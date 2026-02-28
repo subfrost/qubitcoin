@@ -1,5 +1,8 @@
 # Build artifacts
 /target/
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
 **/*.rs.bk
 
 # IDE / Editor

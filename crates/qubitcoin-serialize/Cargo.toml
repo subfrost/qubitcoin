@@ -13,3 +13,8 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 hex = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "serialize_bench"
+harness = false

@@ -1,0 +1,51 @@
+[package]
+name = "qubitcoin-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+qubitcoin-consensus = { path = "../crates/qubitcoin-consensus" }
+qubitcoin-serialize = { path = "../crates/qubitcoin-serialize" }
+qubitcoin-primitives = { path = "../crates/qubitcoin-primitives" }
+qubitcoin-script = { path = "../crates/qubitcoin-script" }
+qubitcoin-net = { path = "../crates/qubitcoin-net" }
+qubitcoin-crypto = { path = "../crates/qubitcoin-crypto" }
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "deserialize_transaction"
+path = "fuzz_targets/deserialize_transaction.rs"
+doc = false
+
+[[bin]]
+name = "deserialize_block"
+path = "fuzz_targets/deserialize_block.rs"
+doc = false
+
+[[bin]]
+name = "script_eval"
+path = "fuzz_targets/script_eval.rs"
+doc = false
+
+[[bin]]
+name = "compact_size"
+path = "fuzz_targets/compact_size.rs"
+doc = false
+
+[[bin]]
+name = "arith_uint256"
+path = "fuzz_targets/arith_uint256.rs"
+doc = false
+
+[[bin]]
+name = "deserialize_network_message"
+path = "fuzz_targets/deserialize_network_message.rs"
+doc = false

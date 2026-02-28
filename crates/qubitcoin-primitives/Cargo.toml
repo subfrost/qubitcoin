@@ -12,3 +12,8 @@ hex = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "primitives_bench"
+harness = false

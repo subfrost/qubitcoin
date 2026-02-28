@@ -404,6 +404,8 @@ fn parse_expected_error(s: &str) -> Option<ScriptError> {
         "CLEANSTACK" => Some(ScriptError::CleanStack),
         "MINIMALIF" => Some(ScriptError::MinimalIf),
         "SIG_NULLFAIL" | "NULLFAIL" => Some(ScriptError::SigNullFail),
+        "SIG_NULLDUMMY" => Some(ScriptError::SigNullDummy),
+        "SCRIPTNUM" => Some(ScriptError::ScriptNum),
         "DISCOURAGE_UPGRADABLE_NOPS" => Some(ScriptError::DiscourageUpgradableNops),
         "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" => {
             Some(ScriptError::DiscourageUpgradableWitnessProgram)
