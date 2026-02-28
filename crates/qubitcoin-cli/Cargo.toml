@@ -1,0 +1,22 @@
+[package]
+name = "qubitcoin-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CLI binary for Qubitcoin"
+
+[lib]
+name = "qubitcoin_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qubitcoin-cli"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]

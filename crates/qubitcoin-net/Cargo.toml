@@ -1,0 +1,23 @@
+[package]
+name = "qubitcoin-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "P2P networking for Qubitcoin: tokio-based, protocol messages, peer management"
+
+[dependencies]
+qubitcoin-common = { workspace = true }
+qubitcoin-node = { workspace = true }
+qubitcoin-util = { workspace = true }
+qubitcoin-serialize = { workspace = true }
+qubitcoin-primitives = { workspace = true }
+qubitcoin-crypto = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+bitflags = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]

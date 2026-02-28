@@ -1,0 +1,23 @@
+[package]
+name = "qubitcoind"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Qubitcoin daemon: full node implementation"
+
+[[bin]]
+name = "qubitcoind"
+path = "src/main.rs"
+
+[dependencies]
+qubitcoin-util = { workspace = true }
+qubitcoin-common = { workspace = true }
+qubitcoin-consensus = { workspace = true }
+qubitcoin-primitives = { workspace = true }
+qubitcoin-node = { workspace = true }
+qubitcoin-net = { workspace = true }
+qubitcoin-rpc = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }

@@ -1,0 +1,26 @@
+[package]
+name = "qubitcoin-consensus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Embeddable consensus library for Qubitcoin: Block, Tx, merkle, validation, params"
+
+[features]
+default = ["std"]
+std = []
+rust-bitcoin-compat = ["bitcoin"]
+metashrew-compat = ["rust-bitcoin-compat"]
+
+[dependencies]
+qubitcoin-script = { workspace = true }
+qubitcoin-serialize = { workspace = true }
+qubitcoin-primitives = { workspace = true }
+qubitcoin-crypto = { workspace = true }
+secp256k1 = { workspace = true }
+bitcoin = { version = "0.32", optional = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }
+serde_json = { workspace = true }

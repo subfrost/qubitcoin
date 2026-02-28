@@ -1,0 +1,197 @@
+//! DbWrapper: typed serialization + XOR obfuscation layer.
+//! Maps to: src/dbwrapper.h (CDBWrapper)
+
+use crate::traits::{Database, DbBatch};
+use qubitcoin_serialize::{Decodable, Encodable, Error as SerError};
+use std::io::Cursor;
+
+/// Database wrapper that provides:
+/// 1. Typed key/value serialization using Encodable/Decodable
+/// 2. XOR obfuscation of values (port of Bitcoin Core's obfuscation)
+/// 3. Key prefixing
+///
+/// The obfuscation key is stored in the database itself under a special key.
+/// This prevents casual inspection of the database values.
+pub struct DbWrapper<D: Database> {
+    db: D,
+    obfuscation_key: Vec<u8>,
+}
+
+/// The key under which the obfuscation key is stored.
+const OBFUSCATION_KEY_KEY: &[u8] = b"\x0e\x00obfuscate_key";
+
+/// Length of the obfuscation key in bytes.
+const OBFUSCATION_KEY_LEN: usize = 8;
+
+impl<D: Database> DbWrapper<D> {
+    /// Create a new DbWrapper. If `obfuscate` is true and no obfuscation key
+    /// exists in the database, a random one is generated and stored.
+    pub fn new(db: D, obfuscate: bool) -> Self {
+        let obfuscation_key = if obfuscate {
+            // Try to read existing obfuscation key
+            if let Ok(Some(key)) = db.read(OBFUSCATION_KEY_KEY) {
+                key
+            } else {
+                // Generate new key
+                let key: Vec<u8> = (0..OBFUSCATION_KEY_LEN)
+                    .map(|_| rand::random::<u8>())
+                    .collect();
+                // Store it
+                let mut batch = db.new_batch();
+                batch.put(OBFUSCATION_KEY_KEY, &key);
+                let _ = db.write_batch(batch, true);
+                key
+            }
+        } else {
+            vec![]
+        };
+
+        DbWrapper {
+            db,
+            obfuscation_key,
+        }
+    }
+
+    /// Create without obfuscation (for testing).
+    pub fn new_unobfuscated(db: D) -> Self {
+        DbWrapper {
+            db,
+            obfuscation_key: vec![],
+        }
+    }
+
+    /// Read a typed value from the database.
+    pub fn read<K: AsRef<[u8]>, V: Decodable>(&self, key: K) -> Result<Option<V>, DbWrapperError> {
+        match self
+            .db
+            .read(key.as_ref())
+            .map_err(|e| DbWrapperError::Db(e.to_string()))?
+        {
+            Some(mut raw) => {
+                self.xor_bytes(&mut raw);
+                let value =
+                    V::decode(&mut Cursor::new(&raw)).map_err(|e| DbWrapperError::Serialize(e))?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Check if a key exists in the database.
+    pub fn exists<K: AsRef<[u8]>>(&self, key: K) -> Result<bool, DbWrapperError> {
+        self.db
+            .exists(key.as_ref())
+            .map_err(|e| DbWrapperError::Db(e.to_string()))
+    }
+
+    /// Write a typed key-value pair.
+    pub fn write<K: AsRef<[u8]>, V: Encodable>(
+        &self,
+        key: K,
+        value: &V,
+        sync: bool,
+    ) -> Result<(), DbWrapperError> {
+        let mut batch = self.db.new_batch();
+        let mut serialized = Vec::new();
+        value
+            .encode(&mut serialized)
+            .map_err(|e| DbWrapperError::Serialize(e))?;
+        self.xor_bytes(&mut serialized);
+        batch.put(key.as_ref(), &serialized);
+        self.db
+            .write_batch(batch, sync)
+            .map_err(|e| DbWrapperError::Db(e.to_string()))
+    }
+
+    /// Delete a key.
+    pub fn erase<K: AsRef<[u8]>>(&self, key: K, sync: bool) -> Result<(), DbWrapperError> {
+        let mut batch = self.db.new_batch();
+        batch.delete(key.as_ref());
+        self.db
+            .write_batch(batch, sync)
+            .map_err(|e| DbWrapperError::Db(e.to_string()))
+    }
+
+    /// Get the underlying database.
+    pub fn inner(&self) -> &D {
+        &self.db
+    }
+
+    /// XOR obfuscation: XOR each byte with the obfuscation key (repeating).
+    fn xor_bytes(&self, data: &mut [u8]) {
+        if self.obfuscation_key.is_empty() {
+            return;
+        }
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte ^= self.obfuscation_key[i % self.obfuscation_key.len()];
+        }
+    }
+}
+
+/// Error type for DbWrapper operations.
+#[derive(Debug, thiserror::Error)]
+pub enum DbWrapperError {
+    #[error("Database error: {0}")]
+    Db(String),
+    #[error("Serialization error: {0}")]
+    Serialize(SerError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::MemoryDb;
+
+    #[test]
+    fn test_typed_read_write() {
+        let db = MemoryDb::new();
+        let wrapper = DbWrapper::new_unobfuscated(db);
+
+        let value: u32 = 42;
+        wrapper.write(b"test_key", &value, false).unwrap();
+
+        let read_back: u32 = wrapper.read::<_, u32>(b"test_key").unwrap().unwrap();
+        assert_eq!(read_back, 42);
+    }
+
+    #[test]
+    fn test_exists_and_erase() {
+        let db = MemoryDb::new();
+        let wrapper = DbWrapper::new_unobfuscated(db);
+
+        wrapper.write(b"key", &100u32, false).unwrap();
+        assert!(wrapper.exists(b"key").unwrap());
+
+        wrapper.erase(b"key", false).unwrap();
+        assert!(!wrapper.exists(b"key").unwrap());
+    }
+
+    #[test]
+    fn test_obfuscation() {
+        let db = MemoryDb::new();
+        let wrapper = DbWrapper::new(db, true);
+
+        let value: u64 = 0xdeadbeef12345678;
+        wrapper.write(b"obf_key", &value, false).unwrap();
+
+        // Reading through wrapper should give back original value
+        let read_back: u64 = wrapper.read::<_, u64>(b"obf_key").unwrap().unwrap();
+        assert_eq!(read_back, value);
+
+        // Reading raw bytes from underlying db should be XOR'd (not original)
+        let raw = wrapper.inner().read(b"obf_key").unwrap().unwrap();
+        let mut original_bytes = Vec::new();
+        value.encode(&mut original_bytes).unwrap();
+        // The raw bytes should differ from the original (unless obfuscation key is all zeros, which is extremely unlikely)
+        assert_ne!(raw, original_bytes);
+    }
+
+    #[test]
+    fn test_missing_key() {
+        let db = MemoryDb::new();
+        let wrapper = DbWrapper::new_unobfuscated(db);
+
+        let result: Option<u32> = wrapper.read(b"nonexistent").unwrap();
+        assert!(result.is_none());
+    }
+}

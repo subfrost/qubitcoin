@@ -1,0 +1,15 @@
+[package]
+name = "qubitcoin-serialize"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Serialization framework for Qubitcoin: Encodable/Decodable, CompactSize, VarInt, DataStream"
+
+[dependencies]
+qubitcoin-primitives = { workspace = true }
+byteorder = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }

@@ -1,0 +1,31 @@
+[package]
+name = "qubitcoin-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Node implementation for Qubitcoin: validation, ChainstateManager, mempool, block storage"
+
+[dependencies]
+qubitcoin-common = { workspace = true }
+qubitcoin-consensus = { workspace = true }
+qubitcoin-storage = { workspace = true }
+qubitcoin-serialize = { workspace = true }
+qubitcoin-primitives = { workspace = true }
+qubitcoin-crypto = { workspace = true }
+qubitcoin-script = { workspace = true }
+qubitcoin-util = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+crossbeam-channel = { workspace = true }
+tracing = { workspace = true }
+rayon = { workspace = true }
+memmap2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+qubitcoin-consensus = { workspace = true }
+qubitcoin-common = { workspace = true }
+qubitcoin-primitives = { workspace = true }
+qubitcoin-script = { workspace = true }

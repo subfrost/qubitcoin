@@ -1,0 +1,23 @@
+[package]
+name = "qubitcoin-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Common types for Qubitcoin: CoinsView, ChainParams, PoW, policy, keys, CBlockIndex"
+
+[dependencies]
+qubitcoin-consensus = { workspace = true }
+qubitcoin-storage = { workspace = true }
+qubitcoin-serialize = { workspace = true }
+qubitcoin-primitives = { workspace = true }
+qubitcoin-crypto = { workspace = true }
+qubitcoin-util = { workspace = true }
+qubitcoin-script = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+secp256k1 = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+hex = { workspace = true }

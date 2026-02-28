@@ -1,0 +1,14 @@
+[package]
+name = "qubitcoin-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Cryptographic primitives for Qubitcoin: SHA256d, RIPEMD160, SipHash, secp256k1"
+
+[dependencies]
+secp256k1 = { workspace = true }
+bitcoin_hashes = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]

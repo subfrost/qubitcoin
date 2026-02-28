@@ -1,0 +1,23 @@
+[package]
+name = "qubitcoin-rpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "JSON-RPC server for Qubitcoin"
+
+[dependencies]
+qubitcoin-node = { workspace = true }
+qubitcoin-common = { workspace = true }
+qubitcoin-util = { workspace = true }
+qubitcoin-primitives = { workspace = true }
+qubitcoin-consensus = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

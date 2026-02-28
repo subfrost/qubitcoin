@@ -1,0 +1,18 @@
+[package]
+name = "qubitcoin-script"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Script types and opcodes for Qubitcoin: Script, ScriptNum, Opcode enum, ScriptVerifyFlags"
+
+[dependencies]
+qubitcoin-primitives = { workspace = true }
+qubitcoin-crypto = { workspace = true }
+qubitcoin-serialize = { workspace = true }
+thiserror = { workspace = true }
+bitflags = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/qubitcoin-crypto",
+    "crates/qubitcoin-primitives",
+    "crates/qubitcoin-serialize",
+    "crates/qubitcoin-script",
+    "crates/qubitcoin-consensus",
+    "crates/qubitcoin-storage",
+    "crates/qubitcoin-util",
+    "crates/qubitcoin-common",
+    "crates/qubitcoin-node",
+    "crates/qubitcoin-net",
+    "crates/qubitcoin-rpc",
+    "crates/qubitcoin-wallet",
+    "crates/qubitcoin-cli",
+    "crates/qubitcoin-tx",
+    "crates/qubitcoind",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "MIT"
+
+[workspace.dependencies]
+# Internal crates
+qubitcoin-crypto = { path = "crates/qubitcoin-crypto" }
+qubitcoin-primitives = { path = "crates/qubitcoin-primitives" }
+qubitcoin-serialize = { path = "crates/qubitcoin-serialize" }
+qubitcoin-script = { path = "crates/qubitcoin-script" }
+qubitcoin-consensus = { path = "crates/qubitcoin-consensus" }
+qubitcoin-storage = { path = "crates/qubitcoin-storage" }
+qubitcoin-util = { path = "crates/qubitcoin-util" }
+qubitcoin-common = { path = "crates/qubitcoin-common" }
+qubitcoin-node = { path = "crates/qubitcoin-node" }
+qubitcoin-net = { path = "crates/qubitcoin-net" }
+qubitcoin-rpc = { path = "crates/qubitcoin-rpc" }
+qubitcoin-wallet = { path = "crates/qubitcoin-wallet" }
+
+# External dependencies
+secp256k1 = { version = "0.29", features = ["global-context", "rand-std"] }
+bitcoin_hashes = "0.14"
+bitcoin = "0.32"
+hex = "0.4"
+thiserror = "1"
+byteorder = "1"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.8"
+log = "0.4" # kept for backward compat; prefer tracing for new code
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tokio = { version = "1", features = ["full"] }
+rocksdb = "0.22"
+bitflags = "2"
+rayon = "1.10"
+memmap2 = "0.9"
+tempfile = "3"
+prometheus = "0.13"
+
+[profile.release]
+lto = true
+codegen-units = 1

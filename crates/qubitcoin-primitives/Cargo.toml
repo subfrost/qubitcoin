@@ -1,0 +1,14 @@
+[package]
+name = "qubitcoin-primitives"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Primitive types for Qubitcoin: Uint256, ArithUint256, Amount, Txid, BlockHash"
+
+[dependencies]
+qubitcoin-crypto = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]

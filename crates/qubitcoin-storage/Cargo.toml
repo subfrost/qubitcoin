@@ -1,0 +1,21 @@
+[package]
+name = "qubitcoin-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Database abstraction for Qubitcoin: trait-based with RocksDB and MemoryDb backends"
+
+[features]
+default = ["rocksdb-backend"]
+rocksdb-backend = ["rocksdb"]
+
+[dependencies]
+qubitcoin-serialize = { workspace = true }
+rocksdb = { workspace = true, optional = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
