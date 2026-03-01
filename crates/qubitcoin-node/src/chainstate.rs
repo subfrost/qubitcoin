@@ -732,8 +732,10 @@ impl ChainstateManager {
             .status
             .raise_validity(BlockStatus::VALID_SCRIPTS);
 
-        // 5. Activate the best chain.
-        self.activate_best_chain()?;
+        // 5. Activate the best chain.  Pass the arena index of the block
+        //    we just connected so activate_best_chain skips reconnecting it
+        //    (its UTXO changes are already in coins_tip).
+        self.activate_best_chain(Some(arena_idx))?;
 
         let on_active = self.active_chainstate.chain.tip() == Some(arena_idx);
         Ok((on_active, Some(block_undo)))
@@ -751,7 +753,10 @@ impl ChainstateManager {
     ///   2. Disconnect blocks from the current tip down to the fork point.
     ///   3. Connect blocks from the fork point up to the new tip.
     ///   4. Update the active chain.
-    fn activate_best_chain(&mut self) -> Result<(), BlockValidationState> {
+    fn activate_best_chain(
+        &mut self,
+        just_connected: Option<usize>,
+    ) -> Result<(), BlockValidationState> {
         // Find the fully-validated entry with the most work.
         let mut best_idx: Option<usize> = None;
         let mut best_work = ArithUint256::zero();
@@ -824,6 +829,13 @@ impl ChainstateManager {
             }
             let idx_at_h = new_chain[h_usize];
             let block_hash = self.block_index.get(idx_at_h).block_hash;
+
+            // Skip the block whose UTXO changes were already applied by the
+            // caller (process_new_block).  Reconnecting it would double-apply
+            // outputs/spends and corrupt the UTXO set.
+            if just_connected == Some(idx_at_h) {
+                continue;
+            }
 
             // Build MTP lookup for this connect_block call.
             let arena = self.block_index.as_slice();

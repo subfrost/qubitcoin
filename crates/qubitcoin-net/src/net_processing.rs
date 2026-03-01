@@ -358,14 +358,31 @@ impl NetProcessor {
                         }
                         ConnectionEvent::Disconnected { peer_id, reason } => {
                             tracing::info!(peer_id = peer_id, reason = %reason, "peer disconnected");
-                            // Re-queue in-flight blocks from disconnected peer.
+                            // Re-queue in-flight blocks from disconnected peer
+                            // to the FRONT so the head-of-line block is first.
+                            let mut requeued = 0usize;
                             if let Some(state) = self.peer_states.get(&peer_id) {
-                                for (hash, _) in &state.blocks_in_flight {
-                                    self.blocks_to_download.push_back(*hash);
+                                // Push in reverse so earliest blocks end up at front.
+                                for (hash, _) in state.blocks_in_flight.iter().rev() {
+                                    self.blocks_to_download.push_front(*hash);
+                                    requeued += 1;
                                 }
                             }
                             self.peer_states.remove(&peer_id);
                             self.notifier.on_peer_disconnected(peer_id);
+
+                            // Redistribute re-queued blocks to remaining peers.
+                            if requeued > 0 {
+                                let peer_ids: Vec<u64> = self
+                                    .peer_states
+                                    .iter()
+                                    .filter(|(_, s)| s.handshake_complete && !s.discouraged)
+                                    .map(|(&pid, _)| pid)
+                                    .collect();
+                                for pid in peer_ids {
+                                    self.request_blocks(pid);
+                                }
+                            }
                         }
                         ConnectionEvent::NewInbound { peer_id, addr } => {
                             tracing::debug!(peer_id = peer_id, addr = %addr, "new inbound peer");
@@ -624,10 +641,12 @@ impl NetProcessor {
 
         // Find which peer has the head-of-line block in-flight.
         let mut slow_peer: Option<u64> = None;
+        let mut in_any_flight = false;
         let mut stall_secs = 0u64;
         for (&pid, state) in &self.peer_states {
             if let Some((_, req_time)) = state.blocks_in_flight.iter().find(|(h, _)| *h == head_hash)
             {
+                in_any_flight = true;
                 let elapsed = req_time.elapsed();
                 if elapsed > stall_timeout {
                     slow_peer = Some(pid);
@@ -637,9 +656,36 @@ impl NetProcessor {
             }
         }
 
+        // If the block is not in ANY peer's in-flight list, it may have been
+        // lost when a peer disconnected.  Re-queue it and request immediately.
+        if !in_any_flight {
+            self.blocks_to_download.push_front(head_hash);
+            let peer_ids: Vec<u64> = self
+                .peer_states
+                .iter()
+                .filter(|(_, s)| {
+                    s.handshake_complete
+                        && !s.discouraged
+                        && s.blocks_in_flight.len() < MAX_BLOCKS_IN_TRANSIT_PER_PEER
+                })
+                .map(|(&pid, _)| pid)
+                .collect();
+            if !peer_ids.is_empty() {
+                tracing::info!(
+                    height = self.next_process_idx + 1,
+                    peers = peer_ids.len(),
+                    "head-of-line block not in-flight, re-requesting"
+                );
+                for pid in peer_ids {
+                    self.request_blocks(pid);
+                }
+            }
+            return;
+        }
+
         let slow_pid = match slow_peer {
             Some(pid) => pid,
-            None => return, // Not stalled or not yet in-flight.
+            None => return, // In-flight but not yet stalled.
         };
 
         // Find a different peer with capacity.  Allow one extra in-flight
