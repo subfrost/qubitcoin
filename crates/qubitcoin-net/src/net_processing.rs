@@ -23,8 +23,9 @@
 use crate::connection::ConnectionEvent;
 use crate::connection::{serialize_message, ConnManager};
 use crate::protocol::{
-    InvType, InvVect, NetMessage, BLOCK_DOWNLOAD_TIMEOUT_BASE, MAX_ADDR_TO_SEND,
-    MAX_BLOCKS_IN_TRANSIT_PER_PEER, MAX_HEADERS_RESULTS, MAX_INV_SIZE, PROTOCOL_VERSION,
+    InvType, InvVect, NetMessage, BLOCK_DOWNLOAD_TIMEOUT_BASE, BLOCK_STALLING_TIMEOUT,
+    MAX_ADDR_TO_SEND, MAX_BLOCKS_IN_TRANSIT_PER_PEER, MAX_HEADERS_RESULTS, MAX_INV_SIZE,
+    PROTOCOL_VERSION,
 };
 use qubitcoin_primitives::{BlockHash, Uint256};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -229,6 +230,8 @@ pub struct NetProcessor {
     pending_blocks: HashMap<BlockHash, (u64, Vec<u8>)>,
     /// Index into `header_chain` for the next block to process in order.
     next_process_idx: usize,
+    /// When `next_process_idx` last advanced (for head-of-line stall detection).
+    last_drain_time: Instant,
     /// Per-peer state.
     peer_states: HashMap<u64, PeerSyncState>,
     /// Total blocks received.
@@ -301,6 +304,7 @@ impl NetProcessor {
             blocks_downloaded: HashSet::new(),
             pending_blocks: HashMap::new(),
             next_process_idx: 0,
+            last_drain_time: Instant::now(),
             peer_states: HashMap::new(),
             blocks_received: 0,
             total_headers: 0,
@@ -495,6 +499,24 @@ impl NetProcessor {
         }
     }
 
+    /// Start block download by distributing blocks across all connected peers.
+    fn start_block_download(&mut self) {
+        let peer_ids: Vec<u64> = self
+            .peer_states
+            .iter()
+            .filter(|(_, state)| state.handshake_complete && !state.discouraged)
+            .map(|(&pid, _)| pid)
+            .collect();
+        tracing::info!(
+            peers = peer_ids.len(),
+            blocks_queued = self.blocks_to_download.len(),
+            "starting block download from all peers"
+        );
+        for pid in peer_ids {
+            self.request_blocks(pid);
+        }
+    }
+
     /// Mark a peer as misbehaving and disconnect them.
     ///
     /// In Bitcoin Core v30+, a single call to Misbehaving() immediately
@@ -514,11 +536,16 @@ impl NetProcessor {
         self.conn_manager.disconnect_peer(peer_id);
     }
 
-    /// Check for stalled peers whose oldest in-flight block request has
-    /// exceeded `BLOCK_DOWNLOAD_TIMEOUT_BASE`.  Stalled peers are
-    /// discouraged, their in-flight blocks are re-queued, and the peer
-    /// is disconnected.
+    /// Check for stalled peers and head-of-line blocking.
+    ///
+    /// Two checks:
+    /// 1. Peers whose oldest in-flight block exceeds `BLOCK_DOWNLOAD_TIMEOUT_BASE`
+    ///    are disconnected and their blocks re-queued.
+    /// 2. If the next block needed for chain-order processing has been in-flight
+    ///    for longer than `BLOCK_STALLING_TIMEOUT`, re-request it from a faster
+    ///    peer to break head-of-line blocking.
     fn check_stalled_peers(&mut self) {
+        // --- 1. Hard timeout: disconnect completely stalled peers ---
         let timeout = std::time::Duration::from_secs(BLOCK_DOWNLOAD_TIMEOUT_BASE);
         let stalled: Vec<u64> = self
             .peer_states
@@ -551,6 +578,125 @@ impl NetProcessor {
                 state.blocks_in_flight.clear();
             }
             self.conn_manager.disconnect_peer(peer_id);
+        }
+
+        // --- 2. Head-of-line stall: re-request from a faster peer ---
+        self.check_head_of_line_stall();
+
+        // --- 3. Kick idle peers to download more blocks ---
+        self.kick_idle_peers();
+    }
+
+    /// Detect head-of-line blocking and re-request the stalled block.
+    ///
+    /// If the next block needed for ordered processing has been in-flight on a
+    /// peer for longer than `BLOCK_STALLING_TIMEOUT`, steal it from the slow
+    /// peer and request it from a different peer with available capacity.
+    fn check_head_of_line_stall(&mut self) {
+        if self.next_process_idx >= self.header_chain.len() {
+            return;
+        }
+
+        let head_hash = self.header_chain[self.next_process_idx];
+
+        // Already in the buffer — drain_processable will handle it.
+        if self.pending_blocks.contains_key(&head_hash) {
+            // Try to drain now (might have been buffered since last drain).
+            self.drain_processable();
+            return;
+        }
+
+        // Already downloaded (shouldn't happen, but be safe).
+        if self.blocks_downloaded.contains(&head_hash) {
+            return;
+        }
+
+        let stall_timeout = std::time::Duration::from_secs(BLOCK_STALLING_TIMEOUT);
+
+        // Find which peer has the head-of-line block in-flight.
+        let mut slow_peer: Option<u64> = None;
+        let mut stall_secs = 0u64;
+        for (&pid, state) in &self.peer_states {
+            if let Some((_, req_time)) = state.blocks_in_flight.iter().find(|(h, _)| *h == head_hash)
+            {
+                let elapsed = req_time.elapsed();
+                if elapsed > stall_timeout {
+                    slow_peer = Some(pid);
+                    stall_secs = elapsed.as_secs();
+                }
+                break;
+            }
+        }
+
+        let slow_pid = match slow_peer {
+            Some(pid) => pid,
+            None => return, // Not stalled or not yet in-flight.
+        };
+
+        // Find a different peer with available in-flight capacity.
+        let fast_peer = self
+            .peer_states
+            .iter()
+            .filter(|(&pid, state)| {
+                pid != slow_pid
+                    && state.handshake_complete
+                    && !state.discouraged
+                    && state.blocks_in_flight.len() < MAX_BLOCKS_IN_TRANSIT_PER_PEER
+            })
+            .min_by_key(|(_, state)| state.blocks_in_flight.len())
+            .map(|(&pid, _)| pid);
+
+        if let Some(fast_pid) = fast_peer {
+            tracing::info!(
+                height = self.next_process_idx + 1,
+                slow_peer = slow_pid,
+                fast_peer = fast_pid,
+                stall_secs = stall_secs,
+                "re-requesting stalled head-of-line block"
+            );
+
+            // Remove from slow peer's in-flight (steal the assignment).
+            if let Some(state) = self.peer_states.get_mut(&slow_pid) {
+                state.blocks_in_flight.retain(|(h, _)| *h != head_hash);
+            }
+
+            // Assign to the faster peer.
+            if let Some(state) = self.peer_states.get_mut(&fast_pid) {
+                state.blocks_in_flight.push((head_hash, Instant::now()));
+            }
+            let inv = vec![InvVect::new(
+                InvType::WitnessBlock,
+                qubitcoin_primitives::Uint256::from_bytes(*head_hash.data()),
+            )];
+            let msg = NetMessage::GetData(inv);
+            let payload = serialize_message(&msg);
+            self.conn_manager.send_to_peer(fast_pid, "getdata", payload);
+
+            // Also fill the slow peer's freed slot with the next block from queue.
+            self.request_blocks(slow_pid);
+        }
+    }
+
+    /// Kick peers that have capacity but no in-flight blocks.
+    ///
+    /// After header sync, only one peer initially calls `request_blocks`.
+    /// This ensures ALL connected peers participate in block download.
+    fn kick_idle_peers(&mut self) {
+        if self.blocks_to_download.is_empty() {
+            return;
+        }
+        let idle_peers: Vec<u64> = self
+            .peer_states
+            .iter()
+            .filter(|(_, state)| {
+                state.handshake_complete
+                    && !state.discouraged
+                    && state.blocks_in_flight.is_empty()
+            })
+            .map(|(&pid, _)| pid)
+            .collect();
+        for pid in idle_peers {
+            self.request_blocks(pid);
         }
     }
 
@@ -761,9 +907,9 @@ impl NetProcessor {
                 "headers sync complete, {} total headers",
                 self.total_headers
             );
-            // If headers sync is done, start requesting blocks.
+            // If headers sync is done, start requesting blocks from all peers.
             if !self.blocks_to_download.is_empty() {
-                self.request_blocks(peer_id);
+                self.start_block_download();
             }
             return;
         }
@@ -829,8 +975,8 @@ impl NetProcessor {
                 blocks_queued = self.blocks_to_download.len(),
                 "header download complete"
             );
-            // IBD header phase complete. Start block download.
-            self.request_blocks(peer_id);
+            // IBD header phase complete. Start block download from all peers.
+            self.start_block_download();
         }
     }
 
@@ -850,7 +996,7 @@ impl NetProcessor {
             None
         };
 
-        tracing::info!(
+        tracing::debug!(
             peer_id = peer_id,
             bytes = data.len(),
             blocks = self.blocks_received,
@@ -908,16 +1054,21 @@ impl NetProcessor {
     /// walks `header_chain` from `next_process_idx` and processes every block
     /// whose data is already in `pending_blocks`, stopping at the first gap.
     fn drain_processable(&mut self) {
+        let start_idx = self.next_process_idx;
         while self.next_process_idx < self.header_chain.len() {
             let hash = self.header_chain[self.next_process_idx];
             if let Some((peer_id, data)) = self.pending_blocks.remove(&hash) {
                 match self.node.process_block(&data) {
                     Ok(true) => {
-                        tracing::info!(
-                            height = self.next_process_idx + 1,
-                            pending = self.pending_blocks.len(),
-                            "block accepted (ordered)"
-                        );
+                        let height = self.next_process_idx + 1;
+                        // Log every 1000 blocks or first 100 blocks for progress.
+                        if height <= 100 || height % 1000 == 0 {
+                            tracing::info!(
+                                height = height,
+                                pending = self.pending_blocks.len(),
+                                "block accepted"
+                            );
+                        }
                     }
                     Ok(false) => {
                         tracing::debug!("block not accepted (already have or invalid)");
@@ -935,10 +1086,21 @@ impl NetProcessor {
                     }
                 }
                 self.next_process_idx += 1;
+                self.last_drain_time = Instant::now();
             } else {
                 // Next block in chain order hasn't arrived yet.
                 break;
             }
+        }
+        let processed = self.next_process_idx - start_idx;
+        if processed > 0 {
+            tracing::info!(
+                height = self.next_process_idx,
+                batch = processed,
+                pending = self.pending_blocks.len(),
+                queued = self.blocks_to_download.len(),
+                "drain batch complete"
+            );
         }
     }
 
