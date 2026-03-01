@@ -606,9 +606,18 @@ impl NetProcessor {
             return;
         }
 
-        // Already downloaded (shouldn't happen, but be safe).
-        if self.blocks_downloaded.contains(&head_hash) {
-            return;
+        // Block was downloaded but data is not buffered — the data was lost
+        // (e.g. the block went through the non-IBD path and failed).  Remove
+        // it from `blocks_downloaded` so it will be re-requested below.
+        if self.blocks_downloaded.contains(&head_hash)
+            && !self.pending_blocks.contains_key(&head_hash)
+        {
+            self.blocks_downloaded.remove(&head_hash);
+            self.blocks_to_download.push_front(head_hash);
+            tracing::info!(
+                height = self.next_process_idx + 1,
+                "re-queuing lost head-of-line block for download"
+            );
         }
 
         let stall_timeout = std::time::Duration::from_secs(BLOCK_STALLING_TIMEOUT);
