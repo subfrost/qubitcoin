@@ -73,6 +73,10 @@ bitflags::bitflags! {
 
         /// Making unknown public key versions non-standard (BIP342).
         const DISCOURAGE_UPGRADABLE_PUBKEYTYPE = 1 << 20;
+
+        /// Pay-to-Merkle-Root validation (BIP 360).
+        /// SegWit version 2: script-path only, no public key on-chain.
+        const P2MR = 1 << 21;
     }
 }
 
@@ -87,7 +91,8 @@ pub const MANDATORY_SCRIPT_VERIFY_FLAGS: ScriptVerifyFlags = ScriptVerifyFlags::
     .union(ScriptVerifyFlags::CHECKLOCKTIMEVERIFY)
     .union(ScriptVerifyFlags::CHECKSEQUENCEVERIFY)
     .union(ScriptVerifyFlags::WITNESS)
-    .union(ScriptVerifyFlags::TAPROOT);
+    .union(ScriptVerifyFlags::TAPROOT)
+    .union(ScriptVerifyFlags::P2MR);
 
 /// Standard script verification flags used for mempool relay policy.
 ///

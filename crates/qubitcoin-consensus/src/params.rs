@@ -23,6 +23,15 @@ pub struct ConsensusParams {
     /// -1 means never active. Bitcoin Core uses version bits for this on
     /// mainnet, but we simplify to a height for the same effect.
     pub taproot_height: i32,
+    /// Block height at which P2MR (BIP 360) becomes active.
+    /// SegWit version 2: script-path only, no public key on-chain.
+    /// `i32::MAX` means not yet activated (TBD with community).
+    pub p2mr_height: i32,
+    /// Block height at which Q-Day seize transactions are enforced.
+    /// At this height, frozen quantum-vulnerable UTXOs are consensus-seized
+    /// into a FROST-controlled P2MR address.
+    /// `i32::MAX` means not yet activated.
+    pub qday_seize_height: i32,
 
     /// Map of block hashes to script verification flag overrides.
     /// Used for the two historical blocks that violated P2SH/Taproot rules.
@@ -81,6 +90,8 @@ impl ConsensusParams {
             csv_height: 419328,
             segwit_height: 481824,
             taproot_height: 709632,
+            p2mr_height: i32::MAX,           // TBD with community
+            qday_seize_height: i32::MAX,     // TBD with community
             script_flag_exceptions: exceptions,
             rule_change_activation_threshold: 1916,
             miner_confirmation_window: 2016,
@@ -121,6 +132,8 @@ impl ConsensusParams {
             csv_height: 770112,
             segwit_height: 834624,
             taproot_height: 0, // always active on testnet3
+            p2mr_height: 1,
+            qday_seize_height: 1,
             script_flag_exceptions: exceptions,
             rule_change_activation_threshold: 1512,
             miner_confirmation_window: 2016,
@@ -155,6 +168,8 @@ impl ConsensusParams {
             csv_height: 1,
             segwit_height: 0,  // always active
             taproot_height: 0, // always active
+            p2mr_height: 0,    // always active
+            qday_seize_height: 0, // always active
             script_flag_exceptions: HashMap::new(),
             rule_change_activation_threshold: 108,
             miner_confirmation_window: 144,
@@ -183,6 +198,8 @@ impl ConsensusParams {
             csv_height: 1,
             segwit_height: 1,
             taproot_height: 0, // always active
+            p2mr_height: 1,
+            qday_seize_height: 1,
             script_flag_exceptions: HashMap::new(),
             rule_change_activation_threshold: 1916,
             miner_confirmation_window: 2016,
@@ -217,6 +234,8 @@ impl ConsensusParams {
             csv_height: 1,
             segwit_height: 1,
             taproot_height: 0, // always active
+            p2mr_height: 1,
+            qday_seize_height: 1,
             script_flag_exceptions: HashMap::new(),
             rule_change_activation_threshold: 1512,
             miner_confirmation_window: 2016,

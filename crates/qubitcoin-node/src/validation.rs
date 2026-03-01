@@ -22,6 +22,7 @@ use qubitcoin_consensus::{
     },
     merkle::{block_merkle_root, block_witness_merkle_root},
     params::ConsensusParams,
+    qday_seize, seize,
     transaction::{OutPoint, Transaction},
     validation_state::{
         BlockValidationResult, BlockValidationState, TxValidationResult, TxValidationState,
@@ -98,6 +99,11 @@ pub fn get_block_script_flags(
     // BIP147: Enforce NULLDUMMY (activated simultaneously with segwit).
     if height >= params.segwit_height {
         flags |= ScriptVerifyFlags::NULLDUMMY;
+    }
+
+    // BIP 360: Enforce P2MR (Pay-to-Merkle-Root) witness v2 validation.
+    if height >= params.p2mr_height {
+        flags |= ScriptVerifyFlags::P2MR;
     }
 
     flags
@@ -1164,6 +1170,44 @@ pub fn connect_block(
                     );
                     return Err(state);
                 }
+            }
+        }
+    }
+
+    // Q-Day seize enforcement: at the seize activation height, the block
+    // MUST contain the seize transactions that move frozen UTXOs to the
+    // FROST P2MR address.
+    if height == params.qday_seize_height {
+        match qday_seize::load_frozen_set() {
+            Ok(frozen) => {
+                if !frozen.is_empty() {
+                    let seize_script = qday_seize::seize_script_pubkey();
+                    let expected_seize_txs = seize::create_seize_transactions(
+                        &frozen,
+                        |outpoint| {
+                            view.fetch_coin(outpoint).map(|c| c.tx_out.value)
+                        },
+                        &seize_script,
+                    );
+                    if let Err(msg) = seize::validate_seize_block(&block.vtx, &expected_seize_txs) {
+                        let mut state = BlockValidationState::new();
+                        state.invalid(
+                            BlockValidationResult::Consensus,
+                            "bad-qday-seize",
+                            msg,
+                        );
+                        return Err(state);
+                    }
+                }
+            }
+            Err(msg) => {
+                let mut state = BlockValidationState::new();
+                state.invalid(
+                    BlockValidationResult::Consensus,
+                    "bad-qday-frozen-set",
+                    msg,
+                );
+                return Err(state);
             }
         }
     }

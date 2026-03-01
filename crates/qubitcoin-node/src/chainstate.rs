@@ -233,6 +233,9 @@ pub struct ChainstateManager {
     best_valid_tip: Option<(usize, ArithUint256)>,
     /// Arena indices of block index entries modified since the last flush.
     dirty_indices: HashSet<usize>,
+    /// Cached frozen outpoints for Q-Day seize enforcement.
+    /// Loaded on first access at `qday_seize_height`.
+    qday_frozen: Option<qubitcoin_consensus::qday_seize::FrozenOutpoints>,
 }
 
 impl ChainstateManager {
@@ -253,6 +256,7 @@ impl ChainstateManager {
             assume_valid_height: None,
             best_valid_tip: None,
             dirty_indices: HashSet::new(),
+            qday_frozen: None,
         }
     }
 

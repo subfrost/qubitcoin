@@ -32,6 +32,10 @@ pub mod params;
 pub mod sighash;
 /// Transaction signature verification (ECDSA and Schnorr).
 pub mod sign;
+/// Q-Day seize consensus constants, frozen set, and seize script.
+pub mod qday_seize;
+/// Q-Day seize transaction construction and validation.
+pub mod seize;
 /// Transaction primitive types: [`OutPoint`], [`TxIn`], [`TxOut`], [`Transaction`].
 pub mod transaction;
 /// Validation state types for structured error reporting.
@@ -56,6 +60,14 @@ pub use transaction::{
     SEQUENCE_LOCKTIME_MASK, SEQUENCE_LOCKTIME_TYPE_FLAG,
 };
 pub use validation_state::{BlockValidationResult, TxValidationResult, ValidationState};
+
+pub use qday_seize::{
+    load_frozen_set, seize_script_pubkey, FrozenOutpoints as ConsensusFrozenOutpoints,
+    FROZEN_COMMITMENT_HASH, FROZEN_OUTPOINTS_DATA, SEIZE_P2MR_PROGRAM,
+};
+pub use seize::{
+    create_seize_transactions, validate_seize_block, validate_seize_transaction, SEIZE_TX_VERSION,
+};
 
 /// Compatibility conversions between qubitcoin types and `rust-bitcoin` 0.32 types.
 ///

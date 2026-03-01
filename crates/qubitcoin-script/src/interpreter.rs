@@ -60,6 +60,17 @@ const TAPROOT_CONTROL_MAX_SIZE: usize =
 /// Offset added to witness serialized size for validation weight budget.
 const VALIDATION_WEIGHT_OFFSET: i64 = 50;
 
+// P2MR constants (BIP 360)
+/// Size of the control block base for P2MR: 1 byte leaf version only (no internal key).
+const P2MR_CONTROL_BASE_SIZE: usize = 1;
+/// Size of each merkle path node in the P2MR control block.
+const P2MR_CONTROL_NODE_SIZE: usize = 32;
+/// Maximum number of merkle path nodes in P2MR.
+const P2MR_CONTROL_MAX_NODE_COUNT: usize = 128;
+/// Maximum P2MR control block size.
+const P2MR_CONTROL_MAX_SIZE: usize =
+    P2MR_CONTROL_BASE_SIZE + P2MR_CONTROL_NODE_SIZE * P2MR_CONTROL_MAX_NODE_COUNT;
+
 // ---------------------------------------------------------------------------
 // Stack type
 // ---------------------------------------------------------------------------
@@ -2096,6 +2107,123 @@ fn verify_witness_program(
             *error = ScriptError::Ok;
             return true;
         }
+    } else if wit_version == 2 && wit_program.len() == 32 && !is_p2sh {
+        // BIP 360 P2MR: 32-byte non-P2SH witness v2 program (Pay-to-Merkle-Root)
+        // Script-path only — no public key on-chain, no key-path spending.
+        if !flags.contains(ScriptVerifyFlags::P2MR) {
+            *error = ScriptError::Ok;
+            return true;
+        }
+        if witness.stack.is_empty() {
+            *error = ScriptError::WitnessProgramWitnessEmpty;
+            return false;
+        }
+
+        // Work with a mutable copy of the witness stack items
+        let mut stack_items: Vec<Vec<u8>> = witness.stack.clone();
+
+        // --- Annex detection (same as taproot) ---
+        if stack_items.len() >= 2
+            && !stack_items.last().unwrap().is_empty()
+            && stack_items.last().unwrap()[0] == ANNEX_TAG
+        {
+            let annex = stack_items.pop().unwrap();
+            exec_data.annex_hash = qubitcoin_crypto::hash::sha256_hash(&annex);
+            exec_data.annex_present = true;
+        } else {
+            exec_data.annex_present = false;
+        }
+        exec_data.annex_init = true;
+
+        // P2MR requires at least 2 items: [script, control_block, ...args]
+        if stack_items.len() < 2 {
+            *error = ScriptError::WitnessProgramWitnessEmpty;
+            return false;
+        }
+
+        // --- Script-path spending (P2MR has no key-path) ---
+        let control = stack_items.pop().unwrap();
+        let script = stack_items.pop().unwrap();
+
+        // Validate control block size: base(1) + N*32 merkle nodes
+        if control.len() < P2MR_CONTROL_BASE_SIZE
+            || control.len() > P2MR_CONTROL_MAX_SIZE
+            || ((control.len() - P2MR_CONTROL_BASE_SIZE) % P2MR_CONTROL_NODE_SIZE) != 0
+        {
+            *error = ScriptError::TaprootWrongControlSize;
+            return false;
+        }
+
+        // Compute tapleaf hash (reuses existing tapscript tagged hash)
+        let leaf_version = control[0] & TAPROOT_LEAF_MASK;
+        exec_data.tapleaf_hash = compute_tapleaf_hash(leaf_version, &script);
+
+        // Verify P2MR commitment: walk merkle path and compare root to witness program
+        // Key difference from taproot: NO internal key tweak. The computed root
+        // must equal the witness program directly.
+        if !verify_p2mr_commitment(&control, wit_program, &exec_data.tapleaf_hash) {
+            *error = ScriptError::WitnessProgramMismatch;
+            return false;
+        }
+        exec_data.tapleaf_hash_init = true;
+
+        if leaf_version == TAPROOT_LEAF_TAPSCRIPT {
+            // Execute as tapscript (BIP 342 rules)
+            let exec_script = Script::from_slice(&script);
+
+            // OP_SUCCESSx pre-scan (same as taproot)
+            {
+                let mut pc = 0usize;
+                let script_bytes = exec_script.as_bytes();
+                while pc < script_bytes.len() {
+                    match exec_script.get_op(pc) {
+                        Some((opcode, _data, next_pc)) => {
+                            if is_op_success(opcode) {
+                                if flags.contains(ScriptVerifyFlags::DISCOURAGE_OP_SUCCESS) {
+                                    *error = ScriptError::DiscourageOpSuccess;
+                                    return false;
+                                }
+                                *error = ScriptError::Ok;
+                                return true;
+                            }
+                            pc = next_pc;
+                        }
+                        None => {
+                            *error = ScriptError::BadOpcode;
+                            return false;
+                        }
+                    }
+                }
+            }
+
+            // Compute validation weight budget
+            exec_data.validation_weight_left =
+                compute_witness_size(&witness.stack) as i64 + VALIDATION_WEIGHT_OFFSET;
+            exec_data.validation_weight_left_init = true;
+
+            // The remaining stack_items become the execution stack
+            let mut exec_stack = ScriptStack::new();
+            for item in &stack_items {
+                exec_stack.push(item.clone());
+            }
+            return execute_witness_script(
+                &mut exec_stack,
+                &exec_script,
+                flags,
+                SigVersion::Tapscript,
+                checker,
+                &mut exec_data,
+                error,
+            );
+        }
+
+        // Unknown leaf version: future soft-fork (succeed for extensibility)
+        if flags.contains(ScriptVerifyFlags::DISCOURAGE_UPGRADABLE_TAPROOT_VERSION) {
+            *error = ScriptError::DiscourageUpgradableTaprootVersion;
+            return false;
+        }
+        *error = ScriptError::Ok;
+        return true;
     } else {
         if flags.contains(ScriptVerifyFlags::DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) {
             *error = ScriptError::DiscourageUpgradableWitnessProgram;
@@ -2205,6 +2333,39 @@ fn verify_taproot_commitment(control: &[u8], program: &[u8], tapleaf_hash: &[u8;
     // Verify: internal_key tweaked by tweak_scalar should equal output_key with the given parity
     let secp = Secp256k1::verification_only();
     internal_key.tweak_add_check(&secp, &output_key, parity, tweak_scalar)
+}
+
+// ---------------------------------------------------------------------------
+// P2MR helper functions (BIP 360)
+// ---------------------------------------------------------------------------
+
+/// Verify the P2MR commitment: walk the merkle path from the tapleaf hash
+/// and check that the computed root matches the witness program directly.
+///
+/// Key difference from taproot: NO internal key tweak. The merkle root
+/// IS the witness program.
+fn verify_p2mr_commitment(
+    control: &[u8],
+    program: &[u8],
+    tapleaf_hash: &[u8; 32],
+) -> bool {
+    let merkle_root = compute_p2mr_merkle_root(control, tapleaf_hash);
+    merkle_root == program
+}
+
+/// Compute the merkle root from the P2MR control block path and tapleaf hash.
+///
+/// P2MR control block layout: [leaf_version (1 byte)] [merkle_node (32 bytes)]*
+/// (no internal key — that's the difference from taproot).
+fn compute_p2mr_merkle_root(control: &[u8], tapleaf_hash: &[u8; 32]) -> [u8; 32] {
+    let path_len = (control.len() - P2MR_CONTROL_BASE_SIZE) / P2MR_CONTROL_NODE_SIZE;
+    let mut k = *tapleaf_hash;
+    for i in 0..path_len {
+        let offset = P2MR_CONTROL_BASE_SIZE + P2MR_CONTROL_NODE_SIZE * i;
+        let node = &control[offset..offset + P2MR_CONTROL_NODE_SIZE];
+        k = compute_tapbranch_hash(&k, node);
+    }
+    k
 }
 
 /// Compute the serialized size of witness stack items.

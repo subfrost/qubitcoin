@@ -748,8 +748,9 @@ async fn main() {
         Network::Signet => 38332,
     }) as u16;
 
+    let rpc_bind_host = args.get_arg("rpcbind").unwrap_or("127.0.0.1");
     let rpc_config = RpcServerConfig {
-        bind_addr: format!("127.0.0.1:{}", rpc_port).parse().unwrap(),
+        bind_addr: format!("{}:{}", rpc_bind_host, rpc_port).parse().unwrap(),
         rpc_user: args.get_arg("rpcuser").map(|s| s.to_string()),
         rpc_password: args.get_arg("rpcpassword").map(|s| s.to_string()),
     };

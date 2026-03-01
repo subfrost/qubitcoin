@@ -302,6 +302,14 @@ impl Script {
         self.data.len() == 34 && self.data[0] == Opcode::Op1 as u8 && self.data[1] == 0x20
     }
 
+    /// Returns `true` if this is a Pay-to-Merkle-Root (P2MR) script (BIP 360).
+    ///
+    /// Format: `OP_2 <32-byte merkle root>`
+    /// SegWit version 2, script-path only (no public key on-chain).
+    pub fn is_p2mr(&self) -> bool {
+        self.data.len() == 34 && self.data[0] == Opcode::Op2 as u8 && self.data[1] == 0x20
+    }
+
     /// Returns `true` if the script is provably unspendable.
     ///
     /// A script is unspendable if it starts with `OP_RETURN` or exceeds
@@ -496,6 +504,17 @@ pub fn build_p2tr(output_key: &[u8; 32]) -> Script {
     let mut s = Script::new();
     s.push_opcode(Opcode::Op1);
     s.push_data(output_key);
+    s
+}
+
+/// Builds a Pay-to-Merkle-Root (P2MR) script (BIP 360).
+///
+/// Format: `OP_2 <32-byte merkle_root>`
+/// SegWit version 2, script-path only — no public key on-chain.
+pub fn build_p2mr(merkle_root: &[u8; 32]) -> Script {
+    let mut s = Script::new();
+    s.push_opcode(Opcode::Op2);
+    s.push_data(merkle_root);
     s
 }
 

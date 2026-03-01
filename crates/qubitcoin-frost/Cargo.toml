@@ -1,0 +1,19 @@
+[package]
+name = "qubitcoin-frost"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "FROST threshold Schnorr keygen and P2MR address computation for Qubitcoin"
+
+[dependencies]
+frost-secp256k1-tr = { workspace = true }
+frost-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+qubitcoin-script = { workspace = true }
+qubitcoin-crypto = { workspace = true }
+qubitcoin-serialize = { workspace = true }
