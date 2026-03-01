@@ -1030,6 +1030,7 @@ impl NetProcessor {
             self.drain_processable();
         } else {
             // Non-IBD block (inv/getdata announcement): process immediately.
+            let in_ibd = self.next_process_idx < self.header_chain.len();
             match self.node.process_block(data) {
                 Ok(true) => {
                     tracing::info!(blocks = self.blocks_received, "block accepted");
@@ -1041,8 +1042,19 @@ impl NetProcessor {
                     );
                 }
                 Err(reason) => {
-                    tracing::warn!(peer_id = peer_id, reason = %reason, "block rejected");
-                    self.misbehaving(peer_id, &format!("invalid block: {}", reason));
+                    if in_ibd {
+                        // During IBD, unsolicited blocks (e.g. inv-announced
+                        // tip blocks) will fail because their ancestors aren't
+                        // in block_index yet.  Don't punish the peer for this.
+                        tracing::debug!(
+                            peer_id = peer_id,
+                            reason = %reason,
+                            "ignoring unsolicited block during IBD"
+                        );
+                    } else {
+                        tracing::warn!(peer_id = peer_id, reason = %reason, "block rejected");
+                        self.misbehaving(peer_id, &format!("invalid block: {}", reason));
+                    }
                 }
             }
         }
@@ -1074,15 +1086,18 @@ impl NetProcessor {
                         tracing::debug!("block not accepted (already have or invalid)");
                     }
                     Err(reason) => {
-                        tracing::warn!(
+                        tracing::error!(
                             peer_id = peer_id,
                             height = self.next_process_idx + 1,
+                            hash = %hash,
                             reason = %reason,
-                            "block rejected during ordered processing"
+                            "block rejected during ordered processing, skipping"
                         );
-                        // Don't advance past a failed block — sync stalls here
-                        // until the issue is resolved.
-                        return;
+                        // Advance past the failed block to avoid a permanent
+                        // stall.  The header was already inserted into the
+                        // block_index by accept_block_header (inside
+                        // process_new_block) even if the body failed, so
+                        // subsequent blocks can still reference it as a parent.
                     }
                 }
                 self.next_process_idx += 1;

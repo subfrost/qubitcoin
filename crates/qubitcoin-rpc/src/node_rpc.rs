@@ -91,6 +91,8 @@ pub struct MempoolEntry {
 pub struct NodeState {
     /// Current chain height (-1 means no blocks yet).
     pub chain_height: RwLock<i32>,
+    /// Number of headers received (may be ahead of chain_height during IBD).
+    pub headers_count: RwLock<i32>,
     /// Hash of the current best block.
     pub best_block_hash: RwLock<String>,
     /// Name of the active chain (e.g. "main", "test", "regtest").
@@ -136,6 +138,7 @@ impl NodeState {
     pub fn new(chain_name: &str) -> Self {
         NodeState {
             chain_height: RwLock::new(-1),
+            headers_count: RwLock::new(-1),
             best_block_hash: RwLock::new(
                 "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
             ),
@@ -174,6 +177,7 @@ pub fn register_node_rpcs(registry: &mut RpcRegistry, state: Arc<NodeState>) {
     let s = state.clone();
     registry.register("getblockchaininfo", move |req: &RpcRequest| {
         let height = *s.chain_height.read();
+        let headers = *s.headers_count.read();
         let hash = s.best_block_hash.read().clone();
         let difficulty = *s.difficulty.read();
         let ibd = *s.is_initial_block_download.read();
@@ -184,7 +188,7 @@ pub fn register_node_rpcs(registry: &mut RpcRegistry, state: Arc<NodeState>) {
             serde_json::json!({
                 "chain": s.chain_name,
                 "blocks": height,
-                "headers": height,
+                "headers": headers,
                 "bestblockhash": hash,
                 "difficulty": difficulty,
                 "time": std::time::SystemTime::now()

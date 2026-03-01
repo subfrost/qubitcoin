@@ -70,7 +70,7 @@ struct RpcStateNotifier {
 
 impl StateNotifier for RpcStateNotifier {
     fn on_headers_update(&self, header_count: usize) {
-        *self.state.chain_height.write() = header_count as i32 - 1;
+        *self.state.headers_count.write() = header_count as i32 - 1;
     }
 
     fn on_peer_connected(&self, _peer_id: u64) {
@@ -607,7 +607,9 @@ async fn main() {
     // Update RPC state with restored chain height.
     {
         let cs = chainstate.lock();
-        *node_state.chain_height.write() = cs.height();
+        let h = cs.height();
+        *node_state.chain_height.write() = h;
+        *node_state.headers_count.write() = h;
         if let Some(tip) = cs.tip() {
             *node_state.best_block_hash.write() =
                 cs.block_index().get(tip).block_hash.to_hex();
