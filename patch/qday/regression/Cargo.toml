@@ -1,0 +1,15 @@
+[package]
+name = "qday-regression"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+
+[workspace]
+
+[dependencies]
+qubitcoin-consensus = { path = "../../../crates/qubitcoin-consensus" }
+qubitcoin-primitives = { path = "../../../crates/qubitcoin-primitives" }
+qubitcoin-script = { path = "../../../crates/qubitcoin-script" }
+qubitcoin-serialize = { path = "../../../crates/qubitcoin-serialize" }
+qubitcoin-crypto = { path = "../../../crates/qubitcoin-crypto" }
+thiserror = "1"

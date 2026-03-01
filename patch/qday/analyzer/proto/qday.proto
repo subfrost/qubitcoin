@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package qday;
+
+// View function input/output types
+
+message TotalVulnerableResponse {
+  uint64 total_sats = 1;
+  uint64 count = 2;
+}
+
+message TypeStats {
+  uint32 vuln_type = 1; // 0=P2PK, 1=ExposedP2PKH, 2=P2TR
+  uint64 count = 2;
+  uint64 sats = 3;
+}
+
+message VulnerableStatsResponse {
+  repeated TypeStats by_type = 1;
+  uint64 total_sats = 2;
+  uint64 total_count = 3;
+}
+
+message SimulateSeizeRequest {
+  uint32 threshold = 1;
+}
+
+message SimulateSeizeResponse {
+  uint64 seized_sats = 1;
+  uint64 seized_count = 2;
+  uint32 safety_rating = 3;
+  uint64 remaining_sats = 4;
+}
+
+message EnumerateRequest {
+  uint32 offset = 1;
+  uint32 limit = 2;
+  uint32 min_score = 3;
+}
+
+message OutpointInfo {
+  bytes txid = 1;
+  uint32 vout = 2;
+  uint64 value = 3;
+  uint32 vuln_type = 4;
+  uint32 height = 5;
+  uint32 score = 6;
+}
+
+message EnumerateResponse {
+  repeated OutpointInfo outpoints = 1;
+}
+
+message OutpointDetailsRequest {
+  bytes txid = 1;
+  uint32 vout = 2;
+}
+
+message OutpointDetailsResponse {
+  uint64 value = 1;
+  uint32 vuln_type = 2;
+  uint32 height = 3;
+  uint32 score = 4;
+  bytes pubkey = 5;
+}

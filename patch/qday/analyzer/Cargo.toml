@@ -1,0 +1,21 @@
+[package]
+name = "qday-analyzer"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+metashrew-core = { git = "https://github.com/kungfuflex/alkanes-rs" }
+metashrew-support = { git = "https://github.com/kungfuflex/alkanes-rs" }
+bitcoin = "0.32.6"
+prost = "0.12.6"
+
+[build-dependencies]
+prost-build = "0.12.6"
+
+[features]
+test-utils = ["metashrew-core/test-utils"]
