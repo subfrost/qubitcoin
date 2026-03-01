@@ -30,6 +30,35 @@ use tracing::Instrument;
 const VERSION: &str = "0.1.0";
 
 // ---------------------------------------------------------------------------
+// ArcCoinsView: wraps Arc<CoinsViewDB> as a CoinsView trait object
+// ---------------------------------------------------------------------------
+
+/// Thin wrapper so a single `Arc<CoinsViewDB>` can serve as both the
+/// `CoinsView` base for the cache *and* the `FlushableCoinsView` target.
+struct ArcCoinsView<D: qubitcoin_storage::Database + Send + Sync + 'static> {
+    inner: Arc<CoinsViewDB<D>>,
+}
+
+impl<D: qubitcoin_storage::Database + Send + Sync + 'static> qubitcoin_common::coins::CoinsView
+    for ArcCoinsView<D>
+{
+    fn get_coin(
+        &self,
+        outpoint: &qubitcoin_consensus::OutPoint,
+    ) -> Option<qubitcoin_common::coins::Coin> {
+        qubitcoin_common::coins::CoinsView::get_coin(self.inner.as_ref(), outpoint)
+    }
+
+    fn get_best_block(&self) -> BlockHash {
+        qubitcoin_common::coins::CoinsView::get_best_block(self.inner.as_ref())
+    }
+
+    fn estimate_size(&self) -> u64 {
+        qubitcoin_common::coins::CoinsView::estimate_size(self.inner.as_ref())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // StateNotifier implementation: bridges NetProcessor events to NodeState
 // ---------------------------------------------------------------------------
 
@@ -393,13 +422,11 @@ async fn main() {
 
     tracing::info!("databases opened");
 
-    // 6. Initialize chainstate with persistent UTXO backing
+    // 6. Initialize chainstate with persistent UTXO backing.
+    //    Use ArcCoinsView so the same RocksDB instance serves as both the
+    //    cache base view and the flush target (avoids RocksDB lock conflict).
     let coins_view: Box<dyn qubitcoin_common::coins::CoinsView + Send + Sync> =
-        Box::new(CoinsViewDB::new(
-            RocksDatabase::open(&chainstate_dir, dbcache_mb)
-                .expect("failed to open chainstate read view"),
-            true,
-        ));
+        Box::new(ArcCoinsView { inner: coins_db.clone() });
     let mut chainstate = ChainstateManager::new(params.clone(), coins_view);
 
     // Load block index from disk.
