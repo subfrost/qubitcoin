@@ -1,5 +1,10 @@
-//! Validation state types for error reporting.
-//! Maps to: src/consensus/validation.h
+//! Validation state types for structured error reporting.
+//!
+//! Maps to: `src/consensus/validation.h` in Bitcoin Core.
+//!
+//! Provides [`ValidationState`], a generic state tracker that records whether
+//! validation passed, and if not, why it failed with a machine-readable result
+//! code and human-readable reason string.
 
 use std::fmt;
 
@@ -47,6 +52,10 @@ pub enum BlockValidationResult {
 
 /// Generic validation state that tracks whether validation succeeded
 /// and if not, why it failed.
+///
+/// Equivalent to `ValidationState<R>` in Bitcoin Core (`src/consensus/validation.h`).
+/// Parameterized by a result code type (`R`), typically [`TxValidationResult`]
+/// or [`BlockValidationResult`].
 #[derive(Debug, Clone)]
 pub struct ValidationState<R: Clone + fmt::Debug> {
     mode: ValidationMode,
@@ -63,6 +72,7 @@ enum ValidationMode {
 }
 
 impl<R: Clone + fmt::Debug + Default> ValidationState<R> {
+    /// Create a new validation state in the `Valid` mode with a default result code.
     pub fn new() -> Self {
         ValidationState {
             mode: ValidationMode::Valid,

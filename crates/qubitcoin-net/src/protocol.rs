@@ -82,7 +82,10 @@ pub const WTXID_RELAY_VERSION: u32 = 70016;
 /// These are the first 4 bytes of every P2P message and are used to detect
 /// the start of a message in the TCP stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NetworkMagic(pub [u8; 4]);
+pub struct NetworkMagic(
+    /// The 4-byte magic value.
+    pub [u8; 4],
+);
 
 impl NetworkMagic {
     /// Mainnet magic: 0xf9beb4d9
@@ -110,9 +113,13 @@ impl NetworkMagic {
 /// - checksum: 4 bytes - first 4 bytes of SHA256d(payload)
 #[derive(Debug, Clone)]
 pub struct MessageHeader {
+    /// Network magic bytes identifying the network (mainnet, testnet, etc.).
     pub magic: NetworkMagic,
+    /// Null-padded 12-byte ASCII command string (e.g., `"version\0\0\0\0\0"`).
     pub command: [u8; 12],
+    /// Length of the message payload in bytes (little-endian on the wire).
     pub payload_size: u32,
+    /// First 4 bytes of SHA256d(payload), used for integrity verification.
     pub checksum: [u8; 4],
 }
 
@@ -223,8 +230,11 @@ impl Default for ServiceFlags {
 /// Maps to CAddress / CService in Bitcoin Core.
 #[derive(Debug, Clone)]
 pub struct NetAddress {
+    /// Bitfield of services advertised by this address.
     pub services: ServiceFlags,
+    /// IP address (IPv4 or IPv6).
     pub ip: std::net::IpAddr,
+    /// TCP port number.
     pub port: u16,
 }
 
@@ -248,15 +258,23 @@ impl NetAddress {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum InvType {
+    /// Error or unrecognized inventory type.
     Error = 0,
+    /// Transaction identified by txid.
     Tx = 1,
+    /// Block identified by block hash.
     Block = 2,
+    /// Filtered block (BIP 37 bloom filter match).
     FilteredBlock = 3,
+    /// Compact block (BIP 152).
     CompactBlock = 4,
-    /// BIP 339: witness transaction by wtxid.
+    /// BIP 339: witness transaction identified by wtxid.
     WTx = 5,
+    /// Witness-serialized transaction (`MSG_TX | MSG_WITNESS_FLAG`).
     WitnessTx = 0x40000001,
+    /// Witness-serialized block (`MSG_BLOCK | MSG_WITNESS_FLAG`).
     WitnessBlock = 0x40000002,
+    /// Witness-serialized filtered block (`MSG_FILTERED_BLOCK | MSG_WITNESS_FLAG`).
     WitnessFilteredBlock = 0x40000003,
 }
 
@@ -314,7 +332,9 @@ impl InvType {
 /// Inventory vector: a type and a hash identifying a data object on the network.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InvVect {
+    /// The type of data object this inventory entry refers to.
     pub inv_type: InvType,
+    /// The 256-bit hash identifying the data object (block hash or txid).
     pub hash: Uint256,
 }
 
@@ -383,16 +403,22 @@ pub enum NetMessage {
     Inv(Vec<InvVect>),
     /// Request data objects by inventory.
     GetData(Vec<InvVect>),
-    /// Request block hashes in a range.
+    /// Request block hashes in a range (locator-based).
     GetBlocks {
+        /// Protocol version of the sender.
         version: u32,
+        /// Block locator hashes (exponential backoff from chain tip).
         locators: Vec<BlockHash>,
+        /// Hash to stop at, or zero for "as many as possible".
         hash_stop: BlockHash,
     },
-    /// Request block headers in a range.
+    /// Request block headers in a range (headers-first sync).
     GetHeaders {
+        /// Protocol version of the sender.
         version: u32,
+        /// Block locator hashes (exponential backoff from chain tip).
         locators: Vec<BlockHash>,
+        /// Hash to stop at, or zero for "as many as possible".
         hash_stop: BlockHash,
     },
     /// A full serialized block.
@@ -405,14 +431,22 @@ pub enum NetMessage {
     NotFound(Vec<InvVect>),
     /// Reject message (deprecated but still encountered on the network).
     Reject {
+        /// The command string of the rejected message (e.g., `"tx"`).
         message: String,
+        /// Rejection code (e.g., 0x10 for invalid, 0x12 for insufficient fee).
         code: u8,
+        /// Human-readable reason for rejection.
         reason: String,
     },
     /// Request peer to send headers instead of inv for new blocks (BIP 130).
     SendHeaders,
     /// Request compact block relay (BIP 152).
-    SendCmpct { announce: bool, version: u64 },
+    SendCmpct {
+        /// Whether to use high-bandwidth mode (unsolicited compact blocks).
+        announce: bool,
+        /// Compact block protocol version (1 = pre-segwit, 2 = segwit).
+        version: u64,
+    },
     /// Minimum fee rate filter in sat/kvB (BIP 133).
     FeeFilter(i64),
     /// Announce wtxid-based relay support (BIP 339).
@@ -422,7 +456,12 @@ pub enum NetMessage {
     /// Sent between VERSION and VERACK during handshake.
     SendAddrV2,
     /// Transaction reconciliation initiation (BIP 330).
-    SendTxRcncl { version: u32, salt: u64 },
+    SendTxRcncl {
+        /// Reconciliation protocol version.
+        version: u32,
+        /// Random salt for reconciliation sketch computation.
+        salt: u64,
+    },
     /// Compact block (BIP 152).
     CmpctBlock(Vec<u8>),
     /// Request block transactions for compact block (BIP 152).
@@ -441,29 +480,42 @@ pub enum NetMessage {
     MemPool,
     /// Request compact filter headers (BIP 157).
     GetCFHeaders {
+        /// Filter type (0 = basic).
         filter_type: u8,
+        /// Start block height.
         start_height: u32,
+        /// Hash of the last block in the requested range.
         stop_hash: BlockHash,
     },
     /// Compact filter headers response (BIP 157).
     CFHeaders(Vec<u8>),
     /// Request compact filters (BIP 157).
     GetCFilters {
+        /// Filter type (0 = basic).
         filter_type: u8,
+        /// Start block height.
         start_height: u32,
+        /// Hash of the last block in the requested range.
         stop_hash: BlockHash,
     },
     /// Compact filter response (BIP 157).
     CFilter(Vec<u8>),
     /// Request compact filter checkpoints (BIP 157).
     GetCFCheckpt {
+        /// Filter type (0 = basic).
         filter_type: u8,
+        /// Hash of the last block in the requested range.
         stop_hash: BlockHash,
     },
     /// Compact filter checkpoints response (BIP 157).
     CFCheckpt(Vec<u8>),
     /// Unknown/unrecognized message type.
-    Unknown { command: String, payload: Vec<u8> },
+    Unknown {
+        /// The command string from the message header.
+        command: String,
+        /// The raw payload bytes.
+        payload: Vec<u8>,
+    },
 }
 
 impl NetMessage {

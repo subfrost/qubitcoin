@@ -127,6 +127,7 @@ pub struct PeerRateState {
 }
 
 impl PeerRateState {
+    /// Create a new per-peer rate state initialized from the given configuration.
     pub fn new(config: &RateLimitConfig) -> Self {
         PeerRateState {
             message_limiter: TokenBucket::new(
@@ -158,6 +159,7 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
+    /// Create a new global rate limiter with the given configuration.
     pub fn new(config: RateLimitConfig) -> Self {
         let global_bw = TokenBucket::new(
             config.max_global_bytes_per_sec as f64,
@@ -305,11 +307,17 @@ pub enum RateLimitResult {
 /// Statistics for a peer connection.
 #[derive(Debug, Clone)]
 pub struct PeerStats {
+    /// Total number of messages received from this peer.
     pub messages_received: u64,
+    /// Total bytes received from this peer.
     pub bytes_received: u64,
+    /// Total number of messages sent to this peer.
     pub messages_sent: u64,
+    /// Total bytes sent to this peer.
     pub bytes_sent: u64,
+    /// Number of rate limit violations by this peer.
     pub violations: u64,
+    /// Current depth of the outbound send queue for this peer.
     pub send_queue_depth: usize,
 }
 

@@ -3,9 +3,9 @@
 //! Maps to: `src/key.h` and `src/pubkey.h` in Bitcoin Core.
 //!
 //! Provides:
-//! - [`Key`]: A private key wrapping `secp256k1::SecretKey`.
-//! - [`PubKey`]: A public key wrapping `secp256k1::PublicKey`.
-//! - [`XOnlyPubKey`]: An x-only public key for Taproot/BIP340.
+//! - `Key`: A private key wrapping `secp256k1::SecretKey`.
+//! - `PubKey`: A public key wrapping `secp256k1::PublicKey`.
+//! - `XOnlyPubKey`: An x-only public key for Taproot/BIP340.
 
 use qubitcoin_crypto::hash::hash160;
 use qubitcoin_primitives::Uint256;

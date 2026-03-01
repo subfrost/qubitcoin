@@ -44,6 +44,7 @@ pub struct BlockFilePos {
 }
 
 impl BlockFilePos {
+    /// Create a new `BlockFilePos` with the given file number and byte offset.
     pub fn new(file_no: u32, pos: u32) -> Self {
         Self { file_no, pos }
     }
@@ -56,6 +57,7 @@ impl BlockFilePos {
         }
     }
 
+    /// Returns `true` if this position is the null sentinel value.
     pub fn is_null(&self) -> bool {
         self.file_no == u32::MAX
     }

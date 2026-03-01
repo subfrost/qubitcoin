@@ -1,24 +1,32 @@
-//! In-memory database implementation backed by BTreeMap.
-//! Used for testing - no disk I/O required.
+//! In-memory database implementation backed by `BTreeMap`.
+//!
+//! Used for testing -- no disk I/O required. All operations are
+//! infallible and thread-safe via `parking_lot::RwLock`.
 
 use crate::traits::{Database, DbBatch, DbIterator};
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 
-/// Error type for MemoryDb (infallible - operations never fail).
+/// Error type for [`MemoryDb`].
+///
+/// `MemoryDb` operations are infallible, but the [`Database`] trait requires
+/// an associated error type. This enum is uninhabited.
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryDbError {
     // MemoryDb operations are infallible, but we need an error type for the trait.
 }
 
-/// In-memory key-value database backed by a BTreeMap.
+/// In-memory key-value database backed by a `BTreeMap`.
 ///
-/// Thread-safe via RwLock. Suitable for testing and in-memory blockchain operation.
+/// Thread-safe via `RwLock`. Suitable for testing and in-memory blockchain operation.
+/// Equivalent to using a `CDBWrapper` with an in-memory backend in Bitcoin Core.
 pub struct MemoryDb {
+    /// The in-memory sorted key-value store.
     data: RwLock<BTreeMap<Vec<u8>, Vec<u8>>>,
 }
 
 impl MemoryDb {
+    /// Create a new, empty `MemoryDb`.
     pub fn new() -> Self {
         MemoryDb {
             data: RwLock::new(BTreeMap::new()),
@@ -94,8 +102,11 @@ enum BatchOp {
     Delete(Vec<u8>),
 }
 
-/// Write batch for MemoryDb.
+/// Write batch for [`MemoryDb`].
+///
+/// Collects put and delete operations to be applied atomically.
 pub struct MemoryBatch {
+    /// Ordered list of pending operations.
     ops: Vec<BatchOp>,
 }
 
@@ -113,10 +124,16 @@ impl DbBatch for MemoryBatch {
     }
 }
 
-/// Iterator over MemoryDb entries.
+/// Iterator over [`MemoryDb`] entries.
+///
+/// Takes a snapshot of all entries at construction time, so mutations to
+/// the database after the iterator is created are not visible.
 pub struct MemoryIterator {
+    /// Snapshot of all key-value pairs, sorted by key.
     entries: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Current cursor position within `entries`.
     pos: usize,
+    /// Whether the iterator is positioned at a valid entry.
     valid: bool,
 }
 

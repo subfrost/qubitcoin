@@ -4,8 +4,8 @@
 //!
 //! When a block is connected, each non-coinbase transaction spends one or more
 //! UTXO entries.  Before those entries are removed from the UTXO set we snapshot
-//! them into a [`TxUndo`] (one per non-coinbase tx).  All per-tx undo records
-//! for a single block are collected into a [`BlockUndo`].
+//! them into a `TxUndo` (one per non-coinbase tx).  All per-tx undo records
+//! for a single block are collected into a `BlockUndo`.
 //!
 //! During a chain reorganization the undo data is replayed in reverse to
 //! restore the UTXO set to its pre-connection state.
@@ -80,7 +80,7 @@ impl Decodable for TxUndo {
 
 /// Undo data for an entire block.
 ///
-/// Stores [`TxUndo`] for every transaction in the block **except** the
+/// Stores `TxUndo` for every transaction in the block **except** the
 /// coinbase (which has no real inputs to undo).
 ///
 /// Port of Bitcoin Core's `CBlockUndo`.

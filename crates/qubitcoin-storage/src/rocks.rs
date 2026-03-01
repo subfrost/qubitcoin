@@ -1,5 +1,7 @@
-//! RocksDB database backend.
-//! Maps to: src/dbwrapper.cpp (LevelDB -> RocksDB)
+//! RocksDB database backend for production use.
+//!
+//! Maps to: `src/dbwrapper.cpp` in Bitcoin Core (which historically used LevelDB;
+//! this implementation uses RocksDB instead).
 
 use crate::traits::{Database, DbBatch, DbIterator};
 use std::path::Path;
@@ -7,12 +9,16 @@ use std::path::Path;
 /// Error type for RocksDB operations.
 #[derive(Debug, thiserror::Error)]
 pub enum RocksError {
+    /// An error originating from the underlying `rocksdb` library.
     #[error("RocksDB error: {0}")]
     Rocks(#[from] rocksdb::Error),
 }
 
 /// RocksDB-backed key-value database for production use.
+///
+/// Wraps a `rocksdb::DB` handle and implements the [`Database`] trait.
 pub struct RocksDatabase {
+    /// The underlying RocksDB handle.
     db: rocksdb::DB,
 }
 
@@ -29,7 +35,7 @@ impl RocksDatabase {
         Ok(RocksDatabase { db })
     }
 
-    /// Open with default options.
+    /// Open a RocksDB database with default options (4 MB write buffer).
     pub fn open_default<P: AsRef<Path>>(path: P) -> Result<Self, RocksError> {
         Self::open(path, 4) // 4 MB default write buffer
     }
@@ -84,8 +90,11 @@ impl Database for RocksDatabase {
     }
 }
 
-/// Write batch for RocksDB.
+/// Write batch for [`RocksDatabase`].
+///
+/// Wraps a `rocksdb::WriteBatch` and implements the [`DbBatch`] trait.
 pub struct RocksBatch {
+    /// The underlying RocksDB write batch.
     inner: rocksdb::WriteBatch,
 }
 
@@ -103,9 +112,13 @@ impl DbBatch for RocksBatch {
     }
 }
 
-/// Iterator over RocksDB entries.
+/// Iterator over [`RocksDatabase`] entries.
+///
+/// Wraps a `rocksdb::DBIterator` and implements the [`DbIterator`] trait.
 pub struct RocksIterator<'a> {
+    /// The underlying RocksDB iterator.
     inner: rocksdb::DBIterator<'a>,
+    /// The current key-value pair, or `None` if the iterator is exhausted.
     current: Option<(Box<[u8]>, Box<[u8]>)>,
 }
 

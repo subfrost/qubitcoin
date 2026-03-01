@@ -1,12 +1,22 @@
 //! Database abstraction traits.
-//! Maps to: src/dbwrapper.h (CDBWrapper interface)
+//!
+//! Maps to: `src/dbwrapper.h` (`CDBWrapper` interface) in Bitcoin Core.
+//!
+//! These traits define the contract for key-value storage backends used
+//! throughout Qubitcoin, including UTXO databases, block indexes, and more.
 
-/// A key-value database.
+/// A key-value database backend.
+///
+/// Equivalent to the `CDBWrapper` interface in Bitcoin Core's `src/dbwrapper.h`.
+/// Implementations must be thread-safe (`Send + Sync`).
 pub trait Database: Send + Sync {
+    /// The write-batch type produced by [`new_batch`](Database::new_batch).
     type Batch: DbBatch;
+    /// The iterator type produced by [`new_iterator`](Database::new_iterator).
     type Iterator<'a>: DbIterator
     where
         Self: 'a;
+    /// The error type returned by fallible operations.
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Read a value by key. Returns None if key doesn't exist.

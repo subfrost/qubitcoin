@@ -12,10 +12,14 @@ use qubitcoin_primitives::Uint256;
 use qubitcoin_script::{Opcode, Script};
 use qubitcoin_serialize::Encodable;
 
-/// Sighash types
+/// `SIGHASH_ALL` (0x01): sign all inputs and all outputs. Default sighash type.
 pub const SIGHASH_ALL: u32 = 1;
+/// `SIGHASH_NONE` (0x02): sign all inputs but no outputs (anyone can redirect the funds).
 pub const SIGHASH_NONE: u32 = 2;
+/// `SIGHASH_SINGLE` (0x03): sign all inputs and only the output at the same index.
 pub const SIGHASH_SINGLE: u32 = 3;
+/// `SIGHASH_ANYONECANPAY` (0x80): modifier flag; sign only the current input.
+/// Combined with a base type (e.g., `SIGHASH_ALL | SIGHASH_ANYONECANPAY`).
 pub const SIGHASH_ANYONECANPAY: u32 = 0x80;
 
 /// Mask for the base sighash type (lower 5 bits).

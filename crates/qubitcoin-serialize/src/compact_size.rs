@@ -1,5 +1,6 @@
 //! CompactSize encoding/decoding.
-//! Maps to: serialize.h (WriteCompactSize/ReadCompactSize)
+//!
+//! Maps to: `serialize.h` (`WriteCompactSize`/`ReadCompactSize`) in Bitcoin Core.
 //!
 //! Compact Size encoding:
 //!   size <  253        -> 1 byte
@@ -10,7 +11,9 @@
 use crate::encode::Error;
 use std::io::{Read, Write};
 
-/// Get the serialized size of a CompactSize value.
+/// Returns the number of bytes needed to encode `size` as a CompactSize value.
+///
+/// Results: 1 byte for values < 253, 3 bytes for <= 0xFFFF, 5 bytes for <= 0xFFFFFFFF, 9 otherwise.
 pub fn compact_size_len(size: u64) -> usize {
     if size < 253 {
         1
@@ -23,7 +26,10 @@ pub fn compact_size_len(size: u64) -> usize {
     }
 }
 
-/// Write a CompactSize-encoded value to a writer.
+/// Writes a CompactSize-encoded unsigned integer to `w`.
+///
+/// Returns the number of bytes written (1, 3, 5, or 9).
+/// Port of Bitcoin Core's `WriteCompactSize`.
 pub fn write_compact_size<W: Write>(w: &mut W, size: u64) -> Result<usize, Error> {
     if size < 253 {
         w.write_all(&[size as u8])?;
@@ -43,15 +49,19 @@ pub fn write_compact_size<W: Write>(w: &mut W, size: u64) -> Result<usize, Error
     }
 }
 
-/// Read a CompactSize-encoded value from a reader.
+/// Reads a CompactSize-encoded unsigned integer from `r`.
 ///
-/// Validates canonical encoding (smallest possible representation).
-/// If `range_check` is true, validates that the result <= MAX_SIZE.
+/// Validates canonical encoding (smallest possible representation) and
+/// rejects values exceeding [`MAX_SIZE`](crate::encode::MAX_SIZE).
+/// Port of Bitcoin Core's `ReadCompactSize`.
 pub fn read_compact_size<R: Read>(r: &mut R) -> Result<u64, Error> {
     read_compact_size_with_range(r, true)
 }
 
-/// Read a CompactSize-encoded value with optional range check.
+/// Reads a CompactSize-encoded unsigned integer with an optional range check.
+///
+/// When `range_check` is `true`, values exceeding [`MAX_SIZE`](crate::encode::MAX_SIZE)
+/// are rejected. Non-canonical encodings are always rejected regardless of this flag.
 pub fn read_compact_size_with_range<R: Read>(r: &mut R, range_check: bool) -> Result<u64, Error> {
     let mut ch_size = [0u8; 1];
     r.read_exact(&mut ch_size)?;

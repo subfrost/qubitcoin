@@ -17,19 +17,28 @@ use crate::verify_flags::ScriptVerifyFlags;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Maximum script length in bytes (for pre-tapscript).
+/// Maximum script length in bytes for pre-tapscript execution (10,000).
+///
+/// Tapscript (BIP 342) removes this limit.
 pub const MAX_SCRIPT_SIZE: usize = 10_000;
 
-/// Maximum number of non-push operations per script.
+/// Maximum number of non-push operations allowed per script (201).
 pub const MAX_OPS_PER_SCRIPT: u32 = 201;
 
-/// Sequence locktime disable flag (BIP 68).
+/// BIP 68 sequence locktime disable flag (bit 31).
+///
+/// When set on an input's `nSequence`, relative lock-time is not enforced.
 pub const SEQUENCE_LOCKTIME_DISABLE_FLAG: u32 = 1 << 31;
 
-/// Sequence locktime type flag (BIP 68).
+/// BIP 68 sequence locktime type flag (bit 22).
+///
+/// When set, the relative lock-time is interpreted as 512-second intervals
+/// rather than block heights.
 pub const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22;
 
-/// Sequence locktime mask (BIP 68).
+/// BIP 68 sequence locktime mask -- the lower 16 bits of `nSequence`.
+///
+/// Extracts the relative lock-time value (either blocks or time intervals).
 pub const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000ffff;
 
 // Taproot constants (BIP 341)
@@ -55,24 +64,31 @@ const VALIDATION_WEIGHT_OFFSET: i64 = 50;
 // Stack type
 // ---------------------------------------------------------------------------
 
-/// A single value on the script stack (byte vector).
+/// A single value on the script stack -- an arbitrary-length byte vector.
 pub type StackValue = Vec<u8>;
 
 /// The script execution stack.
+///
+/// Wraps a `Vec<StackValue>` and provides Bitcoin Core-compatible access
+/// patterns including negative-offset indexing from the top (e.g. -1 = top).
 #[derive(Clone, Debug)]
 pub struct ScriptStack {
+    /// The underlying stack storage; index 0 is the bottom.
     stack: Vec<StackValue>,
 }
 
 impl ScriptStack {
+    /// Creates an empty script stack.
     pub fn new() -> Self {
         ScriptStack { stack: Vec::new() }
     }
 
+    /// Pushes a value onto the top of the stack.
     pub fn push(&mut self, val: StackValue) {
         self.stack.push(val);
     }
 
+    /// Pops and returns the top value, or returns `ScriptError::InvalidStackOperation` if empty.
     pub fn pop(&mut self) -> Result<StackValue, ScriptError> {
         self.stack.pop().ok_or(ScriptError::InvalidStackOperation)
     }
@@ -97,10 +113,12 @@ impl ScriptStack {
         Ok(&mut self.stack[idx as usize])
     }
 
+    /// Returns the number of elements on the stack.
     pub fn size(&self) -> usize {
         self.stack.len()
     }
 
+    /// Returns `true` if the stack contains no elements.
     pub fn empty(&self) -> bool {
         self.stack.is_empty()
     }
@@ -198,26 +216,44 @@ pub fn cast_to_bool(vch: &[u8]) -> bool {
 // SigVersion & ScriptExecutionData
 // ---------------------------------------------------------------------------
 
-/// Signature version for script evaluation.
+/// Signature version controlling which hashing and validation rules apply.
+///
+/// Port of Bitcoin Core's `SigVersion` enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SigVersion {
+    /// Pre-segwit scripts. Signature hashing uses the original algorithm.
     Base,
+    /// Segwit v0 scripts (BIP 143). Uses the BIP 143 signature hash algorithm.
     WitnessV0,
+    /// Taproot key-path spending (BIP 341). Uses the BIP 341 signature hash.
     Taproot,
+    /// Tapscript (BIP 342). Uses BIP 342 signature hashing with leaf hash.
     Tapscript,
 }
 
-/// Data carried through script execution for signature checking.
+/// Mutable data carried through tapscript execution for signature checking.
+///
+/// Port of Bitcoin Core's `ScriptExecutionData`. Fields are lazily initialized
+/// (the `*_init` booleans track whether the corresponding value has been set).
 #[derive(Debug, Clone, Default)]
 pub struct ScriptExecutionData {
+    /// Whether `tapleaf_hash` has been initialized.
     pub tapleaf_hash_init: bool,
+    /// The BIP 341 tapleaf hash for the currently executing tapscript.
     pub tapleaf_hash: [u8; 32],
+    /// Whether `codeseparator_pos` has been initialized.
     pub codeseparator_pos_init: bool,
+    /// Position of the last `OP_CODESEPARATOR` in the script (0xFFFFFFFF if none).
     pub codeseparator_pos: u32,
+    /// Whether `validation_weight_left` has been initialized.
     pub validation_weight_left_init: bool,
+    /// Remaining validation weight budget for BIP 342 sigop limiting.
     pub validation_weight_left: i64,
+    /// Whether annex data has been initialized.
     pub annex_init: bool,
+    /// Whether an annex was present in the witness stack.
     pub annex_present: bool,
+    /// SHA-256 hash of the annex (if present).
     pub annex_hash: [u8; 32],
 }
 
@@ -225,17 +261,23 @@ pub struct ScriptExecutionData {
 // Witness type (local, to avoid circular dependency on qubitcoin-consensus)
 // ---------------------------------------------------------------------------
 
-/// Witness data for script verification.
+/// Witness data associated with a transaction input.
+///
+/// Port of Bitcoin Core's `CScriptWitness`. Contains the witness stack
+/// items that accompany a segwit or taproot input.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScriptWitness {
+    /// The ordered list of witness stack items (byte vectors).
     pub stack: Vec<Vec<u8>>,
 }
 
 impl ScriptWitness {
+    /// Creates an empty witness (no stack items).
     pub fn new() -> Self {
         ScriptWitness { stack: Vec::new() }
     }
 
+    /// Returns `true` if the witness stack is empty (a "null" witness).
     pub fn is_null(&self) -> bool {
         self.stack.is_empty()
     }
@@ -245,9 +287,13 @@ impl ScriptWitness {
 // SignatureChecker trait
 // ---------------------------------------------------------------------------
 
-/// Trait for checking signatures during script evaluation.
-/// Matches Bitcoin Core's BaseSignatureChecker virtual class.
+/// Trait for verifying signatures and time-locks during script evaluation.
+///
+/// Port of Bitcoin Core's `BaseSignatureChecker` virtual class.
+/// Implementors provide transaction-context-aware signature verification;
+/// the default [`BaseSignatureChecker`] always returns `false`.
 pub trait SignatureChecker {
+    /// Verifies an ECDSA signature against `pubkey` using the given `script_code` and `sigversion`.
     fn check_ecdsa_signature(
         &self,
         sig: &[u8],
@@ -256,6 +302,9 @@ pub trait SignatureChecker {
         sigversion: SigVersion,
     ) -> bool;
 
+    /// Verifies a Schnorr signature against `pubkey` using BIP 341/342 sighash rules.
+    ///
+    /// On failure, sets `error` to the appropriate [`ScriptError`] variant.
     fn check_schnorr_signature(
         &self,
         sig: &[u8],
@@ -265,8 +314,10 @@ pub trait SignatureChecker {
         error: &mut ScriptError,
     ) -> bool;
 
+    /// Checks whether the transaction's `nLockTime` satisfies `lock_time` (BIP 65).
     fn check_lock_time(&self, lock_time: &ScriptNum) -> bool;
 
+    /// Checks whether the input's `nSequence` satisfies `sequence` (BIP 112).
     fn check_sequence(&self, sequence: &ScriptNum) -> bool;
 }
 
@@ -577,10 +628,14 @@ fn stack_to_script_num(
 // eval_script - The core script VM
 // ---------------------------------------------------------------------------
 
-/// Evaluate a Bitcoin script.
+/// Evaluates a Bitcoin script on the provided `stack`.
 ///
-/// This is a 1:1 port of Bitcoin Core's `EvalScript`.
-/// Returns true on success, false on failure (with error set).
+/// This is a 1:1 port of Bitcoin Core's `EvalScript()`. Executes every
+/// opcode in `script`, using `checker` for signature / timelock validation
+/// and `flags` to control which consensus rules are enforced.
+///
+/// Returns `true` on success. On failure, `error` is set to the specific
+/// [`ScriptError`] and the function returns `false`.
 pub fn eval_script(
     stack: &mut ScriptStack,
     script: &Script,
@@ -1607,7 +1662,11 @@ pub fn eval_script(
     true
 }
 
-/// Simplified eval_script without exec_data parameter.
+/// Convenience wrapper around [`eval_script`] that creates a default
+/// [`ScriptExecutionData`] internally.
+///
+/// Use this when tapscript execution data is not needed (e.g. for
+/// `SigVersion::Base` or `SigVersion::WitnessV0`).
 pub fn eval_script_simple(
     stack: &mut ScriptStack,
     script: &Script,
@@ -1632,9 +1691,14 @@ pub fn eval_script_simple(
 // verify_script
 // ---------------------------------------------------------------------------
 
-/// Verify a complete script (scriptSig + scriptPubKey + optional witness).
+/// Verifies a complete transaction input script.
 ///
-/// This is a 1:1 port of Bitcoin Core's `VerifyScript`.
+/// Evaluates `script_sig` (the unlocking script), then `script_pubkey`
+/// (the locking script from the UTXO), applying P2SH, segwit, and
+/// taproot rules as dictated by `flags` and `witness`.
+///
+/// This is a 1:1 port of Bitcoin Core's `VerifyScript()`. Returns `true`
+/// on success; on failure, `error` is set to the specific [`ScriptError`].
 pub fn verify_script(
     script_sig: &Script,
     script_pubkey: &Script,

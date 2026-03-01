@@ -1,52 +1,65 @@
-//! Bitcoin Script type.
-//! Maps to: src/script/script.h (CScript, CScriptBase)
+//! Bitcoin Script type and standard script builders.
 //!
-//! A Script is a byte vector representing a sequence of opcodes and data pushes.
+//! Maps to: `src/script/script.h` (`CScript`, `CScriptBase`) in Bitcoin Core.
+//!
+//! A [`Script`] is a byte vector representing a sequence of opcodes and data pushes.
 //! This is the fundamental type for Bitcoin's scripting language.
 
 use crate::opcode::Opcode;
 use crate::script_num::ScriptNum;
 use std::io::{Read, Write};
 
-/// Maximum size of a single script element (520 bytes).
+/// Maximum size in bytes of a single data push in a script (520 bytes).
+///
+/// Corresponds to `MAX_SCRIPT_ELEMENT_SIZE` in Bitcoin Core.
 pub const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
 
-/// Maximum number of non-push operations per script.
+/// Maximum number of non-push operations allowed per script (201).
+///
+/// Corresponds to `MAX_OPS_PER_SCRIPT` in Bitcoin Core.
 pub const MAX_OPS_PER_SCRIPT: usize = 201;
 
-/// Maximum number of public keys per OP_CHECKMULTISIG.
+/// Maximum number of public keys allowed in an `OP_CHECKMULTISIG` operation (20).
 pub const MAX_PUBKEYS_PER_MULTISIG: usize = 20;
 
-/// Maximum number of public keys per OP_CHECKSIGADD (BIP342).
+/// Maximum number of public keys allowed in a BIP 342 `OP_CHECKSIGADD` multi-key
+/// construction (999).
 pub const MAX_PUBKEYS_PER_MULTI_A: usize = 999;
 
-/// Maximum script size in bytes.
+/// Maximum total size of a serialized script in bytes (10,000).
 pub const MAX_SCRIPT_SIZE: usize = 10_000;
 
-/// Maximum combined stack + altstack size.
+/// Maximum combined size of the main stack and the alt stack (1,000 elements).
 pub const MAX_STACK_SIZE: usize = 1000;
 
-/// Threshold for interpreting nLockTime as block height vs. timestamp.
+/// Threshold for interpreting `nLockTime` as a block height (below) vs.
+/// a Unix timestamp (at or above). Value: 500,000,000.
 pub const LOCKTIME_THRESHOLD: u32 = 500_000_000;
 
-/// Maximum nLockTime value.
+/// Maximum representable `nLockTime` value (`0xFFFFFFFF`).
 pub const LOCKTIME_MAX: u32 = 0xFFFFFFFF;
 
-/// Tapscript annex tag.
+/// BIP 341 annex tag byte (`0x50`).
+///
+/// If the last witness stack item starts with this byte and there are at
+/// least two witness items, the last item is treated as the annex.
 pub const ANNEX_TAG: u8 = 0x50;
 
-/// BIP342 validation weight per sigop passed.
+/// BIP 342 validation weight budget charged per signature operation (50).
 pub const VALIDATION_WEIGHT_PER_SIGOP_PASSED: i64 = 50;
 
-/// BIP342 validation weight offset.
+/// BIP 342 validation weight offset added to the witness size budget (50).
 pub const VALIDATION_WEIGHT_OFFSET: i64 = 50;
 
-/// Bitcoin Script.
+/// Bitcoin Script -- a sequence of opcodes and data pushes stored as a byte vector.
 ///
-/// Wraps a byte vector. Provides methods for building scripts from opcodes
-/// and for iterating over opcodes in an existing script.
+/// Port of Bitcoin Core's `CScript` (derived from `CScriptBase`).
+/// Provides builder methods for constructing scripts from opcodes and data,
+/// classification helpers for detecting standard script templates (P2PKH, P2SH,
+/// P2WPKH, P2WSH, P2TR), and an iterator for walking the opcode stream.
 #[derive(Clone, PartialEq, Eq, Hash, Default)]
 pub struct Script {
+    /// The raw script bytes.
     data: Vec<u8>,
 }
 
@@ -215,8 +228,9 @@ impl Script {
         }
     }
 
-    /// Check if the script is a pay-to-script-hash (P2SH) script.
-    /// Format: OP_HASH160 <20 bytes> OP_EQUAL
+    /// Returns `true` if this is a Pay-to-Script-Hash (P2SH) script (BIP 16).
+    ///
+    /// Format: `OP_HASH160 <20-byte hash> OP_EQUAL`
     pub fn is_p2sh(&self) -> bool {
         self.data.len() == 23
             && self.data[0] == Opcode::OpHash160 as u8
@@ -224,8 +238,9 @@ impl Script {
             && self.data[22] == Opcode::OpEqual as u8
     }
 
-    /// Check if the script is a pay-to-public-key-hash (P2PKH) script.
-    /// Format: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+    /// Returns `true` if this is a Pay-to-Public-Key-Hash (P2PKH) script.
+    ///
+    /// Format: `OP_DUP OP_HASH160 <20-byte hash> OP_EQUALVERIFY OP_CHECKSIG`
     pub fn is_p2pkh(&self) -> bool {
         self.data.len() == 25
             && self.data[0] == Opcode::OpDup as u8
@@ -235,8 +250,11 @@ impl Script {
             && self.data[24] == Opcode::OpCheckSig as u8
     }
 
-    /// Check if the script is a witness program (BIP141).
-    /// Format: OP_0/OP_1..OP_16 <2..40 bytes>
+    /// Checks if the script is a witness program (BIP 141).
+    ///
+    /// A witness program has the form: `OP_0`/`OP_1`..`OP_16` followed by a
+    /// 2-to-40 byte data push. Returns `Some((version, program))` if it
+    /// matches, or `None` otherwise.
     pub fn is_witness_program(&self) -> Option<(u8, &[u8])> {
         if self.data.len() < 4 || self.data.len() > 42 {
             return None;
@@ -263,31 +281,39 @@ impl Script {
         Some((version, &self.data[2..]))
     }
 
-    /// Check if the script is pay-to-witness-public-key-hash (P2WPKH).
-    /// Format: OP_0 <20 bytes>
+    /// Returns `true` if this is a Pay-to-Witness-Public-Key-Hash (P2WPKH) script.
+    ///
+    /// Format: `OP_0 <20-byte hash>`
     pub fn is_p2wpkh(&self) -> bool {
         self.data.len() == 22 && self.data[0] == Opcode::Op0 as u8 && self.data[1] == 0x14
     }
 
-    /// Check if the script is pay-to-witness-script-hash (P2WSH).
-    /// Format: OP_0 <32 bytes>
+    /// Returns `true` if this is a Pay-to-Witness-Script-Hash (P2WSH) script.
+    ///
+    /// Format: `OP_0 <32-byte hash>`
     pub fn is_p2wsh(&self) -> bool {
         self.data.len() == 34 && self.data[0] == Opcode::Op0 as u8 && self.data[1] == 0x20
     }
 
-    /// Check if the script is a Taproot output (P2TR).
-    /// Format: OP_1 <32 bytes>
+    /// Returns `true` if this is a Pay-to-Taproot (P2TR) script (BIP 341).
+    ///
+    /// Format: `OP_1 <32-byte x-only pubkey>`
     pub fn is_p2tr(&self) -> bool {
         self.data.len() == 34 && self.data[0] == Opcode::Op1 as u8 && self.data[1] == 0x20
     }
 
-    /// Check if the script is provably unspendable (starts with OP_RETURN).
+    /// Returns `true` if the script is provably unspendable.
+    ///
+    /// A script is unspendable if it starts with `OP_RETURN` or exceeds
+    /// [`MAX_SCRIPT_SIZE`].
     pub fn is_unspendable(&self) -> bool {
         self.data.len() > 0 && self.data[0] == Opcode::OpReturn as u8
             || self.data.len() > MAX_SCRIPT_SIZE
     }
 
-    /// Check if the script contains only push operations.
+    /// Returns `true` if every instruction in this script is a data-push operation.
+    ///
+    /// Required by BIP 62 for `scriptSig` when the `SIGPUSHONLY` flag is set.
     pub fn is_push_only(&self) -> bool {
         let mut pos = 0;
         while let Some((opcode, _, new_pos)) = self.get_op(pos) {
@@ -299,8 +325,13 @@ impl Script {
         true
     }
 
-    /// Count the number of signature operations in the script.
-    /// Does NOT count operations inside P2SH scripts.
+    /// Counts the number of signature operations (sigops) in this script.
+    ///
+    /// When `accurate` is `true`, `OP_CHECKMULTISIG` is counted using the
+    /// preceding small-integer opcode as the key count. When `false`, each
+    /// multisig is counted as [`MAX_PUBKEYS_PER_MULTISIG`] sigops.
+    ///
+    /// Does **not** descend into P2SH redeem scripts.
     pub fn get_sig_op_count(&self, accurate: bool) -> usize {
         let mut count = 0;
         let mut last_opcode = 0u8;
@@ -391,9 +422,13 @@ impl From<Vec<u8>> for Script {
     }
 }
 
-/// Iterator over script operations.
+/// Iterator over the operations (opcode + optional push data) in a [`Script`].
+///
+/// Created by [`Script::iter_ops`].
 pub struct ScriptOpsIter<'a> {
+    /// Reference to the script being iterated.
     script: &'a Script,
+    /// Current byte offset into the script.
     pos: usize,
 }
 
@@ -410,7 +445,9 @@ impl<'a> Iterator for ScriptOpsIter<'a> {
 
 // --- Standard script builders ---
 
-/// Build a P2PKH script: OP_DUP OP_HASH160 <hash> OP_EQUALVERIFY OP_CHECKSIG
+/// Builds a Pay-to-Public-Key-Hash (P2PKH) script.
+///
+/// Format: `OP_DUP OP_HASH160 <pubkey_hash> OP_EQUALVERIFY OP_CHECKSIG`
 pub fn build_p2pkh(pubkey_hash: &[u8; 20]) -> Script {
     let mut s = Script::new();
     s.push_opcode(Opcode::OpDup);
@@ -421,7 +458,9 @@ pub fn build_p2pkh(pubkey_hash: &[u8; 20]) -> Script {
     s
 }
 
-/// Build a P2SH script: OP_HASH160 <hash> OP_EQUAL
+/// Builds a Pay-to-Script-Hash (P2SH) script (BIP 16).
+///
+/// Format: `OP_HASH160 <script_hash> OP_EQUAL`
 pub fn build_p2sh(script_hash: &[u8; 20]) -> Script {
     let mut s = Script::new();
     s.push_opcode(Opcode::OpHash160);
@@ -430,7 +469,9 @@ pub fn build_p2sh(script_hash: &[u8; 20]) -> Script {
     s
 }
 
-/// Build a P2WPKH script: OP_0 <20-byte hash>
+/// Builds a Pay-to-Witness-Public-Key-Hash (P2WPKH) script (BIP 141).
+///
+/// Format: `OP_0 <20-byte pubkey_hash>`
 pub fn build_p2wpkh(pubkey_hash: &[u8; 20]) -> Script {
     let mut s = Script::new();
     s.push_opcode(Opcode::Op0);
@@ -438,7 +479,9 @@ pub fn build_p2wpkh(pubkey_hash: &[u8; 20]) -> Script {
     s
 }
 
-/// Build a P2WSH script: OP_0 <32-byte hash>
+/// Builds a Pay-to-Witness-Script-Hash (P2WSH) script (BIP 141).
+///
+/// Format: `OP_0 <32-byte script_hash>`
 pub fn build_p2wsh(script_hash: &[u8; 32]) -> Script {
     let mut s = Script::new();
     s.push_opcode(Opcode::Op0);
@@ -446,7 +489,9 @@ pub fn build_p2wsh(script_hash: &[u8; 32]) -> Script {
     s
 }
 
-/// Build a P2TR script: OP_1 <32-byte x-only pubkey>
+/// Builds a Pay-to-Taproot (P2TR) script (BIP 341).
+///
+/// Format: `OP_1 <32-byte x-only output_key>`
 pub fn build_p2tr(output_key: &[u8; 32]) -> Script {
     let mut s = Script::new();
     s.push_opcode(Opcode::Op1);
@@ -454,7 +499,10 @@ pub fn build_p2tr(output_key: &[u8; 32]) -> Script {
     s
 }
 
-/// Build an OP_RETURN script with data.
+/// Builds an `OP_RETURN` script embedding arbitrary `data`.
+///
+/// The resulting script is provably unspendable and is commonly used for
+/// data anchoring and token protocols.
 pub fn build_op_return(data: &[u8]) -> Script {
     let mut s = Script::new();
     s.push_opcode(Opcode::OpReturn);

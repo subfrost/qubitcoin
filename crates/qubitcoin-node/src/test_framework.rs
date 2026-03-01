@@ -1,12 +1,12 @@
 //! In-memory blockchain testing framework.
 //!
-//! Provides [`TestChain`], a self-contained in-memory blockchain that allows
+//! Provides `TestChain`, a self-contained in-memory blockchain that allows
 //! downstream projects to create, mine, and manipulate a chain in tests
 //! without touching disk or the network.
 //!
 //! The chain uses regtest parameters (very low proof-of-work difficulty,
-//! 150-block halving interval) and an [`EmptyCoinsView`]-backed
-//! [`CoinsViewCache`] for the UTXO set.
+//! 150-block halving interval) and an `EmptyCoinsView`-backed
+//! `CoinsViewCache` for the UTXO set.
 
 use std::sync::Arc;
 
@@ -25,7 +25,7 @@ use qubitcoin_script::{build_p2pkh, Script};
 
 /// In-memory blockchain for testing.
 ///
-/// Uses regtest parameters with an [`EmptyCoinsView`] backend. Automatically
+/// Uses regtest parameters with an `EmptyCoinsView` backend. Automatically
 /// mines a genesis block on construction so the chain starts at height 0.
 pub struct TestChain {
     /// Chain parameters (regtest).

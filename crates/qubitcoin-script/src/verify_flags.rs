@@ -1,5 +1,6 @@
 //! Script verification flags.
-//! Maps to: src/script/interpreter.h (SCRIPT_VERIFY_* constants)
+//!
+//! Maps to: `src/script/interpreter.h` (`SCRIPT_VERIFY_*` constants) in Bitcoin Core.
 
 bitflags::bitflags! {
     /// Script verification flags controlling which rules are enforced.
@@ -76,7 +77,10 @@ bitflags::bitflags! {
 }
 
 /// Mandatory script verification flags that all new blocks must comply with.
-/// Matches Bitcoin Core: P2SH | DERSIG | NULLDUMMY | CLTV | CSV | WITNESS | TAPROOT
+///
+/// Combination: `P2SH | DERSIG | NULLDUMMY | CHECKLOCKTIMEVERIFY |
+/// CHECKSEQUENCEVERIFY | WITNESS | TAPROOT`.
+/// Matches Bitcoin Core's `MANDATORY_SCRIPT_VERIFY_FLAGS`.
 pub const MANDATORY_SCRIPT_VERIFY_FLAGS: ScriptVerifyFlags = ScriptVerifyFlags::P2SH
     .union(ScriptVerifyFlags::DERSIG)
     .union(ScriptVerifyFlags::NULLDUMMY)
@@ -85,11 +89,11 @@ pub const MANDATORY_SCRIPT_VERIFY_FLAGS: ScriptVerifyFlags = ScriptVerifyFlags::
     .union(ScriptVerifyFlags::WITNESS)
     .union(ScriptVerifyFlags::TAPROOT);
 
-/// Standard script verification flags for relay policy.
-/// Matches Bitcoin Core: MANDATORY + STRICTENC + MINIMALDATA + DISCOURAGE_UPGRADABLE_NOPS +
-/// CLEANSTACK + MINIMALIF + NULLFAIL + LOW_S + DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM +
-/// WITNESS_PUBKEYTYPE + CONST_SCRIPTCODE + DISCOURAGE_UPGRADABLE_TAPROOT_VERSION +
-/// DISCOURAGE_OP_SUCCESS + DISCOURAGE_UPGRADABLE_PUBKEYTYPE
+/// Standard script verification flags used for mempool relay policy.
+///
+/// Includes all [`MANDATORY_SCRIPT_VERIFY_FLAGS`] plus additional malleability
+/// and soft-fork safeness flags. Matches Bitcoin Core's
+/// `STANDARD_SCRIPT_VERIFY_FLAGS`.
 pub const STANDARD_SCRIPT_VERIFY_FLAGS: ScriptVerifyFlags = MANDATORY_SCRIPT_VERIFY_FLAGS
     .union(ScriptVerifyFlags::STRICTENC)
     .union(ScriptVerifyFlags::MINIMALDATA)

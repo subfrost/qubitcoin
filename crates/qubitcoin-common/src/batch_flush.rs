@@ -83,6 +83,7 @@ pub struct CoinsBatch {
 }
 
 impl CoinsBatch {
+    /// Create an empty `CoinsBatch`.
     pub fn new() -> Self {
         CoinsBatch {
             puts: Vec::new(),
@@ -90,6 +91,9 @@ impl CoinsBatch {
         }
     }
 
+    /// Create a `CoinsBatch` with pre-allocated capacity.
+    ///
+    /// Allocates `cap` slots for puts and `cap / 4` for deletes.
     pub fn with_capacity(cap: usize) -> Self {
         CoinsBatch {
             puts: Vec::with_capacity(cap),
@@ -108,6 +112,7 @@ impl CoinsBatch {
         self.puts.len() + self.deletes.len()
     }
 
+    /// Returns `true` if the batch contains no operations.
     pub fn is_empty(&self) -> bool {
         self.puts.is_empty() && self.deletes.is_empty()
     }
@@ -182,6 +187,7 @@ pub struct FlushScheduler {
 }
 
 impl FlushScheduler {
+    /// Create a new `FlushScheduler` with the given configuration.
     pub fn new(config: FlushConfig) -> Self {
         FlushScheduler {
             config,

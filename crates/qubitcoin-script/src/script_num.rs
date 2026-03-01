@@ -1,5 +1,6 @@
 //! Bitcoin Script number type with consensus-critical overflow semantics.
-//! Maps to: src/script/script.h (CScriptNum)
+//!
+//! Maps to: `src/script/script.h` (`CScriptNum`) in Bitcoin Core.
 //!
 //! Script numbers are limited to 4-byte integers during operations.
 //! The range is [-2^31+1 ... 2^31-1] for operands, but the internal
@@ -7,34 +8,46 @@
 //!
 //! Encoding: little-endian with sign bit in the MSB of the last byte.
 
-/// Error for script number operations.
+/// Error returned when a [`ScriptNum`] operation fails (e.g. overflow or non-minimal encoding).
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("Script number error: {0}")]
-pub struct ScriptNumError(pub String);
+pub struct ScriptNumError(
+    /// Human-readable description of the error.
+    pub String,
+);
 
-/// Bitcoin Script number.
+/// Bitcoin Script number -- consensus-critical signed integer type.
 ///
-/// Stores as i64 internally for overflow detection.
-/// Serializes to/from variable-length byte encoding:
-/// - Little-endian magnitude
-/// - Sign bit is MSB of last byte
-/// - Minimal encoding required
+/// Port of Bitcoin Core's `CScriptNum`. Uses `i64` internally to allow
+/// overflow detection, but operands on the stack are limited to 4 bytes
+/// (range \[-2^31+1, 2^31-1\]) unless an explicit larger size is allowed.
+///
+/// The wire encoding is:
+/// - Little-endian magnitude.
+/// - The sign bit occupies the MSB of the last byte.
+/// - Minimal encoding is required (no unnecessary leading zero bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ScriptNum(i64);
 
-/// Default maximum number size in bytes for script operations.
+/// Default maximum byte-length for a script number on the stack (4 bytes).
+///
+/// The interpreter rejects numbers longer than this in most contexts.
+/// Certain operations (e.g. `OP_CHECKLOCKTIMEVERIFY`) temporarily allow 5 bytes.
 pub const DEFAULT_MAX_NUM_SIZE: usize = 4;
 
 impl ScriptNum {
-    /// Create from an i64 value.
+    /// Creates a `ScriptNum` from a raw `i64` value.
     pub const fn new(n: i64) -> Self {
         ScriptNum(n)
     }
 
-    /// Create from byte vector with consensus rules.
+    /// Decodes a `ScriptNum` from its on-stack byte representation.
     ///
-    /// `require_minimal`: reject non-minimal encodings (e.g., 0x00 for zero, extra padding)
-    /// `max_num_size`: maximum allowed byte length (default 4)
+    /// - `vch`: the raw bytes from the script stack.
+    /// - `require_minimal`: if `true`, reject non-minimal encodings (e.g. `0x00`
+    ///   for zero, unnecessary padding bytes).
+    /// - `max_num_size`: maximum allowed byte length (typically
+    ///   [`DEFAULT_MAX_NUM_SIZE`] = 4).
     pub fn from_bytes(
         vch: &[u8],
         require_minimal: bool,
@@ -64,7 +77,9 @@ impl ScriptNum {
         Ok(ScriptNum(Self::decode_bytes(vch)))
     }
 
-    /// Get as i32 with clamping to INT_MAX/INT_MIN.
+    /// Returns the value as `i32`, clamping to `i32::MAX` / `i32::MIN` on overflow.
+    ///
+    /// Port of `CScriptNum::getint()`.
     pub fn getint(&self) -> i32 {
         if self.0 > i32::MAX as i64 {
             i32::MAX
@@ -75,17 +90,23 @@ impl ScriptNum {
         }
     }
 
-    /// Get as i64.
+    /// Returns the underlying `i64` value without clamping.
     pub const fn get_i64(&self) -> i64 {
         self.0
     }
 
-    /// Serialize to byte vector.
+    /// Serializes this number to its minimal byte-vector representation.
+    ///
+    /// Zero produces an empty vector. The sign bit occupies the MSB of the
+    /// last byte.
     pub fn to_bytes(&self) -> Vec<u8> {
         Self::encode_i64(self.0)
     }
 
-    /// Encode an i64 value to script number bytes.
+    /// Encodes an `i64` value to the script number byte representation.
+    ///
+    /// This is a static helper used by [`Script::push_int`](crate::Script::push_int)
+    /// and [`ScriptNum::to_bytes`].
     pub fn encode_i64(value: i64) -> Vec<u8> {
         if value == 0 {
             return vec![];

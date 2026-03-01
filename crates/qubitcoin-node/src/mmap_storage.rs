@@ -21,19 +21,32 @@ use std::path::{Path, PathBuf};
 /// Error type for mmap operations.
 #[derive(Debug, thiserror::Error)]
 pub enum MmapError {
+    /// An underlying I/O error occurred (e.g., permission denied, disk failure).
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
+    /// The requested block file number does not exist on disk.
     #[error("Block file {0} not found")]
     FileNotFound(u32),
+    /// The requested read range exceeds the mapped file size.
     #[error("Offset {offset} + length {length} exceeds file size {file_size} in file {file_num}")]
     OutOfBounds {
+        /// Block file number.
         file_num: u32,
+        /// Byte offset of the requested read.
         offset: usize,
+        /// Number of bytes requested.
         length: usize,
+        /// Actual size of the file on disk.
         file_size: usize,
     },
+    /// The data at the given position could not be parsed as a valid block.
     #[error("Invalid block data at file {file_num} offset {offset}")]
-    InvalidData { file_num: u32, offset: usize },
+    InvalidData {
+        /// Block file number.
+        file_num: u32,
+        /// Byte offset where invalid data was found.
+        offset: usize,
+    },
 }
 
 /// A memory-mapped view of a single block file.

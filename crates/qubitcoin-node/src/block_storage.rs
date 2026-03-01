@@ -4,7 +4,7 @@
 //!
 //! Blocks and their associated undo data are written to numbered flat files
 //! in the `blocks/` subdirectory of the data directory.  Each block file is
-//! capped at [`MAX_BLOCKFILE_SIZE`] bytes; when the current file is full a
+//! capped at `MAX_BLOCKFILE_SIZE` bytes; when the current file is full a
 //! new one is opened.
 //!
 //! File naming:
@@ -119,7 +119,7 @@ impl BlockFileManager {
     /// [N bytes] serialized block data
     /// ```
     ///
-    /// If the current file would exceed [`MAX_BLOCKFILE_SIZE`], a new file is
+    /// If the current file would exceed `MAX_BLOCKFILE_SIZE`, a new file is
     /// started automatically.
     pub fn write_block(
         &self,

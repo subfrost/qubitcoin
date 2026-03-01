@@ -32,6 +32,7 @@ pub struct BlockHeader {
 }
 
 impl BlockHeader {
+    /// Create a new block header with all fields set to zero/default.
     pub fn new() -> Self {
         BlockHeader {
             version: 0,
@@ -43,6 +44,7 @@ impl BlockHeader {
         }
     }
 
+    /// Returns `true` if this header is uninitialized (bits == 0).
     pub fn is_null(&self) -> bool {
         self.bits == 0
     }
@@ -102,6 +104,7 @@ pub struct Block {
 }
 
 impl Block {
+    /// Create a new empty block with a default header and no transactions.
     pub fn new() -> Self {
         Block {
             header: BlockHeader::new(),
@@ -109,6 +112,7 @@ impl Block {
         }
     }
 
+    /// Create a new block with the given header and no transactions.
     pub fn with_header(header: BlockHeader) -> Self {
         Block {
             header,

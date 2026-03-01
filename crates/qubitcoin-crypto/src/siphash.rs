@@ -6,7 +6,12 @@
 //! - Hash table randomization
 //! - Mempool transaction ordering
 
-/// SipHash-2-4 with two 64-bit keys.
+/// Computes SipHash-2-4 with the given 128-bit key (`k0`, `k1`) and arbitrary-length `data`.
+///
+/// SipHash is a fast, cryptographically strong PRF suitable for hash tables and
+/// short message authentication. Equivalent to `CSipHasher` in Bitcoin Core.
+///
+/// Returns a 64-bit hash value.
 pub fn sip_hash(k0: u64, k1: u64, data: &[u8]) -> u64 {
     let mut v0: u64 = 0x736f6d6570736575u64 ^ k0;
     let mut v1: u64 = 0x646f72616e646f6du64 ^ k1;
@@ -55,14 +60,19 @@ pub fn sip_hash(k0: u64, k1: u64, data: &[u8]) -> u64 {
     v0 ^ v1 ^ v2 ^ v3
 }
 
-/// SipHash-2-4 optimized for a single uint256 (32-byte) input.
-/// Maps to CSipHasher::SipHashUint256 in Bitcoin Core.
+/// Computes SipHash-2-4 for a single 256-bit (32-byte) input.
+///
+/// Convenience wrapper around [`sip_hash`] for hashing `Uint256` values.
+/// Equivalent to `SipHashUint256` in Bitcoin Core.
 pub fn sip_hash_uint256(k0: u64, k1: u64, data: &[u8; 32]) -> u64 {
     sip_hash(k0, k1, data)
 }
 
-/// SipHash-2-4 for two uint64 values.
-/// Used for short transaction ID computation (BIP152).
+/// Computes SipHash-2-4 for a 256-bit value with an additional 32-bit `extra` value appended.
+///
+/// Used for short transaction ID computation in BIP-152 compact blocks.
+/// The `extra` parameter is typically the transaction index within the block.
+/// Equivalent to `SipHashUint256Extra` in Bitcoin Core.
 pub fn sip_hash_uint256_extra(k0: u64, k1: u64, data: &[u8; 32], extra: u32) -> u64 {
     let mut buf = [0u8; 36];
     buf[..32].copy_from_slice(data);

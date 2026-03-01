@@ -6,11 +6,15 @@
 use std::fmt;
 use std::ops::{Add, AddAssign, Neg, Sub, SubAssign};
 
-/// Satoshis per BTC.
+/// Number of satoshis per BTC (1 BTC = 100,000,000 satoshis).
+///
+/// Equivalent to `COIN` in Bitcoin Core's `consensus/amount.h`.
 pub const COIN: i64 = 100_000_000;
 
 /// Maximum valid amount in satoshis (consensus-critical).
-/// 21 million BTC = 2,100,000,000,000,000 satoshis.
+///
+/// 21 million BTC = 2,100,000,000,000,000 satoshis. No valid transaction output
+/// may exceed this value. Equivalent to `MAX_MONEY` in Bitcoin Core.
 pub const MAX_MONEY: i64 = 21_000_000 * COIN;
 
 /// Amount in satoshis. Can be negative (for representing fee deltas, etc.).
@@ -20,9 +24,13 @@ pub const MAX_MONEY: i64 = 21_000_000 * COIN;
 pub struct Amount(i64);
 
 impl Amount {
+    /// Zero satoshis.
     pub const ZERO: Amount = Amount(0);
+    /// One satoshi (the smallest indivisible unit).
     pub const ONE_SAT: Amount = Amount(1);
+    /// One BTC (100,000,000 satoshis).
     pub const ONE_BTC: Amount = Amount(COIN);
+    /// The maximum valid monetary amount (21 million BTC).
     pub const MAX: Amount = Amount(MAX_MONEY);
 
     /// Create from satoshis.
@@ -40,19 +48,20 @@ impl Amount {
         self.0
     }
 
-    /// Convert to BTC as f64 (for display only, not for consensus).
+    /// Converts to BTC as `f64` (for display purposes only, not for consensus calculations).
     pub fn to_btc(self) -> f64 {
         self.0 as f64 / COIN as f64
     }
 
-    /// Check if amount is in valid money range [0, MAX_MONEY].
+    /// Returns `true` if this amount is in the valid consensus range `[0, MAX_MONEY]`.
     pub fn in_money_range(self) -> bool {
         self.0 >= 0 && self.0 <= MAX_MONEY
     }
 }
 
-/// Check if a raw satoshi value is in the valid money range.
-/// Direct port of Bitcoin Core's `MoneyRange()`.
+/// Returns `true` if the raw satoshi `value` is in the valid money range `[0, MAX_MONEY]`.
+///
+/// Direct port of Bitcoin Core's `MoneyRange()` function.
 pub fn money_range(value: i64) -> bool {
     value >= 0 && value <= MAX_MONEY
 }

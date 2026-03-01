@@ -5,7 +5,7 @@
 //! Provides log-level abstraction and log categories matching Bitcoin Core's
 //! `-debug=` categories for selective subsystem logging.
 //!
-//! Prefer [`init_tracing`] over the deprecated [`init_logging`] for new code.
+//! Prefer `init_tracing` over the deprecated `init_logging` for new code.
 //! `tracing` gives structured fields, spans, and better observability compared
 //! to Bitcoin Core's `LogPrintf`.
 
@@ -16,10 +16,15 @@ static INIT: Once = Once::new();
 /// Log severity level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LogLevel {
+    /// Critical errors that may cause data loss or shutdown.
     Error,
+    /// Conditions that are not errors but may require attention.
     Warn,
+    /// General operational information (default level).
     Info,
+    /// Detailed information useful for diagnosing problems.
     Debug,
+    /// Very fine-grained diagnostic output.
     Trace,
 }
 
@@ -179,7 +184,7 @@ impl LogCategory {
 /// - Module paths in each log line.
 ///
 /// This is the preferred initialization path. See also the deprecated
-/// [`init_logging`] for backward compatibility.
+/// `init_logging` for backward compatibility.
 pub fn init_tracing(level: LogLevel) {
     use tracing_subscriber::EnvFilter;
 
@@ -198,7 +203,7 @@ pub fn init_tracing(level: LogLevel) {
 
 /// Initialize logging with the given level.
 ///
-/// **Deprecated**: use [`init_tracing`] instead for structured logging,
+/// **Deprecated**: use `init_tracing` instead for structured logging,
 /// spans, and better observability.
 ///
 /// This should be called once at application startup. Subsequent calls are

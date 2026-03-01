@@ -3,11 +3,11 @@
 //! Maps to: `src/coins.h` and `src/coins.cpp` in Bitcoin Core.
 //!
 //! This module provides:
-//! - [`Coin`]: A UTXO entry containing the output, height, and coinbase flag.
-//! - [`CoinsCacheEntry`]: A coin stored in a cache level, with DIRTY/FRESH flags.
-//! - [`CoinsView`]: Abstract trait for reading the UTXO set.
-//! - [`CoinsViewCache`]: In-memory cache over a [`CoinsView`] backend.
-//! - [`CoinsViewDB`]: Database-backed [`CoinsView`] implementation.
+//! - `Coin`: A UTXO entry containing the output, height, and coinbase flag.
+//! - `CoinsCacheEntry`: A coin stored in a cache level, with DIRTY/FRESH flags.
+//! - `CoinsView`: Abstract trait for reading the UTXO set.
+//! - `CoinsViewCache`: In-memory cache over a `CoinsView` backend.
+//! - `CoinsViewDB`: Database-backed `CoinsView` implementation.
 //! - Amount compression/decompression matching Bitcoin Core's `CompressAmount`/`DecompressAmount`.
 //! - Script compression/decompression matching Bitcoin Core's `ScriptCompression`.
 
@@ -283,8 +283,8 @@ fn read_compressed_script<R: Read>(r: &mut R) -> Result<Script, SerError> {
 ///
 /// Serialized format (matching Bitcoin Core):
 /// - `VARINT((height << 1) | coinbase_flag)`
-/// - Compressed amount via [`compress_amount`] encoded as VarInt
-/// - Compressed script via [`write_compressed_script`]
+/// - Compressed amount via `compress_amount` encoded as VarInt
+/// - Compressed script (see `write_compressed_script`)
 #[derive(Clone, Debug)]
 pub struct Coin {
     /// The unspent transaction output.
@@ -447,7 +447,7 @@ impl CoinsCacheFlags {
         self.0
     }
 
-    /// Create from raw bits.
+    /// Create a `CoinsCacheFlags` from raw bits.
     pub fn from_bits(bits: u8) -> Self {
         CoinsCacheFlags(bits)
     }

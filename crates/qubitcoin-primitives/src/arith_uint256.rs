@@ -14,21 +14,28 @@ use std::ops::{
     Mul, MulAssign, Neg, Not, Shl, ShlAssign, Shr, ShrAssign, Sub, SubAssign,
 };
 
-const WIDTH: usize = 8; // 256 / 32
+/// Number of 32-bit limbs in a 256-bit integer (256 / 32 = 8).
+const WIDTH: usize = 8;
 
-/// Error type for arithmetic operations.
+/// Error type for `ArithUint256` arithmetic operations.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ArithError {
+    /// Attempted division by zero.
     #[error("Division by zero")]
     DivisionByZero,
 }
 
-/// 256-bit unsigned integer for arithmetic operations (difficulty calculations).
+/// A 256-bit unsigned integer with full arithmetic operations for difficulty calculations.
 ///
-/// Represented as 8 x u32 limbs in little-endian order (least significant first).
-/// This mirrors Bitcoin Core's `base_uint<256>` / `arith_uint256`.
+/// Represented as 8 x `u32` limbs in little-endian order (least significant first).
+/// Supports addition, subtraction, multiplication, division, bitwise operations,
+/// and shifts. Also provides compact encoding/decoding for the `nBits` field in
+/// block headers.
+///
+/// Equivalent to `base_uint<256>` / `arith_uint256` in Bitcoin Core.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ArithUint256 {
+    /// The 8 limbs of the 256-bit number, with `pn[0]` being the least significant.
     pn: [u32; WIDTH],
 }
 
@@ -39,12 +46,12 @@ impl Default for ArithUint256 {
 }
 
 impl ArithUint256 {
-    /// Create zero value.
+    /// Creates a new `ArithUint256` with value zero.
     pub const fn zero() -> Self {
         ArithUint256 { pn: [0u32; WIDTH] }
     }
 
-    /// Create from u64.
+    /// Creates a new `ArithUint256` from a `u64` value, zero-extending to 256 bits.
     pub const fn from_u64(b: u64) -> Self {
         let mut pn = [0u32; WIDTH];
         pn[0] = b as u32;
@@ -52,12 +59,12 @@ impl ArithUint256 {
         ArithUint256 { pn }
     }
 
-    /// Get the low 64 bits.
+    /// Returns the low 64 bits of this 256-bit integer.
     pub fn low64(&self) -> u64 {
         self.pn[0] as u64 | ((self.pn[1] as u64) << 32)
     }
 
-    /// Get as f64 approximation.
+    /// Returns an `f64` approximation of this value (for display or logging, not consensus).
     pub fn to_f64(&self) -> f64 {
         let mut ret = 0.0f64;
         let mut fact = 1.0f64;
@@ -68,7 +75,10 @@ impl ArithUint256 {
         ret
     }
 
-    /// Returns the position of the highest bit set plus one, or zero if value is zero.
+    /// Returns the position of the highest set bit plus one, or zero if the value is zero.
+    ///
+    /// For example, `bits()` returns 1 for value 1, 8 for value 255, and 9 for value 256.
+    /// Equivalent to `base_uint::bits()` in Bitcoin Core.
     pub fn bits(&self) -> u32 {
         for pos in (0..WIDTH).rev() {
             if self.pn[pos] != 0 {
@@ -83,7 +93,7 @@ impl ArithUint256 {
         0
     }
 
-    /// Numeric comparison (most significant limb first).
+    /// Performs numeric comparison, checking limbs from most significant to least significant.
     pub fn compare_to(&self, other: &ArithUint256) -> Ordering {
         for i in (0..WIDTH).rev() {
             if self.pn[i] < other.pn[i] {
@@ -96,7 +106,7 @@ impl ArithUint256 {
         Ordering::Equal
     }
 
-    /// Check equality with a u64 value.
+    /// Returns `true` if this 256-bit value equals the given `u64` (upper limbs must be zero).
     pub fn equal_to_u64(&self, b: u64) -> bool {
         for i in (2..WIDTH).rev() {
             if self.pn[i] != 0 {
@@ -106,13 +116,13 @@ impl ArithUint256 {
         self.pn[1] == (b >> 32) as u32 && self.pn[0] == (b & 0xffffffff) as u32
     }
 
-    /// Get hex representation (most significant digits first).
+    /// Returns the hexadecimal string representation (most significant digits first).
     pub fn to_hex(&self) -> String {
         let u256 = arith_to_uint256(self);
         u256.to_hex()
     }
 
-    /// Increment (prefix ++).
+    /// Increments this value by one in-place, with carry propagation.
     pub fn inc(&mut self) {
         let mut i = 0;
         while i < WIDTH {
@@ -124,7 +134,7 @@ impl ArithUint256 {
         }
     }
 
-    /// Decrement (prefix --).
+    /// Decrements this value by one in-place, with borrow propagation.
     pub fn dec(&mut self) {
         let mut i = 0;
         while i < WIDTH {
@@ -137,14 +147,20 @@ impl ArithUint256 {
         }
     }
 
-    /// Set from compact representation (nBits field in block header).
+    /// Decodes a compact difficulty representation (`nBits` field in block headers) into
+    /// this 256-bit integer.
     ///
     /// The compact format encodes a 256-bit number as a 32-bit value:
-    /// - Top 8 bits: exponent (number of bytes)
-    /// - Bit 24: sign bit
+    /// - Top 8 bits: exponent (number of bytes in the mantissa)
+    /// - Bit 23: sign bit (negative targets are invalid but representable)
     /// - Lower 23 bits: mantissa
     ///
-    /// N = (-1^sign) * mantissa * 256^(exponent-3)
+    /// The decoded value is: `N = (-1^sign) * mantissa * 256^(exponent-3)`
+    ///
+    /// Returns `(negative, overflow)` where `negative` indicates the sign bit was set
+    /// and `overflow` indicates the compact value overflows 256 bits.
+    ///
+    /// Equivalent to `arith_uint256::SetCompact()` in Bitcoin Core.
     pub fn set_compact(&mut self, compact: u32) -> (bool, bool) {
         let n_size = (compact >> 24) as i32;
         let mut n_word = compact & 0x007fffff;
@@ -165,7 +181,12 @@ impl ArithUint256 {
         (negative, overflow)
     }
 
-    /// Get compact representation (nBits field for block header).
+    /// Encodes this 256-bit integer into compact difficulty representation (`nBits`).
+    ///
+    /// If `negative` is true, the sign bit is set in the result. This is the inverse
+    /// of [`set_compact`](Self::set_compact).
+    ///
+    /// Equivalent to `arith_uint256::GetCompact()` in Bitcoin Core.
     pub fn get_compact(&self, negative: bool) -> u32 {
         let mut n_size = (self.bits() as i32 + 7) / 8;
         let mut n_compact: u32;
@@ -477,8 +498,10 @@ impl fmt::Display for ArithUint256 {
 
 // --- Conversion functions ---
 
-/// Convert ArithUint256 to Uint256.
-/// Writes limbs as little-endian bytes.
+/// Converts an [`ArithUint256`] to a [`Uint256`] by writing limbs as little-endian bytes.
+///
+/// This is used when an arithmetic result (e.g., a difficulty target) needs to be
+/// stored or compared as an opaque hash blob. Equivalent to `ArithToUint256()` in Bitcoin Core.
 pub fn arith_to_uint256(a: &ArithUint256) -> Uint256 {
     let mut data = [0u8; 32];
     for x in 0..WIDTH {
@@ -488,8 +511,10 @@ pub fn arith_to_uint256(a: &ArithUint256) -> Uint256 {
     Uint256::from_bytes(data)
 }
 
-/// Convert Uint256 to ArithUint256.
-/// Reads limbs as little-endian bytes.
+/// Converts a [`Uint256`] to an [`ArithUint256`] by reading limbs as little-endian bytes.
+///
+/// This is used when a hash blob (e.g., a block hash) needs to be compared against
+/// a difficulty target. Equivalent to `UintToArith256()` in Bitcoin Core.
 pub fn uint256_to_arith(a: &Uint256) -> ArithUint256 {
     let data = a.data();
     let mut result = ArithUint256::default();

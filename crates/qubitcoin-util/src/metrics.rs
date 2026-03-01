@@ -28,6 +28,7 @@ pub struct Counter {
 }
 
 impl Counter {
+    /// Create a new counter with the given Prometheus metric name and help text.
     pub fn new(name: &str, help: &str) -> Self {
         Counter {
             value: AtomicU64::new(0),
@@ -36,18 +37,22 @@ impl Counter {
         }
     }
 
+    /// Increment the counter by 1.
     pub fn inc(&self) {
         self.value.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increment the counter by `v`.
     pub fn inc_by(&self, v: u64) {
         self.value.fetch_add(v, Ordering::Relaxed);
     }
 
+    /// Read the current counter value.
     pub fn get(&self) -> u64 {
         self.value.load(Ordering::Relaxed)
     }
 
+    /// Render this counter in Prometheus exposition format.
     pub fn format_prometheus(&self) -> String {
         format!(
             "# HELP {} {}\n# TYPE {} counter\n{} {}\n",
@@ -69,6 +74,7 @@ pub struct Gauge {
 }
 
 impl Gauge {
+    /// Create a new gauge with the given Prometheus metric name and help text.
     pub fn new(name: &str, help: &str) -> Self {
         Gauge {
             value: AtomicI64::new(0),
@@ -77,22 +83,27 @@ impl Gauge {
         }
     }
 
+    /// Set the gauge to an absolute value.
     pub fn set(&self, v: i64) {
         self.value.store(v, Ordering::Relaxed);
     }
 
+    /// Increment the gauge by 1.
     pub fn inc(&self) {
         self.value.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Decrement the gauge by 1.
     pub fn dec(&self) {
         self.value.fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// Read the current gauge value.
     pub fn get(&self) -> i64 {
         self.value.load(Ordering::Relaxed)
     }
 
+    /// Render this gauge in Prometheus exposition format.
     pub fn format_prometheus(&self) -> String {
         format!(
             "# HELP {} {}\n# TYPE {} gauge\n{} {}\n",
@@ -117,6 +128,7 @@ pub struct Histogram {
 }
 
 impl Histogram {
+    /// Create a new histogram with explicit bucket boundaries.
     pub fn new(name: &str, help: &str, buckets: Vec<f64>) -> Self {
         let counts = buckets.iter().map(|_| AtomicU64::new(0)).collect();
         Histogram {
@@ -140,6 +152,7 @@ impl Histogram {
         )
     }
 
+    /// Record an observed value, updating bucket counts, sum, and total count.
     pub fn observe(&self, value: f64) {
         // Update sum
         loop {
@@ -172,6 +185,7 @@ impl Histogram {
         }
     }
 
+    /// Render this histogram in Prometheus exposition format.
     pub fn format_prometheus(&self) -> String {
         let mut output = format!(
             "# HELP {} {}\n# TYPE {} histogram\n",
@@ -198,6 +212,9 @@ impl Histogram {
 }
 
 /// Timer guard for histogram observations.
+///
+/// Records the elapsed wall-clock time as an observation when dropped.
+/// Obtain one via [`Histogram::start_timer`].
 pub struct HistogramTimer<'a> {
     histogram: &'a Histogram,
     start: Instant,
@@ -215,51 +232,90 @@ impl<'a> Drop for HistogramTimer<'a> {
 // ---------------------------------------------------------------------------
 
 /// All metrics for a Qubitcoin node.
+///
+/// Provides counters, gauges, and histograms covering block processing,
+/// P2P networking, mempool, UTXO cache, RPC, script verification, and reorgs.
 pub struct NodeMetrics {
-    // Block metrics
+    // -- Block metrics --
+
+    /// Total number of blocks processed (monotonic counter).
     pub blocks_processed: Counter,
+    /// Current best block height.
     pub block_height: Gauge,
+    /// Time spent validating blocks (seconds).
     pub block_validation_seconds: Histogram,
+    /// Time spent connecting blocks to the active chain (seconds).
     pub block_connect_seconds: Histogram,
+    /// Distribution of block sizes in bytes.
     pub block_size_bytes: Histogram,
 
-    // P2P metrics
+    // -- P2P metrics --
+
+    /// Number of currently connected peers.
     pub peers_connected: Gauge,
+    /// Number of inbound peer connections.
     pub peers_inbound: Gauge,
+    /// Number of outbound peer connections.
     pub peers_outbound: Gauge,
+    /// Total P2P messages received (monotonic counter).
     pub messages_received: Counter,
+    /// Total P2P messages sent (monotonic counter).
     pub messages_sent: Counter,
+    /// Total bytes received from peers (monotonic counter).
     pub bytes_received: Counter,
+    /// Total bytes sent to peers (monotonic counter).
     pub bytes_sent: Counter,
+    /// Total peer disconnections (monotonic counter).
     pub peer_disconnections: Counter,
 
-    // Mempool metrics
+    // -- Mempool metrics --
+
+    /// Number of transactions currently in the mempool.
     pub mempool_size: Gauge,
+    /// Total size of mempool transactions in bytes.
     pub mempool_bytes: Gauge,
+    /// Total transactions accepted into the mempool (monotonic counter).
     pub mempool_accepted: Counter,
+    /// Total transactions rejected from the mempool (monotonic counter).
     pub mempool_rejected: Counter,
 
-    // UTXO cache metrics
+    // -- UTXO cache metrics --
+
+    /// Number of entries in the UTXO cache.
     pub utxo_cache_size: Gauge,
+    /// Total UTXO cache hits (monotonic counter).
     pub utxo_cache_hits: Counter,
+    /// Total UTXO cache misses (monotonic counter).
     pub utxo_cache_misses: Counter,
+    /// Time spent flushing the UTXO cache to disk (seconds).
     pub utxo_flush_seconds: Histogram,
 
-    // RPC metrics
+    // -- RPC metrics --
+
+    /// Total RPC requests received (monotonic counter).
     pub rpc_requests: Counter,
+    /// Total RPC errors returned (monotonic counter).
     pub rpc_errors: Counter,
+    /// Distribution of RPC request latencies (seconds).
     pub rpc_latency_seconds: Histogram,
 
-    // Script verification metrics
+    // -- Script verification metrics --
+
+    /// Total script verifications performed (monotonic counter).
     pub script_verifications: Counter,
+    /// Time spent on script verification (seconds).
     pub script_verification_seconds: Histogram,
 
-    // Reorg metrics
+    // -- Reorg metrics --
+
+    /// Total chain reorganizations (monotonic counter).
     pub chain_reorgs: Counter,
+    /// Distribution of chain reorganization depths (in blocks).
     pub reorg_depth: Histogram,
 }
 
 impl NodeMetrics {
+    /// Create a new metrics registry with all counters, gauges, and histograms initialized to zero.
     pub fn new() -> Self {
         NodeMetrics {
             // Block metrics

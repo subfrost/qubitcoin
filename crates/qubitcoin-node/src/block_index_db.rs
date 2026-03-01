@@ -1,12 +1,12 @@
-//! Block index database: persists [`BlockIndex`] entries to a key-value store.
+//! Block index database: persists `BlockIndex` entries to a key-value store.
 //!
 //! Maps to: `src/txdb.h` / `src/txdb.cpp` (`CBlockTreeDB`) in Bitcoin Core.
 //!
 //! The database stores block index entries keyed by `[b'b' | block_hash(32)]`
 //! and the last known block file number under key `[b'F']`.
 //!
-//! Because [`BlockIndex`] uses arena-style parent/skip indices that are
-//! only meaningful at runtime, loading produces [`BlockIndexRecord`] values
+//! Because `BlockIndex` uses arena-style parent/skip indices that are
+//! only meaningful at runtime, loading produces `BlockIndexRecord` values
 //! instead. The caller is responsible for rebuilding the in-memory arena
 //! from those records.
 
@@ -32,27 +32,42 @@ const KEY_LAST_BLOCK_FILE: &[u8] = &[b'F'];
 // BlockIndexRecord
 // ---------------------------------------------------------------------------
 
-/// A flat record containing all persistable fields of a [`BlockIndex`].
+/// A flat record containing all persistable fields of a `BlockIndex`.
 ///
 /// Returned by [`BlockIndexDB::load_all`] so that callers can rebuild the
 /// arena-based in-memory block index without depending on runtime-only fields
 /// like `prev` (arena index), `skip`, `sequence_id`, or `time_max`.
 #[derive(Clone, Debug)]
 pub struct BlockIndexRecord {
+    /// The double-SHA256 hash of the block header.
     pub block_hash: BlockHash,
+    /// Block header version field.
     pub version: i32,
+    /// Hash of the previous block header.
     pub prev_blockhash: BlockHash,
+    /// Merkle root of the block's transactions.
     pub merkle_root: Uint256,
+    /// Block timestamp (Unix epoch seconds).
     pub time: u32,
+    /// Compact representation of the proof-of-work target (`nBits`).
     pub bits: u32,
+    /// Nonce used to satisfy the proof-of-work.
     pub nonce: u32,
+    /// Height of this block in the chain (0 = genesis).
     pub height: i32,
+    /// Raw `BlockStatus` bitfield (validity and data-availability flags).
     pub status_bits: u32,
+    /// Block file number where this block's data is stored.
     pub file: i32,
+    /// Byte offset of block data within the block file.
     pub data_pos: u32,
+    /// Byte offset of undo data within the undo (rev) file.
     pub undo_pos: u32,
+    /// Number of transactions in this block.
     pub tx_count: u32,
+    /// Total number of transactions in the chain up to and including this block.
     pub chain_tx_count: u64,
+    /// Cumulative proof-of-work as a 32-byte big-endian [`ArithUint256`].
     pub chain_work_bytes: [u8; 32],
 }
 
@@ -67,7 +82,7 @@ impl BlockIndexRecord {
 // Serialization helpers (little-endian, matching Bitcoin Core wire format)
 // ---------------------------------------------------------------------------
 
-/// Serialize a [`BlockIndex`] to bytes.
+/// Serialize a `BlockIndex` to bytes.
 ///
 /// Field order:
 ///   height (i32) | version (i32) | prev_blockhash (32) | merkle_root (32)
@@ -95,7 +110,7 @@ fn serialize_block_index(entry: &BlockIndex) -> Vec<u8> {
     buf
 }
 
-/// Deserialize a [`BlockIndexRecord`] from bytes.
+/// Deserialize a `BlockIndexRecord` from bytes.
 ///
 /// `block_hash` is provided separately because it is encoded in the key, not
 /// the value.
@@ -194,7 +209,7 @@ fn block_index_key(hash: &BlockHash) -> Vec<u8> {
 /// Persistent block-index database.
 ///
 /// Wraps a [`DbWrapper`] and provides typed read/write operations for
-/// [`BlockIndex`] entries and block-file bookkeeping.
+/// `BlockIndex` entries and block-file bookkeeping.
 ///
 /// Maps to `CBlockTreeDB` in Bitcoin Core.
 pub struct BlockIndexDB<D: Database> {
@@ -254,7 +269,7 @@ impl<D: Database> BlockIndexDB<D> {
 
     /// Load all block index entries from the database.
     ///
-    /// Returns [`BlockIndexRecord`] values (not full [`BlockIndex`]) because
+    /// Returns `BlockIndexRecord` values (not full `BlockIndex`) because
     /// arena-based parent/skip links must be rebuilt by the caller.
     ///
     /// Entries whose key does not start with the block-index prefix byte or
@@ -326,7 +341,7 @@ mod tests {
     use qubitcoin_primitives::{ArithUint256, BlockHash, Uint256};
     use qubitcoin_storage::MemoryDb;
 
-    /// Helper: create a [`BlockIndex`] with recognisable field values.
+    /// Helper: create a `BlockIndex` with recognisable field values.
     fn make_test_block_index(height: i32, hash_byte: u8) -> BlockIndex {
         let mut hash_data = [0u8; 32];
         hash_data[0] = hash_byte;

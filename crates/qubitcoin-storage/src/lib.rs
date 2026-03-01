@@ -1,18 +1,24 @@
-//! qubitcoin-storage: Database abstraction for Qubitcoin.
+//! Database abstraction and block storage for Qubitcoin.
 //!
-//! Maps to: src/dbwrapper.h
+//! Maps to: `src/dbwrapper.h` and `src/node/blockstorage.h` in Bitcoin Core.
 //!
 //! Provides:
-//! - `Database`, `DbBatch`, `DbIterator` traits
-//! - `MemoryDb` (BTreeMap-backed, for testing)
-//! - `RocksDatabase` (production, behind `rocksdb-backend` feature)
-//! - `DbWrapper<D>` with typed serialization + XOR obfuscation
+//! - [`Database`], [`DbBatch`], [`DbIterator`] -- abstract traits for key-value storage.
+//! - [`MemoryDb`] -- `BTreeMap`-backed in-memory database (for testing).
+//! - [`RocksDatabase`] -- production RocksDB backend (behind `rocksdb-backend` feature).
+//! - [`DbWrapper`] -- typed serialization with optional XOR obfuscation.
+//! - [`BlockFileManager`] -- flat-file block storage (`blk?????.dat`).
 
+/// Flat-file block storage manager. Equivalent to `FlatFileSeq` / `BlockManager` in Bitcoin Core.
 pub mod block_file;
+/// In-memory database backend for testing.
 pub mod memory;
+/// RocksDB production database backend (requires the `rocksdb-backend` feature).
 #[cfg(feature = "rocksdb-backend")]
 pub mod rocks;
+/// Core database abstraction traits ([`Database`], [`DbBatch`], [`DbIterator`]).
 pub mod traits;
+/// Typed serialization wrapper with XOR obfuscation. Equivalent to `CDBWrapper` in Bitcoin Core.
 pub mod wrapper;
 
 pub use block_file::{

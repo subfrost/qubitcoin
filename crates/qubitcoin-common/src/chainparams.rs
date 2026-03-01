@@ -3,8 +3,8 @@
 //! Maps to: `src/kernel/chainparams.h` and `src/kernel/chainparams.cpp` in Bitcoin Core.
 //!
 //! Provides:
-//! - [`Network`]: Enum identifying mainnet, testnet, regtest, or signet.
-//! - [`ChainParams`]: Full chain parameters for a given network, including
+//! - `Network`: Enum identifying mainnet, testnet, regtest, or signet.
+//! - `ChainParams`: Full chain parameters for a given network, including
 //!   consensus params, default port, address prefixes, and genesis block hash.
 
 use qubitcoin_consensus::block::{Block, BlockHeader};
@@ -17,10 +17,15 @@ use std::sync::Arc;
 /// Network type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Network {
+    /// Bitcoin mainnet (production network).
     Mainnet,
+    /// Bitcoin testnet3 (legacy test network).
     Testnet,
+    /// Bitcoin testnet4 (newer test network, May 2024).
     Testnet4,
+    /// Regression test network (local, instant mining).
     Regtest,
+    /// Signet (signature-based test network with centralized block production).
     Signet,
 }
 

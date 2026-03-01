@@ -3,7 +3,7 @@
 //! Maps to: `src/util/time.h` and `src/util/time.cpp` in Bitcoin Core.
 //!
 //! Provides functions for getting the current time at various granularities,
-//! formatting timestamps, and a [`MockClock`] for deterministic testing.
+//! formatting timestamps, and a `MockClock` for deterministic testing.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};

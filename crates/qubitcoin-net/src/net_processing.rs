@@ -2,7 +2,7 @@
 //!
 //! Maps to: src/net_processing.cpp (PeerManagerImpl)
 //!
-//! The [`NetProcessor`] consumes [`ConnectionEvent`]s from the connection layer
+//! The `NetProcessor` consumes `ConnectionEvent`s from the connection layer
 //! and dispatches appropriate responses. It is the bridge between the raw P2P
 //! transport (connection.rs) and the higher-level node logic (validation,
 //! mempool, chain state).

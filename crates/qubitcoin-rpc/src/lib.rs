@@ -17,7 +17,11 @@
 //! - [`node_rpc`] -- RPC method handlers wired to shared, mutable
 //!   [`node_rpc::NodeState`] for live node data.
 
+/// HTTP/1.1 server that accepts JSON-RPC requests over TCP with optional Basic Auth.
 pub mod http_server;
+/// Stub implementations of all RPC methods (blockchain, mining, network, mempool, utility).
 pub mod methods;
+/// RPC method handlers wired to shared, mutable `NodeState` for live node data.
 pub mod node_rpc;
+/// Core RPC types (request, response, error), `RpcRegistry` handler dispatch, and request processing.
 pub mod server;

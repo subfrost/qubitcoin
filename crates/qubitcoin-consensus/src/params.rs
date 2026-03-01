@@ -34,11 +34,15 @@ pub struct ConsensusParams {
     /// Number of blocks in a retargeting period.
     pub miner_confirmation_window: u32,
 
-    /// Proof-of-work parameters
+    /// Proof-of-work upper bound. No target may exceed this value.
     pub pow_limit: Uint256,
-    pub pow_target_timespan: i64, // seconds
-    pub pow_target_spacing: i64,  // seconds
+    /// Target timespan for difficulty adjustment, in seconds (e.g., 2 weeks for mainnet).
+    pub pow_target_timespan: i64,
+    /// Target time between blocks, in seconds (e.g., 600 for mainnet = 10 minutes).
+    pub pow_target_spacing: i64,
+    /// Whether to allow minimum-difficulty blocks (testnet rule).
     pub pow_allow_min_difficulty_blocks: bool,
+    /// Whether to disable difficulty retargeting entirely (regtest rule).
     pub pow_no_retargeting: bool,
 
     /// The best chain should have at least this much work.

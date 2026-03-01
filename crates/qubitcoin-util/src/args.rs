@@ -7,7 +7,7 @@
 //! - `-key` as boolean true
 //! - `-nokey` as boolean false (negation prefix)
 //! - Multiple values for the same key (e.g., `-connect=a -connect=b`)
-//! - Default values via [`ArgsManager::set_default`]
+//! - Default values via `ArgsManager::set_default`
 
 use std::collections::HashMap;
 

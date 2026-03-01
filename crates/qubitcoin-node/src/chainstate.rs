@@ -4,11 +4,11 @@
 //! (specifically `Chainstate` and `ChainstateManager`).
 //!
 //! This module provides:
-//! - [`BlockMap`]: Arena-based storage for block indices (replaces Bitcoin Core's
+//! - `BlockMap`: Arena-based storage for block indices (replaces Bitcoin Core's
 //!   pointer-based `BlockMap` / `std::unordered_map<uint256, CBlockIndex*>`).
-//! - [`Chainstate`]: A single chainstate instance holding the active chain and
+//! - `Chainstate`: A single chainstate instance holding the active chain and
 //!   UTXO cache tip.
-//! - [`ChainstateManager`]: Top-level manager that owns the block index, chain
+//! - `ChainstateManager`: Top-level manager that owns the block index, chain
 //!   parameters, and the active chainstate. Entry point for block processing.
 
 use crate::undo::BlockUndo;

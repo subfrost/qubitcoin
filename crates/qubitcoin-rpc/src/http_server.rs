@@ -4,7 +4,7 @@
 //! HTTP server for JSON-RPC.
 //!
 //! Listens on a configurable address and dispatches incoming HTTP POST
-//! requests to the [`RpcRegistry`] for JSON-RPC processing.  Authentication
+//! requests to the `RpcRegistry` for JSON-RPC processing.  Authentication
 //! via HTTP Basic Auth is supported when `rpc_user` / `rpc_password` are set.
 
 use crate::server::{process_request, RpcRegistry};

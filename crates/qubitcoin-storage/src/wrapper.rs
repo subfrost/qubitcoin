@@ -1,26 +1,37 @@
-//! DbWrapper: typed serialization + XOR obfuscation layer.
-//! Maps to: src/dbwrapper.h (CDBWrapper)
+//! `DbWrapper`: typed serialization + XOR obfuscation layer.
+//!
+//! Maps to: `CDBWrapper` in Bitcoin Core's `src/dbwrapper.h`.
+//!
+//! This module wraps a raw `Database` with:
+//! 1. Typed key/value serialization via `Encodable`/`Decodable`.
+//! 2. XOR obfuscation of stored values (matching Bitcoin Core).
+//!
+//! The obfuscation key is persisted in the database under a well-known key
+//! so that values remain readable across restarts.
 
 use crate::traits::{Database, DbBatch};
 use qubitcoin_serialize::{Decodable, Encodable, Error as SerError};
 use std::io::Cursor;
 
-/// Database wrapper that provides:
-/// 1. Typed key/value serialization using Encodable/Decodable
-/// 2. XOR obfuscation of values (port of Bitcoin Core's obfuscation)
-/// 3. Key prefixing
+/// Database wrapper providing typed serialization and optional XOR obfuscation.
 ///
-/// The obfuscation key is stored in the database itself under a special key.
-/// This prevents casual inspection of the database values.
+/// Wraps a raw `Database` implementation. When obfuscation is enabled, all
+/// values are XOR-ed with a random 8-byte key before being written and
+/// un-XOR-ed on read. The obfuscation key itself is stored unobfuscated
+/// under the `OBFUSCATION_KEY_KEY` constant.
+///
+/// Equivalent to `CDBWrapper` in Bitcoin Core.
 pub struct DbWrapper<D: Database> {
+    /// The underlying raw database.
     db: D,
+    /// The XOR obfuscation key (empty if obfuscation is disabled).
     obfuscation_key: Vec<u8>,
 }
 
-/// The key under which the obfuscation key is stored.
+/// The database key under which the obfuscation key is stored.
 const OBFUSCATION_KEY_KEY: &[u8] = b"\x0e\x00obfuscate_key";
 
-/// Length of the obfuscation key in bytes.
+/// Length of the obfuscation key in bytes (8).
 const OBFUSCATION_KEY_LEN: usize = 8;
 
 impl<D: Database> DbWrapper<D> {
@@ -112,7 +123,7 @@ impl<D: Database> DbWrapper<D> {
             .map_err(|e| DbWrapperError::Db(e.to_string()))
     }
 
-    /// Get the underlying database.
+    /// Get a reference to the underlying raw [`Database`].
     pub fn inner(&self) -> &D {
         &self.db
     }
@@ -128,11 +139,13 @@ impl<D: Database> DbWrapper<D> {
     }
 }
 
-/// Error type for DbWrapper operations.
+/// Error type for [`DbWrapper`] operations.
 #[derive(Debug, thiserror::Error)]
 pub enum DbWrapperError {
+    /// An error from the underlying database backend.
     #[error("Database error: {0}")]
     Db(String),
+    /// A serialization or deserialization error.
     #[error("Serialization error: {0}")]
     Serialize(SerError),
 }

@@ -1,161 +1,295 @@
 //! Bitcoin Script opcodes.
-//! Maps to: src/script/script.h (opcodetype enum)
+//!
+//! Maps to: `src/script/script.h` (`opcodetype` enum) in Bitcoin Core.
 //!
 //! Complete enumeration of all Bitcoin Script opcodes including
 //! disabled, reserved, and tapscript opcodes.
 
 /// All Bitcoin Script opcodes.
 ///
-/// Port of Bitcoin Core's `opcodetype` enum. Values match byte values in script.
+/// Port of Bitcoin Core's `opcodetype` enum. The discriminant values match the
+/// byte values used in serialized scripts, so `Opcode as u8` gives the on-wire byte.
+///
+/// Opcodes 0x01..=0x4b are *direct data push* instructions (push the next N
+/// bytes) and are handled by the script parser rather than this enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Opcode {
-    // Push value
+    // -- Push value --
+
+    /// Push an empty byte vector onto the stack (also known as `OP_FALSE`).
     Op0 = 0x00,
+    /// The next byte contains the number of bytes to push.
     OpPushData1 = 0x4c,
+    /// The next two bytes (little-endian) contain the number of bytes to push.
     OpPushData2 = 0x4d,
+    /// The next four bytes (little-endian) contain the number of bytes to push.
     OpPushData4 = 0x4e,
+    /// Push the number -1 onto the stack.
     Op1Negate = 0x4f,
+    /// Reserved opcode. Transaction is invalid unless found in an unexecuted `OP_IF` branch.
     OpReserved = 0x50,
+    /// Push the number 1 onto the stack (also known as `OP_TRUE`).
     Op1 = 0x51,
+    /// Push the number 2 onto the stack.
     Op2 = 0x52,
+    /// Push the number 3 onto the stack.
     Op3 = 0x53,
+    /// Push the number 4 onto the stack.
     Op4 = 0x54,
+    /// Push the number 5 onto the stack.
     Op5 = 0x55,
+    /// Push the number 6 onto the stack.
     Op6 = 0x56,
+    /// Push the number 7 onto the stack.
     Op7 = 0x57,
+    /// Push the number 8 onto the stack.
     Op8 = 0x58,
+    /// Push the number 9 onto the stack.
     Op9 = 0x59,
+    /// Push the number 10 onto the stack.
     Op10 = 0x5a,
+    /// Push the number 11 onto the stack.
     Op11 = 0x5b,
+    /// Push the number 12 onto the stack.
     Op12 = 0x5c,
+    /// Push the number 13 onto the stack.
     Op13 = 0x5d,
+    /// Push the number 14 onto the stack.
     Op14 = 0x5e,
+    /// Push the number 15 onto the stack.
     Op15 = 0x5f,
+    /// Push the number 16 onto the stack.
     Op16 = 0x60,
 
-    // Control flow
+    // -- Control flow --
+
+    /// Does nothing.
     OpNop = 0x61,
+    /// Reserved. Transaction is invalid unless in an unexecuted `OP_IF` branch.
     OpVer = 0x62,
+    /// Execute the following statements only if the top stack value is true.
     OpIf = 0x63,
+    /// Execute the following statements only if the top stack value is false.
     OpNotIf = 0x64,
+    /// Reserved. Transaction is invalid even in an unexecuted `OP_IF` branch.
     OpVerIf = 0x65,
+    /// Reserved. Transaction is invalid even in an unexecuted `OP_IF` branch.
     OpVerNotIf = 0x66,
+    /// Execute the following statements if the preceding `OP_IF`/`OP_NOTIF` was not executed.
     OpElse = 0x67,
+    /// End an `OP_IF`/`OP_NOTIF` block.
     OpEndIf = 0x68,
+    /// Mark the transaction as invalid if the top stack value is false.
     OpVerify = 0x69,
+    /// Mark the transaction as invalid. Used for provably unspendable outputs.
     OpReturn = 0x6a,
 
-    // Stack
+    // -- Stack manipulation --
+
+    /// Move the top stack item to the alt stack.
     OpToAltStack = 0x6b,
+    /// Move the top alt-stack item to the main stack.
     OpFromAltStack = 0x6c,
+    /// Remove the top two stack items.
     Op2Drop = 0x6d,
+    /// Duplicate the top two stack items.
     Op2Dup = 0x6e,
+    /// Duplicate the top three stack items.
     Op3Dup = 0x6f,
+    /// Copy items 3 and 4 to the top of the stack.
     Op2Over = 0x70,
+    /// Move items 5 and 6 to the top of the stack.
     Op2Rot = 0x71,
+    /// Swap the top two pairs of items.
     Op2Swap = 0x72,
+    /// Duplicate the top stack value if it is non-zero.
     OpIfDup = 0x73,
+    /// Push the number of stack items onto the stack.
     OpDepth = 0x74,
+    /// Remove the top stack item.
     OpDrop = 0x75,
+    /// Duplicate the top stack item.
     OpDup = 0x76,
+    /// Remove the second-to-top stack item.
     OpNip = 0x77,
+    /// Copy the second-to-top stack item to the top.
     OpOver = 0x78,
+    /// Copy the item N levels back in the stack to the top.
     OpPick = 0x79,
+    /// Move the item N levels back in the stack to the top.
     OpRoll = 0x7a,
+    /// Rotate the top three items: (x1 x2 x3 -> x2 x3 x1).
     OpRot = 0x7b,
+    /// Swap the top two stack items.
     OpSwap = 0x7c,
+    /// Copy the top item and insert it before the second-to-top item.
     OpTuck = 0x7d,
 
-    // Splice (disabled)
+    // -- Splice (disabled) --
+
+    /// Concatenate two strings. **Disabled.**
     OpCat = 0x7e,
+    /// Return a section of a string. **Disabled.**
     OpSubStr = 0x7f,
+    /// Keep only characters left of a specified point. **Disabled.**
     OpLeft = 0x80,
+    /// Keep only characters right of a specified point. **Disabled.**
     OpRight = 0x81,
+    /// Push the byte-length of the top stack item.
     OpSize = 0x82,
 
-    // Bit logic (disabled except EQUAL)
+    // -- Bitwise logic (disabled except `OP_EQUAL`) --
+
+    /// Flip all bits of the input. **Disabled.**
     OpInvert = 0x83,
+    /// Bitwise AND of two values. **Disabled.**
     OpAnd = 0x84,
+    /// Bitwise OR of two values. **Disabled.**
     OpOr = 0x85,
+    /// Bitwise XOR of two values. **Disabled.**
     OpXor = 0x86,
+    /// Push 1 if the top two items are byte-for-byte equal, 0 otherwise.
     OpEqual = 0x87,
+    /// Same as `OP_EQUAL` followed by `OP_VERIFY`.
     OpEqualVerify = 0x88,
+    /// Reserved. Transaction is invalid unless in an unexecuted `OP_IF` branch.
     OpReserved1 = 0x89,
+    /// Reserved. Transaction is invalid unless in an unexecuted `OP_IF` branch.
     OpReserved2 = 0x8a,
 
-    // Numeric
+    // -- Numeric --
+
+    /// Add 1 to the top stack item.
     Op1Add = 0x8b,
+    /// Subtract 1 from the top stack item.
     Op1Sub = 0x8c,
+    /// Multiply the top item by 2. **Disabled.**
     Op2Mul = 0x8d,
+    /// Divide the top item by 2. **Disabled.**
     Op2Div = 0x8e,
+    /// Negate the sign of the top stack item.
     OpNegate = 0x8f,
+    /// Replace the top item with its absolute value.
     OpAbs = 0x90,
+    /// If the top item is 0 or 1, flip it; otherwise push 0.
     OpNot = 0x91,
+    /// Push 0 if the top item is 0, otherwise push 1.
     Op0NotEqual = 0x92,
+    /// Pop two items, push their sum.
     OpAdd = 0x93,
+    /// Pop two items, push a - b.
     OpSub = 0x94,
+    /// Multiply two items. **Disabled.**
     OpMul = 0x95,
+    /// Divide two items. **Disabled.**
     OpDiv = 0x96,
+    /// Modulo of two items. **Disabled.**
     OpMod = 0x97,
+    /// Left-shift. **Disabled.**
     OpLShift = 0x98,
+    /// Right-shift. **Disabled.**
     OpRShift = 0x99,
+    /// Push 1 if both inputs are non-zero, otherwise 0.
     OpBoolAnd = 0x9a,
+    /// Push 1 if either input is non-zero, otherwise 0.
     OpBoolOr = 0x9b,
+    /// Push 1 if the two numbers are equal, otherwise 0.
     OpNumEqual = 0x9c,
+    /// Same as `OP_NUMEQUAL` followed by `OP_VERIFY`.
     OpNumEqualVerify = 0x9d,
+    /// Push 1 if the two numbers are not equal, otherwise 0.
     OpNumNotEqual = 0x9e,
+    /// Push 1 if a < b, otherwise 0.
     OpLessThan = 0x9f,
+    /// Push 1 if a > b, otherwise 0.
     OpGreaterThan = 0xa0,
+    /// Push 1 if a <= b, otherwise 0.
     OpLessThanOrEqual = 0xa1,
+    /// Push 1 if a >= b, otherwise 0.
     OpGreaterThanOrEqual = 0xa2,
+    /// Push the smaller of two items.
     OpMin = 0xa3,
+    /// Push the larger of two items.
     OpMax = 0xa4,
+    /// Push 1 if x is within [min, max), otherwise 0.
     OpWithin = 0xa5,
 
-    // Crypto
+    // -- Crypto --
+
+    /// Hash the top item with RIPEMD-160.
     OpRipemd160 = 0xa6,
+    /// Hash the top item with SHA-1.
     OpSha1 = 0xa7,
+    /// Hash the top item with SHA-256.
     OpSha256 = 0xa8,
+    /// Hash the top item with SHA-256 then RIPEMD-160 (= Hash160).
     OpHash160 = 0xa9,
+    /// Hash the top item with double SHA-256 (= Hash256).
     OpHash256 = 0xaa,
+    /// Mark the boundary for signature hashing (affects `FindAndDelete`).
     OpCodeSeparator = 0xab,
+    /// Pop a signature and public key; push 1 if the signature is valid, 0 otherwise.
     OpCheckSig = 0xac,
+    /// Same as `OP_CHECKSIG` followed by `OP_VERIFY`.
     OpCheckSigVerify = 0xad,
+    /// Pop M signatures and N public keys; push 1 if all signatures are valid.
     OpCheckMultiSig = 0xae,
+    /// Same as `OP_CHECKMULTISIG` followed by `OP_VERIFY`.
     OpCheckMultiSigVerify = 0xaf,
 
-    // Expansion / NOP
+    // -- Expansion / NOP --
+
+    /// No operation. Reserved for future soft-fork upgrades.
     OpNop1 = 0xb0,
+    /// Verify that the top stack value >= the transaction's `nLockTime` (BIP 65).
     OpCheckLockTimeVerify = 0xb1,
+    /// Verify that the top stack value matches the input's `nSequence` (BIP 112).
     OpCheckSequenceVerify = 0xb2,
+    /// No operation. Reserved for future soft-fork upgrades.
     OpNop4 = 0xb3,
+    /// No operation. Reserved for future soft-fork upgrades.
     OpNop5 = 0xb4,
+    /// No operation. Reserved for future soft-fork upgrades.
     OpNop6 = 0xb5,
+    /// No operation. Reserved for future soft-fork upgrades.
     OpNop7 = 0xb6,
+    /// No operation. Reserved for future soft-fork upgrades.
     OpNop8 = 0xb7,
+    /// No operation. Reserved for future soft-fork upgrades.
     OpNop9 = 0xb8,
+    /// No operation. Reserved for future soft-fork upgrades.
     OpNop10 = 0xb9,
 
-    // BIP342 Tapscript
+    // -- BIP 342 Tapscript --
+
+    /// Tapscript multi-signature accumulator: pops sig, pubkey, and n; pushes n+1 or n (BIP 342).
     OpCheckSigAdd = 0xba,
 
-    // Invalid
+    // -- Invalid --
+
+    /// Sentinel value representing an invalid or unrecognized opcode.
     OpInvalidOpcode = 0xff,
 }
 
-/// Aliases for common opcodes.
+/// Alias: `OP_FALSE` is the same as [`Opcode::Op0`].
 pub const OP_FALSE: Opcode = Opcode::Op0;
+/// Alias: `OP_TRUE` is the same as [`Opcode::Op1`].
 pub const OP_TRUE: Opcode = Opcode::Op1;
+/// Alias: `OP_NOP2` is the pre-BIP-65 name for [`Opcode::OpCheckLockTimeVerify`].
 pub const OP_NOP2: Opcode = Opcode::OpCheckLockTimeVerify;
+/// Alias: `OP_NOP3` is the pre-BIP-112 name for [`Opcode::OpCheckSequenceVerify`].
 pub const OP_NOP3: Opcode = Opcode::OpCheckSequenceVerify;
 
-/// Maximum valid opcode value (OP_NOP10).
+/// Maximum valid opcode byte value (`OP_NOP10` = `0xb9`).
 pub const MAX_OPCODE: u8 = Opcode::OpNop10 as u8;
 
 impl Opcode {
-    /// Try to convert a byte to an Opcode.
-    /// Returns None for values between OP_NOP10+1 (0xba+1) and 0xfe that aren't OP_CHECKSIGADD.
+    /// Converts a raw byte to the corresponding `Opcode`, if one exists.
+    ///
+    /// Returns `None` for direct-push bytes (0x01..=0x4b) and for undefined
+    /// bytes in the range 0xbb..=0xfe. Those ranges are handled separately by
+    /// the script parser.
     pub fn from_u8(byte: u8) -> Option<Opcode> {
         // Direct data push opcodes (0x01..=0x4b) are not in the enum
         // They represent "push next N bytes" and are handled by the script parser
@@ -279,7 +413,9 @@ impl Opcode {
         }
     }
 
-    /// Get the opcode name as a string (matching Bitcoin Core's GetOpName).
+    /// Returns the human-readable name of this opcode (e.g. `"OP_DUP"`).
+    ///
+    /// Matches Bitcoin Core's `GetOpName()`.
     pub fn name(&self) -> &'static str {
         match self {
             Opcode::Op0 => "OP_0",
@@ -398,12 +534,18 @@ impl Opcode {
         }
     }
 
-    /// Check if this is a push-data opcode (includes OP_0 and OP_1..OP_16).
+    /// Returns `true` if this opcode is a data-push instruction.
+    ///
+    /// This includes `OP_0`, `OP_PUSHDATA1`..`OP_PUSHDATA4`, `OP_1NEGATE`,
+    /// and the small-integer pushes `OP_1`..`OP_16`.
     pub fn is_push(&self) -> bool {
         (*self as u8) <= Opcode::Op16 as u8
     }
 
-    /// Check if this opcode is disabled.
+    /// Returns `true` if this opcode is disabled in all script versions.
+    ///
+    /// Disabled opcodes cause immediate script failure if encountered,
+    /// even inside an unexecuted `OP_IF` branch.
     pub fn is_disabled(&self) -> bool {
         matches!(
             self,
@@ -432,8 +574,11 @@ impl std::fmt::Display for Opcode {
     }
 }
 
-/// Decode an opcode name string to Opcode value.
-/// Returns None for unrecognized names.
+/// Parses a human-readable opcode name (e.g. `"OP_DUP"`) into the corresponding [`Opcode`].
+///
+/// Recognizes common aliases such as `"OP_FALSE"` for `OP_0`, `"OP_TRUE"` for `OP_1`,
+/// and bare decimal digits `"0"`..`"16"` for the small-integer push opcodes.
+/// Returns `None` for unrecognized names.
 pub fn name_to_opcode(name: &str) -> Option<Opcode> {
     match name {
         "OP_0" | "OP_FALSE" | "0" => Some(Opcode::Op0),

@@ -1,17 +1,29 @@
 //! Cryptographic hash functions wrapping bitcoin_hashes.
 //! Maps to: src/crypto/ (SHA256, RIPEMD160, etc.)
 
+/// Re-export of HASH160 (RIPEMD160(SHA256)) types from `bitcoin_hashes`.
 pub use bitcoin_hashes::hash160;
+/// Re-export of RIPEMD160 types from `bitcoin_hashes`.
 pub use bitcoin_hashes::ripemd160;
+/// Re-export of SHA-1 types from `bitcoin_hashes`.
 pub use bitcoin_hashes::sha1;
+/// Re-export of SHA-256 types from `bitcoin_hashes`.
 pub use bitcoin_hashes::sha256;
+/// Re-export of double-SHA-256 types from `bitcoin_hashes`.
 pub use bitcoin_hashes::sha256d;
+/// Re-export of SHA-512 types from `bitcoin_hashes`.
 pub use bitcoin_hashes::sha512;
+/// Re-export of the `Hash` trait from `bitcoin_hashes`.
 pub use bitcoin_hashes::Hash;
+/// Re-export of the `HashEngine` trait from `bitcoin_hashes` for incremental hashing.
 pub use bitcoin_hashes::HashEngine;
 
-/// Double-SHA256 hash: SHA256(SHA256(data))
-/// This is the primary hash used in Bitcoin for block hashes, txids, etc.
+/// Computes the double-SHA256 hash: `SHA256(SHA256(data))`.
+///
+/// This is the primary hash used in Bitcoin for block hashes, transaction IDs, and
+/// Merkle trees. Equivalent to `CHashWriter` / `Hash()` in Bitcoin Core.
+///
+/// Returns a 32-byte digest.
 #[inline]
 pub fn hash256(data: &[u8]) -> [u8; 32] {
     let hash = sha256d::Hash::hash(data);
@@ -21,8 +33,11 @@ pub fn hash256(data: &[u8]) -> [u8; 32] {
     result
 }
 
-/// HASH160: RIPEMD160(SHA256(data))
-/// Used for Bitcoin addresses (P2PKH, P2SH).
+/// Computes HASH160: `RIPEMD160(SHA256(data))`.
+///
+/// Used for Bitcoin addresses (P2PKH, P2SH). Equivalent to `CHash160` in Bitcoin Core.
+///
+/// Returns a 20-byte digest.
 #[inline]
 pub fn hash160(data: &[u8]) -> [u8; 20] {
     let hash = bitcoin_hashes::hash160::Hash::hash(data);
@@ -32,7 +47,9 @@ pub fn hash160(data: &[u8]) -> [u8; 20] {
     result
 }
 
-/// Single SHA256 hash.
+/// Computes a single SHA-256 hash of the input data.
+///
+/// Returns a 32-byte digest. For double-hashing, use [`hash256`] instead.
 #[inline]
 pub fn sha256_hash(data: &[u8]) -> [u8; 32] {
     let hash = sha256::Hash::hash(data);
@@ -42,7 +59,10 @@ pub fn sha256_hash(data: &[u8]) -> [u8; 32] {
     result
 }
 
-/// RIPEMD160 hash.
+/// Computes a RIPEMD-160 hash of the input data.
+///
+/// Returns a 20-byte digest. Rarely used standalone; typically combined with
+/// SHA-256 via [`hash160()`].
 #[inline]
 pub fn ripemd160_hash(data: &[u8]) -> [u8; 20] {
     let hash = ripemd160::Hash::hash(data);
@@ -52,7 +72,10 @@ pub fn ripemd160_hash(data: &[u8]) -> [u8; 20] {
     result
 }
 
-/// SHA-1 hash (used in OP_SHA1).
+/// Computes a SHA-1 hash of the input data.
+///
+/// Returns a 20-byte digest. Used by the `OP_SHA1` script opcode.
+/// SHA-1 is considered cryptographically weak; this exists only for script compatibility.
 #[inline]
 pub fn sha1_hash(data: &[u8]) -> [u8; 20] {
     let hash = sha1::Hash::hash(data);
@@ -62,7 +85,12 @@ pub fn sha1_hash(data: &[u8]) -> [u8; 20] {
     result
 }
 
-/// Tagged hash per BIP340: SHA256(SHA256(tag) || SHA256(tag) || msg)
+/// Computes a tagged hash per BIP-340: `SHA256(SHA256(tag) || SHA256(tag) || msg)`.
+///
+/// Tagged hashes provide domain separation, ensuring that hashes computed for
+/// different purposes (e.g., Taproot key tweaks vs. signature challenges) cannot collide.
+///
+/// Returns a 32-byte digest.
 pub fn tagged_hash(tag: &[u8], msg: &[u8]) -> [u8; 32] {
     let tag_hash = sha256_hash(tag);
     let mut engine = sha256::HashEngine::default();

@@ -1,5 +1,6 @@
 //! Variable-length integer encoding.
-//! Maps to: serialize.h (WriteVarInt/ReadVarInt)
+//!
+//! Maps to: `serialize.h` (`WriteVarInt`/`ReadVarInt`) in Bitcoin Core.
 //!
 //! MSB base-128 encoding. High bit in each byte indicates continuation.
 //! One is subtracted from all but the last digit for unique encoding.
@@ -12,7 +13,9 @@
 use crate::encode::Error;
 use std::io::{Read, Write};
 
-/// Get the serialized size of a VarInt value.
+/// Returns the number of bytes needed to encode `n` as a VarInt.
+///
+/// Results: 1 byte for 0..=127, 2 bytes for 128..=16511, and so on.
 pub fn varint_len(mut n: u64) -> usize {
     let mut len = 0;
     loop {
@@ -25,7 +28,10 @@ pub fn varint_len(mut n: u64) -> usize {
     len
 }
 
-/// Write a VarInt-encoded unsigned value.
+/// Writes an unsigned integer in VarInt (MSB base-128) encoding to `w`.
+///
+/// Returns the number of bytes written.
+/// Port of Bitcoin Core's `WriteVarInt`.
 pub fn write_varint<W: Write>(w: &mut W, mut n: u64) -> Result<usize, Error> {
     let mut tmp = [0u8; 10]; // max 10 bytes for 64-bit
     let mut len = 0;
@@ -45,7 +51,11 @@ pub fn write_varint<W: Write>(w: &mut W, mut n: u64) -> Result<usize, Error> {
     Ok(total)
 }
 
-/// Read a VarInt-encoded unsigned value.
+/// Reads a VarInt-encoded unsigned integer from `r`.
+///
+/// Returns [`Error::VarIntTooLarge`] if the
+/// decoded value would overflow `u64`.
+/// Port of Bitcoin Core's `ReadVarInt`.
 pub fn read_varint<R: Read>(r: &mut R) -> Result<u64, Error> {
     let mut n: u64 = 0;
     loop {
@@ -68,13 +78,15 @@ pub fn read_varint<R: Read>(r: &mut R) -> Result<u64, Error> {
     }
 }
 
-/// Write a VarInt-encoded signed non-negative value.
-/// The value must be >= 0; negative values will produce incorrect results.
+/// Writes a non-negative `i64` value in VarInt encoding to `w`.
+///
+/// The value must be >= 0; negative values will produce incorrect results
+/// because the sign bit is reinterpreted as magnitude.
 pub fn write_varint_signed<W: Write>(w: &mut W, n: i64) -> Result<usize, Error> {
     write_varint(w, n as u64)
 }
 
-/// Read a VarInt-encoded signed non-negative value.
+/// Reads a VarInt-encoded value and returns it as a non-negative `i64`.
 pub fn read_varint_signed<R: Read>(r: &mut R) -> Result<i64, Error> {
     let n = read_varint(r)?;
     Ok(n as i64)

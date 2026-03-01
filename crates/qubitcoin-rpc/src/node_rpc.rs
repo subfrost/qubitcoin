@@ -3,9 +3,9 @@
 
 //! RPC methods wired to real node state.
 //!
-//! [`NodeState`] holds the shared, mutable state that the running node
+//! `NodeState` holds the shared, mutable state that the running node
 //! updates (block height, best hash, peer count, etc.).  The
-//! [`register_node_rpcs`] function registers every supported RPC method
+//! `register_node_rpcs` function registers every supported RPC method
 //! so that each handler reads live data from the shared state.
 
 use crate::server::{RpcRegistry, RpcRequest, RpcResponse, RPC_INVALID_PARAMS, RPC_MISC_ERROR};
@@ -168,7 +168,7 @@ impl NodeState {
 // Registration
 // ---------------------------------------------------------------------------
 
-/// Register all RPC methods that read from live [`NodeState`].
+/// Register all RPC methods that read from live `NodeState`.
 pub fn register_node_rpcs(registry: &mut RpcRegistry, state: Arc<NodeState>) {
     // -- getblockchaininfo --------------------------------------------------
     let s = state.clone();

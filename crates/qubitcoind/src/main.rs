@@ -27,6 +27,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::Instrument;
 
+/// Current qubitcoind version string, displayed at startup and in RPC responses.
 const VERSION: &str = "0.1.0";
 
 // ---------------------------------------------------------------------------

@@ -3,11 +3,11 @@
 //! Maps to: `src/chain.h` in Bitcoin Core.
 //!
 //! Provides:
-//! - [`BlockStatus`]: Validation and storage status flags for a block.
-//! - [`BlockIndex`]: In-memory representation of a block's metadata (port of `CBlockIndex`).
-//! - [`DiskBlockIndex`]: On-disk serializable form of a block index entry (port of `CDiskBlockIndex`).
-//! - [`Chain`]: An in-memory indexed chain of blocks (port of `CChain`).
-//! - [`get_bits_proof`] / [`get_block_proof`]: Proof-of-work calculations.
+//! - `BlockStatus`: Validation and storage status flags for a block.
+//! - `BlockIndex`: In-memory representation of a block's metadata (port of `CBlockIndex`).
+//! - `DiskBlockIndex`: On-disk serializable form of a block index entry (port of `CDiskBlockIndex`).
+//! - `Chain`: An in-memory indexed chain of blocks (port of `CChain`).
+//! - `get_bits_proof` / `get_block_proof`: Proof-of-work calculations.
 
 use qubitcoin_consensus::BlockHeader;
 use qubitcoin_primitives::{ArithUint256, BlockHash, Uint256};
@@ -246,6 +246,7 @@ pub struct FlatFilePos {
 }
 
 impl FlatFilePos {
+    /// A sentinel value representing an invalid / absent position.
     pub const NULL: FlatFilePos = FlatFilePos { file: -1, pos: 0 };
 
     /// A null position indicates the data is not available.
@@ -548,21 +549,33 @@ impl fmt::Display for BlockIndex {
 #[derive(Clone, Debug, Default)]
 pub struct DiskBlockIndex {
     // Header fields
+    /// Block version information.
     pub version: i32,
+    /// Hash of the previous block header.
     pub hash_prev: BlockHash,
+    /// Merkle root of the transactions in the block.
     pub merkle_root: Uint256,
+    /// Block timestamp (seconds since Unix epoch).
     pub time: u32,
+    /// Compact difficulty target (`nBits`).
     pub bits: u32,
+    /// Proof-of-work nonce.
     pub nonce: u32,
 
     // Chain bookkeeping
+    /// Height of this block in the chain.
     pub height: i32,
+    /// Validation and storage status flags.
     pub status: BlockStatus,
+    /// Number of transactions in this block.
     pub tx_count: u32,
 
     // File positions
+    /// Which `blk?????.dat` file this block is stored in.
     pub file: i32,
+    /// Byte offset of the block data within `blk?????.dat`.
     pub data_pos: u32,
+    /// Byte offset of the undo data within `rev?????.dat`.
     pub undo_pos: u32,
 }
 

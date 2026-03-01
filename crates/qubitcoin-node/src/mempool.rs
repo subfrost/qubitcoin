@@ -188,62 +188,77 @@ impl MempoolEntry {
 
     // -- Accessors --
 
+    /// Get a reference to the underlying transaction.
     pub fn tx(&self) -> &TransactionRef {
         &self.tx
     }
 
+    /// Get the transaction ID.
     pub fn txid(&self) -> Txid {
         *self.tx.txid()
     }
 
+    /// Get the fee paid by this transaction.
     pub fn fee(&self) -> Amount {
         self.fee
     }
 
+    /// Get the virtual size (weight / 4, rounded up) of this transaction.
     pub fn vsize(&self) -> u32 {
         self.vsize
     }
 
+    /// Get the Unix timestamp when this entry was added to the mempool.
     pub fn time(&self) -> u64 {
         self.time
     }
 
+    /// Get the chain tip height when this entry was added.
     pub fn entry_height(&self) -> i32 {
         self.entry_height
     }
 
+    /// Returns `true` if this transaction spends a coinbase output.
     pub fn spends_coinbase(&self) -> bool {
         self.spends_coinbase
     }
 
+    /// Get the BIP141-weighted signature operation cost.
     pub fn sig_op_cost(&self) -> u32 {
         self.sig_op_cost
     }
 
+    /// Get the fee rate of this individual transaction.
     pub fn fee_rate(&self) -> FeeRate {
         self.fee_rate
     }
 
+    /// Get the number of in-mempool ancestors (including self).
     pub fn ancestor_count(&self) -> u64 {
         self.ancestor_count
     }
 
+    /// Get the total virtual size of in-mempool ancestors (including self).
     pub fn ancestor_size(&self) -> u64 {
         self.ancestor_size
     }
 
+    /// Get the total fee of in-mempool ancestors (including self).
     pub fn ancestor_fee(&self) -> Amount {
         self.ancestor_fee
     }
 
+    /// Get the number of in-mempool descendants (including self).
     pub fn descendant_count(&self) -> u64 {
         self.descendant_count
     }
 
+    /// Get the total virtual size of in-mempool descendants (including self).
     pub fn descendant_size(&self) -> u64 {
         self.descendant_size
     }
 
+    /// Get the total fee of in-mempool descendants (including self).
     pub fn descendant_fee(&self) -> Amount {
         self.descendant_fee
     }

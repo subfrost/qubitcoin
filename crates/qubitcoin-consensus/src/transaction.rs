@@ -34,25 +34,32 @@ pub const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000ffff;
 /// Granularity shift for time-based relative lock-times (BIP68).
 pub const SEQUENCE_LOCKTIME_GRANULARITY: u32 = 9;
 
-/// Default transaction version.
+/// Default transaction version (2). Version 2 enables BIP68 relative lock-time.
 pub const CURRENT_TX_VERSION: u32 = 2;
 
 // --- Types ---
 
-/// An outpoint: combination of a transaction hash and an output index.
+/// An outpoint: reference to a specific output of a previous transaction.
+///
+/// Equivalent to `COutPoint` in Bitcoin Core (`src/primitives/transaction.h`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct OutPoint {
+    /// The transaction ID of the referenced transaction.
     pub hash: Txid,
+    /// The index of the output within that transaction.
     pub n: u32,
 }
 
 impl OutPoint {
+    /// Sentinel index value used in null/coinbase outpoints (`u32::MAX`).
     pub const NULL_INDEX: u32 = u32::MAX;
 
+    /// Create a new outpoint referencing output `n` of transaction `hash`.
     pub fn new(hash: Txid, n: u32) -> Self {
         OutPoint { hash, n }
     }
 
+    /// Create a null outpoint (zero hash, `NULL_INDEX`). Used in coinbase inputs.
     pub fn null() -> Self {
         OutPoint {
             hash: Txid::ZERO,
@@ -60,6 +67,7 @@ impl OutPoint {
         }
     }
 
+    /// Returns `true` if this is a null outpoint (coinbase marker).
     pub fn is_null(&self) -> bool {
         self.hash.is_null() && self.n == Self::NULL_INDEX
     }
@@ -87,41 +95,54 @@ impl Decodable for OutPoint {
     }
 }
 
-/// Witness data for a transaction input.
+/// Witness data for a transaction input (BIP141).
+///
+/// Equivalent to `CTxInWitness` / `CScriptWitness` in Bitcoin Core.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Witness {
+    /// Stack items pushed onto the script evaluation stack before execution.
     pub stack: Vec<Vec<u8>>,
 }
 
 impl Witness {
+    /// Create an empty witness with no stack items.
     pub fn new() -> Self {
         Witness { stack: Vec::new() }
     }
 
+    /// Returns `true` if the witness stack is empty (no witness data).
     pub fn is_null(&self) -> bool {
         self.stack.is_empty()
     }
 
+    /// Returns the number of items on the witness stack.
     pub fn len(&self) -> usize {
         self.stack.len()
     }
 
+    /// Returns `true` if the witness stack contains no items.
     pub fn is_empty(&self) -> bool {
         self.stack.is_empty()
     }
 }
 
 /// A transaction input.
+///
+/// Equivalent to `CTxIn` in Bitcoin Core (`src/primitives/transaction.h`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TxIn {
+    /// The outpoint being spent (reference to a previous transaction output).
     pub prevout: OutPoint,
+    /// Unlocking script (signature script). Empty for segwit spends.
     pub script_sig: Script,
+    /// Sequence number. Controls relative lock-time (BIP68) and `nLockTime` behavior.
     pub sequence: u32,
-    /// Witness data - only serialized as part of the transaction.
+    /// Witness data (BIP141). Only serialized as part of the full transaction.
     pub witness: Witness,
 }
 
 impl TxIn {
+    /// Create a new transaction input with the given outpoint, script, and sequence.
     pub fn new(prevout: OutPoint, script_sig: Script, sequence: u32) -> Self {
         TxIn {
             prevout,
@@ -131,6 +152,7 @@ impl TxIn {
         }
     }
 
+    /// Create a coinbase input with a null outpoint and `SEQUENCE_FINAL`.
     pub fn coinbase(script_sig: Script) -> Self {
         TxIn {
             prevout: OutPoint::null(),
@@ -176,13 +198,18 @@ impl Decodable for TxIn {
 }
 
 /// A transaction output.
+///
+/// Equivalent to `CTxOut` in Bitcoin Core (`src/primitives/transaction.h`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TxOut {
+    /// Output value in satoshis.
     pub value: Amount,
+    /// Locking script (scriptPubKey) that defines the spending conditions.
     pub script_pubkey: Script,
 }
 
 impl TxOut {
+    /// Create a new transaction output with the given value and scriptPubKey.
     pub fn new(value: Amount, script_pubkey: Script) -> Self {
         TxOut {
             value,
@@ -190,6 +217,9 @@ impl TxOut {
         }
     }
 
+    /// Create a null output (value = -1, empty script).
+    ///
+    /// Used as a placeholder in `SIGHASH_SINGLE` serialization.
     pub fn null() -> Self {
         TxOut {
             value: Amount::from_sat(-1),
@@ -197,6 +227,7 @@ impl TxOut {
         }
     }
 
+    /// Returns `true` if this is a null output (value == -1).
     pub fn is_null(&self) -> bool {
         self.value.to_sat() == -1
     }
@@ -229,13 +260,18 @@ impl Decodable for TxOut {
 
 /// An immutable transaction with cached hashes.
 ///
-/// Port of Bitcoin Core's CTransaction. Once constructed, fields cannot be
-/// modified (ensuring hash cache consistency).
+/// Equivalent to `CTransaction` in Bitcoin Core (`src/primitives/transaction.h`).
+/// Once constructed, fields should not be modified (ensuring hash cache consistency).
 #[derive(Clone, Debug)]
 pub struct Transaction {
+    /// Transaction format version. Currently 1 or 2 (BIP68 requires version >= 2).
     pub version: u32,
+    /// Transaction inputs (coins being spent).
     pub vin: Vec<TxIn>,
+    /// Transaction outputs (new coins being created).
     pub vout: Vec<TxOut>,
+    /// Lock time. If non-zero, the transaction cannot be mined before this
+    /// block height (if < 500,000,000) or Unix timestamp (if >= 500,000,000).
     pub lock_time: u32,
     // Cached hashes (computed once on construction)
     hash: Txid,

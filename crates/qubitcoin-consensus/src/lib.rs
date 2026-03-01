@@ -1,27 +1,40 @@
-//! qubitcoin-consensus: Embeddable consensus library for Qubitcoin.
+//! Embeddable consensus library for Qubitcoin.
 //!
-//! Zero I/O, no_std-optional. Pure functions for consensus validation.
+//! Zero I/O, `no_std`-optional. Pure functions for consensus validation.
 //!
-//! Maps to: bitcoin_consensus static lib + consensus/ directory
+//! Maps to: `bitcoin_consensus` static lib + `consensus/` directory in Bitcoin Core.
 //!
-//! Provides:
-//! - Transaction types: OutPoint, TxIn, TxOut, Transaction, Block, BlockHeader
-//! - Consensus validation: check_transaction, merkle root, PoW, subsidy
-//! - ConsensusParams for network configurations
-//! - ValidationState for error reporting
+//! # Provided functionality
+//!
+//! - **Transaction types**: [`OutPoint`], [`TxIn`], [`TxOut`], [`Transaction`],
+//!   [`Block`], [`BlockHeader`]
+//! - **Consensus validation**: [`check_transaction`], [`check_proof_of_work`],
+//!   [`get_block_subsidy`], Merkle root computation
+//! - **Signature hashing**: legacy, BIP143 (segwit v0), and BIP341 (taproot)
+//! - **Signature verification**: [`TransactionSignatureChecker`] for ECDSA and Schnorr
+//! - **Network parameters**: [`ConsensusParams`] for mainnet, testnet, regtest, signet
+//! - **Error reporting**: [`ValidationState`] with typed result codes
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
+/// Block and block header types. Maps to `src/primitives/block.h` in Bitcoin Core.
 pub mod block;
+/// Context-free consensus validation functions (transaction checks, PoW, subsidy).
 pub mod check;
+/// Merkle tree computation for block transaction and witness roots.
 pub mod merkle;
+/// Consensus parameters for different networks (mainnet, testnet, regtest, signet).
 pub mod params;
+/// Signature hash computation for legacy, segwit v0 (BIP143), and taproot (BIP341).
 pub mod sighash;
+/// Transaction signature verification (ECDSA and Schnorr).
 pub mod sign;
+/// Transaction primitive types: [`OutPoint`], [`TxIn`], [`TxOut`], [`Transaction`].
 pub mod transaction;
+/// Validation state types for structured error reporting.
 pub mod validation_state;
 
 pub use block::{Block, BlockHeader};
@@ -44,5 +57,8 @@ pub use transaction::{
 };
 pub use validation_state::{BlockValidationResult, TxValidationResult, ValidationState};
 
+/// Compatibility conversions between qubitcoin types and `rust-bitcoin` 0.32 types.
+///
+/// Gated behind the `rust-bitcoin-compat` feature.
 #[cfg(feature = "rust-bitcoin-compat")]
 pub mod compat;

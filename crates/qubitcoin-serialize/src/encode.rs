@@ -1,51 +1,72 @@
-//! Encodable/Decodable traits and implementations for primitive types.
-//! Maps to: src/serialize.h (Serialize/Unserialize template functions)
+//! `Encodable`/`Decodable` traits and implementations for primitive types.
+//!
+//! Maps to: `src/serialize.h` (`Serialize`/`Unserialize` template functions) in Bitcoin Core.
 //!
 //! In Bitcoin Core, serialization is template-based with duck typing.
-//! In Rust, we use traits: `Encodable` and `Decodable`.
+//! In Rust, we use traits: [`Encodable`] and [`Decodable`].
 
 use std::io::{self, Read, Write};
 
-/// Maximum size of a serialized object (32 MB).
+/// Maximum size of a serialized object in bytes (32 MB, `0x02000000`).
+///
+/// Any object whose serialized representation exceeds this limit is rejected.
+/// Matches `MAX_SIZE` in Bitcoin Core's `serialize.h`.
 pub const MAX_SIZE: u64 = 0x02000000;
 
-/// Maximum vector allocation during deserialization.
+/// Maximum number of elements to pre-allocate when deserializing a vector.
+///
+/// Prevents a malicious peer from causing excessive memory allocation
+/// by advertising a very large vector length before the actual data arrives.
 pub const MAX_VECTOR_ALLOCATE: usize = 5_000_000;
 
-/// Error type for serialization/deserialization.
+/// Error type for serialization/deserialization operations.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// An underlying I/O error occurred during reading or writing.
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 
+    /// A CompactSize value was not encoded in the smallest possible form.
     #[error("Non-canonical compact size encoding")]
     NonCanonicalCompactSize,
 
+    /// A CompactSize value exceeded [`MAX_SIZE`].
     #[error("Compact size too large: {0}")]
     CompactSizeTooLarge(u64),
 
+    /// A VarInt value overflowed the maximum representable `u64`.
     #[error("VarInt too large")]
     VarIntTooLarge,
 
+    /// The data contained an invalid or unexpected encoding (e.g. invalid UTF-8).
     #[error("Invalid encoding: {0}")]
     InvalidEncoding(String),
 
+    /// The reader ran out of data before the expected amount was consumed.
     #[error("End of data")]
     EndOfData,
 
+    /// A vector or byte sequence length exceeded [`MAX_SIZE`].
     #[error("Size exceeds max: {0}")]
     OversizedVector(u64),
 }
 
 /// Trait for types that can be serialized to a byte stream.
-/// Port of Bitcoin Core's `Serialize(Stream&)` method.
+///
+/// Port of Bitcoin Core's `Serialize(Stream&)` template method.
+/// All integers are written in little-endian byte order.
 pub trait Encodable {
+    /// Writes the serialized form of `self` to `writer`.
+    ///
+    /// Returns the number of bytes written.
     fn encode<W: Write>(&self, writer: &mut W) -> Result<usize, Error>;
 }
 
 /// Trait for types that can be deserialized from a byte stream.
-/// Port of Bitcoin Core's `Unserialize(Stream&)` method.
+///
+/// Port of Bitcoin Core's `Unserialize(Stream&)` template method.
 pub trait Decodable: Sized {
+    /// Reads and returns an instance of `Self` from `reader`.
     fn decode<R: Read>(reader: &mut R) -> Result<Self, Error>;
 }
 
@@ -364,7 +385,10 @@ impl Decodable for qubitcoin_primitives::BlockHash {
     }
 }
 
-/// Helper: Encode a vector of encodable items (CompactSize length prefix + items).
+/// Encodes a slice of [`Encodable`] items as a CompactSize length prefix followed by each item.
+///
+/// This is the standard Bitcoin serialization format for vectors of objects.
+/// Returns the total number of bytes written.
 pub fn encode_vec<W: Write, T: Encodable>(w: &mut W, vec: &[T]) -> Result<usize, Error> {
     let mut size = crate::compact_size::write_compact_size(w, vec.len() as u64)?;
     for item in vec {
@@ -373,7 +397,10 @@ pub fn encode_vec<W: Write, T: Encodable>(w: &mut W, vec: &[T]) -> Result<usize,
     Ok(size)
 }
 
-/// Helper: Decode a vector of decodable items.
+/// Decodes a CompactSize-prefixed vector of [`Decodable`] items from `r`.
+///
+/// Reads a CompactSize length, then decodes that many items sequentially.
+/// Rejects vectors whose declared length exceeds [`MAX_SIZE`].
 pub fn decode_vec<R: Read, T: Decodable>(r: &mut R) -> Result<Vec<T>, Error> {
     let len = crate::compact_size::read_compact_size(r)?;
     if len > MAX_SIZE {
@@ -386,14 +413,18 @@ pub fn decode_vec<R: Read, T: Decodable>(r: &mut R) -> Result<Vec<T>, Error> {
     Ok(vec)
 }
 
-/// Convenience function to serialize an Encodable to bytes.
+/// Serializes an [`Encodable`] value into a new `Vec<u8>`.
+///
+/// This is a convenience wrapper around [`Encodable::encode`].
 pub fn serialize<T: Encodable>(obj: &T) -> Result<Vec<u8>, Error> {
     let mut buf = Vec::new();
     obj.encode(&mut buf)?;
     Ok(buf)
 }
 
-/// Convenience function to deserialize a Decodable from bytes.
+/// Deserializes a [`Decodable`] value from a byte slice.
+///
+/// This is a convenience wrapper around [`Decodable::decode`].
 pub fn deserialize<T: Decodable>(data: &[u8]) -> Result<T, Error> {
     let mut cursor = io::Cursor::new(data);
     T::decode(&mut cursor)

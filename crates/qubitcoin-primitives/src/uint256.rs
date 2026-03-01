@@ -1,5 +1,5 @@
 //! Fixed-size opaque blob types: Uint160, Uint256.
-//! Maps to: src/uint256.h (base_blob<BITS>)
+//! Maps to: `src/uint256.h` (`base_blob`)
 //!
 //! These are NOT integer types - they are opaque byte blobs used for hashes.
 //! For arithmetic operations, use ArithUint256.
@@ -10,39 +10,55 @@
 
 use std::fmt;
 
-/// 256-bit opaque blob. Used for all Bitcoin hash types (Txid, BlockHash, etc.).
+/// A 256-bit opaque byte blob used for all Bitcoin hash types (`Txid`, `BlockHash`, etc.).
 ///
-/// Internal storage is a 32-byte array. Hex representation reverses byte order
-/// to match Bitcoin Core's convention.
+/// This is **not** an integer type -- it has no arithmetic operations. For arithmetic
+/// on 256-bit values (e.g., difficulty target comparison), convert to `ArithUint256`
+/// via `uint256_to_arith`.
+///
+/// Internal storage is a 32-byte array in little-endian order. Hex representation
+/// reverses byte order to match Bitcoin Core's display convention.
+///
+/// Equivalent to `base_blob<256>` / `uint256` in Bitcoin Core.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Uint256 {
+    /// The raw 32 bytes stored in little-endian order.
     data: [u8; 32],
 }
 
-/// 160-bit opaque blob. Used for RIPEMD160/Hash160 output.
+/// A 160-bit opaque byte blob used for RIPEMD-160 and Hash160 outputs.
+///
+/// Equivalent to `base_blob<160>` / `uint160` in Bitcoin Core.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Uint160 {
+    /// The raw 20 bytes stored in little-endian order.
     data: [u8; 20],
 }
 
 impl Uint256 {
+    /// The all-zero 256-bit value, used as a null/sentinel constant.
     pub const ZERO: Uint256 = Uint256 { data: [0u8; 32] };
+    /// The value one (byte 0 is `0x01`, all others `0x00`).
     pub const ONE: Uint256 = Uint256 {
         data: [
             1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0,
         ],
     };
+    /// The size of a `Uint256` in bytes (always 32).
     pub const SIZE: usize = 32;
 
-    /// Create from a single byte value (stored at position 0, rest zeros).
+    /// Creates a `Uint256` from a single byte value, stored at position 0 with the rest zeroed.
     pub const fn from_u8(v: u8) -> Self {
         let mut data = [0u8; 32];
         data[0] = v;
         Uint256 { data }
     }
 
-    /// Create from a 32-byte slice. Panics if slice length != 32.
+    /// Creates a `Uint256` from a 32-byte slice.
+    ///
+    /// # Panics
+    /// Panics if `slice.len() != 32`.
     pub fn from_slice(slice: &[u8]) -> Self {
         assert!(
             slice.len() == 32,
@@ -53,14 +69,16 @@ impl Uint256 {
         Uint256 { data }
     }
 
-    /// Create from a 32-byte array.
+    /// Creates a `Uint256` from a 32-byte array (no byte-order conversion).
     pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Uint256 { data: bytes }
     }
 
-    /// Parse from reversed-byte hex string (Bitcoin Core convention).
-    /// The hex string represents the hash in display order (big-endian),
-    /// which is the reverse of internal byte order.
+    /// Parses from a reversed-byte hex string (Bitcoin Core display convention).
+    ///
+    /// The hex string represents the hash in display order (most significant byte first),
+    /// which is the reverse of the internal little-endian byte order. Returns `None` if
+    /// the string is not exactly 64 hex characters or contains invalid hex digits.
     pub fn from_hex(hex_str: &str) -> Option<Self> {
         if hex_str.len() != 64 {
             return None;
@@ -74,7 +92,10 @@ impl Uint256 {
         Some(Uint256 { data })
     }
 
-    /// Parse from reversed-byte hex string with optional "0x" prefix and zero-padding.
+    /// Parses from a reversed-byte hex string with optional `0x` prefix and automatic zero-padding.
+    ///
+    /// Short hex strings are left-padded with zeros to 64 characters before parsing.
+    /// For example, `"0x1"` is treated as `"0000...0001"`.
     pub fn from_user_hex(input: &str) -> Option<Self> {
         let input = input.strip_prefix("0x").unwrap_or(input);
         if input.len() > 64 {
@@ -84,7 +105,10 @@ impl Uint256 {
         Self::from_hex(&padded)
     }
 
-    /// Get the reversed-byte hex representation (Bitcoin Core convention).
+    /// Returns the reversed-byte hex string (Bitcoin Core display convention).
+    ///
+    /// The output shows the most significant byte first, which is the standard
+    /// display format for block hashes and transaction IDs.
     pub fn to_hex(&self) -> String {
         let mut reversed = [0u8; 32];
         for i in 0..32 {
@@ -93,22 +117,24 @@ impl Uint256 {
         hex::encode(reversed)
     }
 
-    /// Check if all bytes are zero.
+    /// Returns `true` if all 32 bytes are zero (null hash).
     pub fn is_null(&self) -> bool {
         self.data.iter().all(|&b| b == 0)
     }
 
-    /// Set all bytes to zero.
+    /// Sets all 32 bytes to zero, making this a null hash.
     pub fn set_null(&mut self) {
         self.data = [0u8; 32];
     }
 
-    /// Lexicographic comparison (compares bytes from start).
+    /// Performs lexicographic byte comparison (compares from byte 0 upward).
     pub fn compare(&self, other: &Uint256) -> std::cmp::Ordering {
         self.data.cmp(&other.data)
     }
 
-    /// Read a little-endian u64 at the given position (0-indexed, in units of 8 bytes).
+    /// Reads a little-endian `u64` at the given `pos` (0-indexed, in units of 8 bytes).
+    ///
+    /// Position 0 reads bytes 0..8, position 1 reads bytes 8..16, etc.
     pub fn get_u64(&self, pos: usize) -> u64 {
         let offset = pos * 8;
         u64::from_le_bytes([
@@ -123,22 +149,22 @@ impl Uint256 {
         ])
     }
 
-    /// Get immutable reference to underlying data.
+    /// Returns an immutable reference to the underlying 32-byte array.
     pub fn data(&self) -> &[u8; 32] {
         &self.data
     }
 
-    /// Get mutable reference to underlying data.
+    /// Returns a mutable reference to the underlying 32-byte array.
     pub fn data_mut(&mut self) -> &mut [u8; 32] {
         &mut self.data
     }
 
-    /// Get as byte slice.
+    /// Returns the underlying data as a byte slice.
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
     }
 
-    /// Size in bytes (always 32).
+    /// Returns the size of a `Uint256` in bytes (always 32).
     pub const fn size() -> usize {
         32
     }
@@ -189,13 +215,20 @@ impl From<Uint256> for [u8; 32] {
 // --- Uint160 ---
 
 impl Uint160 {
+    /// The all-zero 160-bit value, used as a null/sentinel constant.
     pub const ZERO: Uint160 = Uint160 { data: [0u8; 20] };
+    /// The size of a `Uint160` in bytes (always 20).
     pub const SIZE: usize = 20;
 
+    /// Creates a `Uint160` from a 20-byte array (no byte-order conversion).
     pub const fn from_bytes(bytes: [u8; 20]) -> Self {
         Uint160 { data: bytes }
     }
 
+    /// Creates a `Uint160` from a 20-byte slice.
+    ///
+    /// # Panics
+    /// Panics if `slice.len() != 20`.
     pub fn from_slice(slice: &[u8]) -> Self {
         assert!(
             slice.len() == 20,
@@ -206,6 +239,8 @@ impl Uint160 {
         Uint160 { data }
     }
 
+    /// Parses from a reversed-byte hex string (Bitcoin Core display convention).
+    /// Returns `None` if the string is not exactly 40 hex characters or contains invalid hex digits.
     pub fn from_hex(hex_str: &str) -> Option<Self> {
         if hex_str.len() != 40 {
             return None;
@@ -218,6 +253,7 @@ impl Uint160 {
         Some(Uint160 { data })
     }
 
+    /// Returns the reversed-byte hex string (Bitcoin Core display convention).
     pub fn to_hex(&self) -> String {
         let mut reversed = [0u8; 20];
         for i in 0..20 {
@@ -226,14 +262,17 @@ impl Uint160 {
         hex::encode(reversed)
     }
 
+    /// Returns `true` if all 20 bytes are zero (null hash).
     pub fn is_null(&self) -> bool {
         self.data.iter().all(|&b| b == 0)
     }
 
+    /// Returns an immutable reference to the underlying 20-byte array.
     pub fn data(&self) -> &[u8; 20] {
         &self.data
     }
 
+    /// Returns the underlying data as a byte slice.
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
     }

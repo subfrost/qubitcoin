@@ -20,16 +20,22 @@
 
 use crate::hash::sha256_hash;
 
-/// The 3072-bit prime used as modulus.
-/// p = 2^3072 - 1103717 (the largest 3072-bit safe prime)
+/// The difference between `2^3072` and the modular prime `p`.
+///
+/// The prime is `p = 2^3072 - 1103717`, which is the largest 3072-bit safe prime.
+/// Storing only the difference allows efficient modular reduction.
 const PRIME_DIFF: u64 = 1103717;
 
-/// Number of 32-bit limbs in 3072 bits.
+/// Number of 32-bit limbs needed to represent a 3072-bit number (3072 / 32 = 96).
 const LIMBS: usize = 96;
 
-/// A 3072-bit number stored as 96 x 32-bit limbs (little-endian).
+/// A 3072-bit unsigned integer stored as 96 x 32-bit limbs in little-endian order.
+///
+/// Used internally by [`MuHash`] for modular arithmetic over the prime field
+/// `GF(p)` where `p = 2^3072 - 1103717`. Equivalent to `Num3072` in Bitcoin Core.
 #[derive(Clone, Debug)]
 pub struct Num3072 {
+    /// The 96 limbs representing the number, with `limbs[0]` being the least significant.
     limbs: [u32; LIMBS],
 }
 
@@ -122,8 +128,10 @@ impl Num3072 {
         }
     }
 
-    /// Multiply two 3072-bit numbers modulo p.
-    /// Uses schoolbook multiplication with reduction.
+    /// Multiplies two 3072-bit numbers modulo `p`.
+    ///
+    /// Uses schoolbook O(n^2) multiplication followed by Barrett-style reduction.
+    /// The result is fully reduced to the range `[0, p)`.
     pub fn mul_mod(&self, other: &Num3072) -> Num3072 {
         // Use 64-bit wide multiplication
         let mut result = [0u64; LIMBS * 2];
@@ -184,13 +192,13 @@ impl Num3072 {
         num
     }
 
-    /// Compute modular inverse using Fermat's little theorem.
-    /// a^(-1) = a^(p-2) mod p
+    /// Computes the modular inverse using Fermat's little theorem: `a^(-1) = a^(p-2) mod p`.
     ///
-    /// p - 2 = 2^3072 - PRIME_DIFF - 2 = 2^3072 - 1103719
+    /// Since `p` is prime, `a^(p-1) = 1 mod p` for any `a != 0`, so `a^(p-2)` is the
+    /// multiplicative inverse. Uses square-and-multiply exponentiation from the most
+    /// significant bit down.
     ///
-    /// We compute this via square-and-multiply, processing from
-    /// the most significant bit down.
+    /// The exponent is `p - 2 = 2^3072 - 1103719`.
     pub fn mod_inverse(&self) -> Num3072 {
         // p - 2 = 2^3072 - (PRIME_DIFF + 2)
         // In binary, this is 3072 ones, then subtract (PRIME_DIFF + 2).
@@ -299,19 +307,28 @@ impl MuHash {
         num
     }
 
-    /// Add an element to the set.
+    /// Adds an element to the set by multiplying its hash into the numerator.
+    ///
+    /// The element `data` is hashed to a 3072-bit field element and multiplied
+    /// into the running product. This operation is O(1) regardless of set size.
     pub fn insert(&mut self, data: &[u8]) {
         let h = Self::hash_to_num(data);
         self.numerator = self.numerator.mul_mod(&h);
     }
 
-    /// Remove an element from the set.
+    /// Removes an element from the set by multiplying its hash into the denominator.
+    ///
+    /// The element `data` is hashed to a 3072-bit field element and accumulated
+    /// in the denominator. On finalization, the denominator is inverted and
+    /// multiplied with the numerator to cancel this element.
     pub fn remove(&mut self, data: &[u8]) {
         let h = Self::hash_to_num(data);
         self.denominator = self.denominator.mul_mod(&h);
     }
 
-    /// Combine two MuHash accumulators.
+    /// Combines two `MuHash` accumulators by multiplying their numerators and denominators.
+    ///
+    /// This allows parallel computation of partial set hashes that are then merged.
     pub fn combine(&mut self, other: &MuHash) {
         self.numerator = self.numerator.mul_mod(&other.numerator);
         self.denominator = self.denominator.mul_mod(&other.denominator);
@@ -330,9 +347,20 @@ impl MuHash {
         sha256_hash(&bytes)
     }
 
-    /// Serialize the UTXO data for hashing.
+    /// Serializes UTXO data into a canonical byte format for hashing.
     ///
-    /// Format: txid || vout || height || coinbase || amount || script_pubkey
+    /// Format: `txid || vout || height || coinbase || amount || script_pubkey`
+    ///
+    /// This canonical serialization ensures that the UTXO set hash is deterministic
+    /// across all nodes.
+    ///
+    /// # Parameters
+    /// - `txid`: The 32-byte transaction ID of the output.
+    /// - `vout`: The output index within the transaction.
+    /// - `height`: The block height at which this UTXO was created.
+    /// - `coinbase`: Whether this output comes from a coinbase transaction.
+    /// - `amount`: The output value in satoshis.
+    /// - `script_pubkey`: The output's locking script.
     pub fn serialize_utxo(
         txid: &[u8; 32],
         vout: u32,

@@ -1,8 +1,9 @@
 //! In-memory data stream for serialization/deserialization.
-//! Maps to: src/streams.h (DataStream)
 //!
-//! DataStream wraps a Vec<u8> with a read cursor, supporting both
-//! read (consuming) and write (appending) operations.
+//! Maps to: `src/streams.h` (`DataStream`) in Bitcoin Core.
+//!
+//! [`DataStream`] wraps a `Vec<u8>` with a read cursor, supporting both
+//! sequential reading (consuming) and appending (writing) operations.
 
 use crate::encode::{Decodable, Encodable, Error};
 use std::io::{self, Read, Write};
@@ -85,12 +86,14 @@ impl DataStream {
         self.data
     }
 
-    /// Serialize an encodable value into this stream.
+    /// Serializes an [`Encodable`] value by appending its bytes to this stream.
+    ///
+    /// Returns the number of bytes written.
     pub fn write_obj<T: Encodable>(&mut self, obj: &T) -> Result<usize, Error> {
         obj.encode(&mut self.data)
     }
 
-    /// Deserialize a decodable value from this stream.
+    /// Deserializes a [`Decodable`] value from this stream, advancing the read cursor.
     pub fn read_obj<T: Decodable>(&mut self) -> Result<T, Error> {
         let mut cursor = io::Cursor::new(&self.data[self.read_pos..]);
         let obj = T::decode(&mut cursor)?;
@@ -98,7 +101,9 @@ impl DataStream {
         Ok(obj)
     }
 
-    /// Skip n bytes.
+    /// Advances the read cursor by `n` bytes without reading them.
+    ///
+    /// Returns [`Error::EndOfData`] if fewer than `n` bytes remain.
     pub fn skip(&mut self, n: usize) -> Result<(), Error> {
         if self.read_pos + n > self.data.len() {
             return Err(Error::EndOfData);

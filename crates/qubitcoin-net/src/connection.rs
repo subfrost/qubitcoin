@@ -5,7 +5,7 @@
 //! Handles message framing, serialization over the wire, and connection
 //! lifecycle (listen, connect, handshake, message loop, shutdown).
 //!
-//! The main entry point is [`ConnManager`], which owns a TCP listener task
+//! The main entry point is `ConnManager`, which owns a TCP listener task
 //! and spawns per-peer tasks that read/write Bitcoin protocol messages.
 
 use crate::peer::{PeerManager, PeerState};
@@ -31,15 +31,38 @@ use tokio::sync::{broadcast, mpsc};
 #[derive(Debug, Clone)]
 pub enum ConnectionEvent {
     /// A new inbound connection has been accepted.
-    NewInbound { peer_id: u64, addr: SocketAddr },
+    NewInbound {
+        /// Unique identifier assigned to this peer.
+        peer_id: u64,
+        /// Remote socket address of the connecting peer.
+        addr: SocketAddr,
+    },
     /// An outbound connection has been established.
-    NewOutbound { peer_id: u64, addr: SocketAddr },
+    NewOutbound {
+        /// Unique identifier assigned to this peer.
+        peer_id: u64,
+        /// Remote socket address we connected to.
+        addr: SocketAddr,
+    },
     /// A fully parsed message was received from a peer.
-    MessageReceived { peer_id: u64, message: NetMessage },
+    MessageReceived {
+        /// Identifier of the peer that sent the message.
+        peer_id: u64,
+        /// The deserialized P2P protocol message.
+        message: NetMessage,
+    },
     /// A peer has disconnected (or been disconnected).
-    Disconnected { peer_id: u64, reason: String },
+    Disconnected {
+        /// Identifier of the disconnected peer.
+        peer_id: u64,
+        /// Human-readable reason for the disconnection.
+        reason: String,
+    },
     /// The version/verack handshake completed successfully.
-    HandshakeComplete { peer_id: u64 },
+    HandshakeComplete {
+        /// Identifier of the peer whose handshake completed.
+        peer_id: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------

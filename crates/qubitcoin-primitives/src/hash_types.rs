@@ -13,42 +13,53 @@ macro_rules! define_hash_type {
         pub struct $name(Uint256);
 
         impl $name {
+            /// Creates a new instance from a [`Uint256`].
             pub const fn from_uint256(hash: Uint256) -> Self {
                 $name(hash)
             }
 
+            /// Creates a new instance from a byte slice. Panics if `slice.len() != 32`.
             pub fn from_slice(slice: &[u8]) -> Self {
                 $name(Uint256::from_slice(slice))
             }
 
+            /// Creates a new instance from a 32-byte array.
             pub fn from_bytes(bytes: [u8; 32]) -> Self {
                 $name(Uint256::from_bytes(bytes))
             }
 
+            /// Parses from a reversed-byte hex string (Bitcoin Core display convention).
+            /// Returns `None` if the hex string is invalid or not exactly 64 characters.
             pub fn from_hex(hex_str: &str) -> Option<Self> {
                 Uint256::from_hex(hex_str).map($name)
             }
 
+            /// Returns the reversed-byte hex representation (Bitcoin Core display convention).
             pub fn to_hex(&self) -> String {
                 self.0.to_hex()
             }
 
+            /// Returns `true` if all bytes are zero (null hash).
             pub fn is_null(&self) -> bool {
                 self.0.is_null()
             }
 
+            /// Returns a reference to the underlying [`Uint256`].
             pub fn as_uint256(&self) -> &Uint256 {
                 &self.0
             }
 
+            /// Consumes this value and returns the underlying [`Uint256`].
             pub fn into_uint256(self) -> Uint256 {
                 self.0
             }
 
+            /// Returns the raw bytes as a slice.
             pub fn as_bytes(&self) -> &[u8] {
                 self.0.as_bytes()
             }
 
+            /// Returns a reference to the underlying 32-byte array.
             pub fn data(&self) -> &[u8; 32] {
                 self.0.data()
             }
@@ -102,16 +113,19 @@ define_hash_type!(
 );
 define_hash_type!(BlockHash, "Block hash (double SHA256 of block header).");
 
-/// Null/zero constants.
+/// Null/zero constants for hash types.
 impl Txid {
+    /// The all-zero transaction ID, used as a sentinel/null value.
     pub const ZERO: Txid = Txid(Uint256::ZERO);
 }
 
 impl Wtxid {
+    /// The all-zero witness transaction ID, used as a sentinel/null value.
     pub const ZERO: Wtxid = Wtxid(Uint256::ZERO);
 }
 
 impl BlockHash {
+    /// The all-zero block hash, used as a sentinel/null value.
     pub const ZERO: BlockHash = BlockHash(Uint256::ZERO);
 }
 

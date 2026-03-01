@@ -1,91 +1,160 @@
 //! Script execution error types.
-//! Maps to: src/script/script_error.h
+//!
+//! Maps to: `src/script/script_error.h` in Bitcoin Core.
 
 /// All possible script verification errors.
 ///
-/// Port of Bitcoin Core's `ScriptError` enum. Values match 1:1.
+/// Port of Bitcoin Core's `ScriptError` enum. Discriminant values match 1:1
+/// with the C++ implementation for cross-validation compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ScriptError {
+    /// No error -- script evaluated successfully.
     Ok = 0,
+    /// An unspecified or internal error occurred.
     UnknownError = 1,
+    /// Script finished with a false/empty value on top of the stack.
     EvalFalse = 2,
+    /// `OP_RETURN` was encountered during execution.
     OpReturn = 3,
 
-    // Max sizes
+    // -- Size / count limits --
+
+    /// A script number exceeded the allowed byte length.
     ScriptNum = 4,
+    /// The script exceeds the maximum allowed size.
     ScriptSize = 5,
+    /// A data push exceeds `MAX_SCRIPT_ELEMENT_SIZE` (520 bytes).
     PushSize = 6,
+    /// The number of non-push operations exceeded `MAX_OPS_PER_SCRIPT`.
     OpCount = 7,
+    /// The combined stack + altstack size exceeded `MAX_STACK_SIZE`.
     StackSize = 8,
+    /// Signature count is negative or exceeds the public key count.
     SigCount = 9,
+    /// Public key count is negative or exceeds the limit.
     PubkeyCount = 10,
 
-    // Verify operations
+    // -- Verify operation failures --
+
+    /// An `OP_VERIFY` operation failed (top of stack was false).
     Verify = 11,
+    /// An `OP_EQUALVERIFY` operation failed.
     EqualVerify = 12,
+    /// An `OP_CHECKMULTISIGVERIFY` operation failed.
     CheckMultiSigVerify = 13,
+    /// An `OP_CHECKSIGVERIFY` operation failed.
     CheckSigVerify = 14,
+    /// An `OP_NUMEQUALVERIFY` operation failed.
     NumEqualVerify = 15,
 
-    // Logical/format errors
+    // -- Logical / format errors --
+
+    /// The opcode is missing, undefined, or not understood.
     BadOpcode = 16,
+    /// A disabled opcode was encountered.
     DisabledOpcode = 17,
+    /// A stack operation was attempted with insufficient stack depth.
     InvalidStackOperation = 18,
+    /// An altstack operation was attempted with an empty altstack.
     InvalidAltstackOperation = 19,
+    /// Unbalanced `OP_IF` / `OP_ELSE` / `OP_ENDIF` construction.
     UnbalancedConditional = 20,
 
-    // CHECKLOCKTIMEVERIFY / CHECKSEQUENCEVERIFY
+    // -- `OP_CHECKLOCKTIMEVERIFY` / `OP_CHECKSEQUENCEVERIFY` --
+
+    /// The locktime argument is negative.
     NegativeLocktime = 21,
+    /// The locktime requirement was not satisfied by the transaction.
     UnsatisfiedLocktime = 22,
 
-    // Malleability
+    // -- Malleability (BIP 62 / BIP 66 / BIP 146) --
+
+    /// Unrecognized or undefined signature hash type.
     SigHashtype = 23,
+    /// Signature is not valid strict-DER encoding.
     SigDer = 24,
+    /// A data push used a larger encoding than necessary.
     MinimalData = 25,
+    /// `scriptSig` contains non-push operations (violates `SIGPUSHONLY`).
     SigPushOnly = 26,
+    /// The S value in a DER signature is not in the lower half of the curve order.
     SigHighS = 27,
+    /// The dummy element for `OP_CHECKMULTISIG` is not the empty byte vector.
     SigNullDummy = 28,
+    /// A public key is neither compressed nor uncompressed format.
     PubKeyType = 29,
+    /// More than one element remains on the stack after execution.
     CleanStack = 30,
+    /// `OP_IF`/`OP_NOTIF` argument is not minimal (must be exactly `0x01` or empty).
     MinimalIf = 31,
+    /// A failing `CHECK(MULTI)SIG` left a non-empty signature on the stack.
     SigNullFail = 32,
 
-    // Softfork safeness
+    // -- Soft-fork safeness --
+
+    /// An upgradable `NOP` opcode was used when `DISCOURAGE_UPGRADABLE_NOPS` is set.
     DiscourageUpgradableNops = 33,
+    /// An upgradable witness program version was used.
     DiscourageUpgradableWitnessProgram = 34,
+    /// An upgradable Taproot leaf version was used.
     DiscourageUpgradableTaprootVersion = 35,
+    /// An `OP_SUCCESS` opcode was encountered in tapscript.
     DiscourageOpSuccess = 36,
+    /// An unknown public key type was used in tapscript.
     DiscourageUpgradablePubkeyType = 37,
 
-    // Segregated witness
+    // -- Segregated witness (BIP 141) --
+
+    /// The witness program has an incorrect length.
     WitnessProgramWrongLength = 38,
+    /// A witness program was provided an empty witness stack.
     WitnessProgramWitnessEmpty = 39,
+    /// The witness program hash does not match the witness script.
     WitnessProgramMismatch = 40,
+    /// A witness output requires an empty `scriptSig`.
     WitnessMalleated = 41,
+    /// A P2SH-wrapped witness requires `scriptSig` to be only the redeem script push.
     WitnessMalleatedP2sh = 42,
+    /// Witness data was provided for a non-witness script.
     WitnessUnexpected = 43,
+    /// A public key used in segwit v0 is not compressed.
     WitnessPubKeyType = 44,
 
-    // Taproot / Tapscript
+    // -- Taproot / Tapscript (BIP 341 / BIP 342) --
+
+    /// A Schnorr signature has an invalid size (must be 64 or 65 bytes).
     SchnorrSigSize = 45,
+    /// A Schnorr signature has an invalid hash type byte.
     SchnorrSigHashtype = 46,
+    /// A Schnorr signature failed verification.
     SchnorrSig = 47,
+    /// The Taproot control block has an invalid size.
     TaprootWrongControlSize = 48,
+    /// The tapscript validation weight budget has been exceeded.
     TapscriptValidationWeight = 49,
+    /// `OP_CHECKMULTISIG`/`OP_CHECKMULTISIGVERIFY` is not available in tapscript.
     TapscriptCheckMultiSig = 50,
+    /// `OP_IF`/`OP_NOTIF` argument must be exactly `0x01` or empty in tapscript.
     TapscriptMinimalIf = 51,
+    /// A public key in tapscript must not be empty.
     TapscriptEmptyPubkey = 52,
 
-    // Additional
+    // -- Additional --
+
+    /// `OP_CODESEPARATOR` used in a non-witness script (when `CONST_SCRIPTCODE` is set).
     OpCodeSeparator = 53,
+    /// A signature was found via `FindAndDelete` in the `scriptCode`.
     SigFindAndDelete = 54,
 
+    /// Sentinel value equal to the total number of error codes.
     ErrorCount = 55,
 }
 
 impl ScriptError {
-    /// Get a human-readable description of the error.
+    /// Returns a human-readable description of this error.
+    ///
+    /// The strings match Bitcoin Core's `ScriptErrorString()`.
     pub fn description(&self) -> &'static str {
         match self {
             ScriptError::Ok => "No error",
