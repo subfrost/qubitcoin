@@ -216,12 +216,19 @@ pub struct NetProcessor {
     node: Arc<dyn NodeInterface>,
     /// Genesis block hash – always included as the last locator entry.
     genesis_hash: BlockHash,
-    /// Known header hashes (simplified header chain).
+    /// Known header hashes (simplified header chain) — deduplicated.
     header_chain: Vec<BlockHash>,
+    /// Fast lookup for headers already in `header_chain`.
+    header_set: HashSet<BlockHash>,
     /// Headers we still need to download blocks for.
     blocks_to_download: VecDeque<BlockHash>,
     /// Blocks we have already downloaded (hash set for dedup).
     blocks_downloaded: HashSet<BlockHash>,
+    /// Buffer for blocks received out of chain order during IBD.
+    /// Key: block hash, Value: (peer_id, raw block data).
+    pending_blocks: HashMap<BlockHash, (u64, Vec<u8>)>,
+    /// Index into `header_chain` for the next block to process in order.
+    next_process_idx: usize,
     /// Per-peer state.
     peer_states: HashMap<u64, PeerSyncState>,
     /// Total blocks received.
@@ -289,8 +296,11 @@ impl NetProcessor {
             node,
             genesis_hash,
             header_chain: Vec::new(),
+            header_set: HashSet::new(),
             blocks_to_download: VecDeque::new(),
             blocks_downloaded: HashSet::new(),
+            pending_blocks: HashMap::new(),
+            next_process_idx: 0,
             peer_states: HashMap::new(),
             blocks_received: 0,
             total_headers: 0,
@@ -764,19 +774,33 @@ impl NetProcessor {
             return;
         }
 
-        // Parse and store header hashes.
+        // Parse and store header hashes, deduplicating across peers.
+        let mut new_count = 0usize;
         for header_data in headers {
             if header_data.len() >= 80 {
                 // The block hash is SHA256d of the 80-byte header.
                 let hash_bytes = qubitcoin_crypto::hash::hash256(header_data);
                 let hash = BlockHash::from_bytes(hash_bytes);
-                self.header_chain.push(hash);
-                // Queue block for download.
-                if !self.blocks_downloaded.contains(&hash) {
-                    self.blocks_to_download.push_back(hash);
+                // Only add if we haven't seen this header before.
+                if self.header_set.insert(hash) {
+                    self.header_chain.push(hash);
+                    // Queue block for download.
+                    if !self.blocks_downloaded.contains(&hash) {
+                        self.blocks_to_download.push_back(hash);
+                    }
+                    self.total_headers += 1;
+                    new_count += 1;
                 }
-                self.total_headers += 1;
             }
+        }
+
+        if new_count < count {
+            tracing::debug!(
+                peer_id = peer_id,
+                new = new_count,
+                duplicates = count - new_count,
+                "deduplicated headers"
+            );
         }
 
         // Update per-peer count.
@@ -788,8 +812,12 @@ impl NetProcessor {
         self.notifier.on_headers_update(self.header_chain.len());
 
         // Log progress every 2000 headers.
-        if self.total_headers % 2000 == 0 || count < 2000 {
-            tracing::info!(headers = self.total_headers, "header sync progress");
+        if self.total_headers % 2000 == 0 || new_count < count {
+            tracing::info!(
+                headers = self.total_headers,
+                unique = self.header_chain.len(),
+                "header sync progress"
+            );
         }
 
         // If we got a full batch, there are likely more -- request next batch.
@@ -807,6 +835,10 @@ impl NetProcessor {
     }
 
     /// Handle a received block.
+    ///
+    /// During IBD, blocks may arrive out of chain order (from multiple peers).
+    /// We buffer them in `pending_blocks` and process in `header_chain` order
+    /// via `drain_processable()`.
     fn handle_block(&mut self, peer_id: u64, data: &[u8]) {
         self.blocks_received += 1;
 
@@ -839,20 +871,73 @@ impl NetProcessor {
         // Notify state change.
         self.notifier.on_block_received(self.blocks_received);
 
-        // Validate block and add to chain via the node interface.
-        match self.node.process_block(data) {
-            Ok(true) => {
-                tracing::info!(blocks = self.blocks_received, "block accepted");
+        // Decide whether to buffer (IBD) or process immediately (post-IBD).
+        let is_ibd_block = block_hash
+            .map(|h| self.header_set.contains(&h))
+            .unwrap_or(false);
+
+        if is_ibd_block {
+            let hash = block_hash.unwrap();
+            // Buffer the block for ordered processing.
+            self.pending_blocks.insert(hash, (peer_id, data.to_vec()));
+            // Drain all processable blocks in chain order.
+            self.drain_processable();
+        } else {
+            // Non-IBD block (inv/getdata announcement): process immediately.
+            match self.node.process_block(data) {
+                Ok(true) => {
+                    tracing::info!(blocks = self.blocks_received, "block accepted");
+                }
+                Ok(false) => {
+                    tracing::debug!(
+                        peer_id = peer_id,
+                        "block not accepted (already have or invalid)"
+                    );
+                }
+                Err(reason) => {
+                    tracing::warn!(peer_id = peer_id, reason = %reason, "block rejected");
+                    self.misbehaving(peer_id, &format!("invalid block: {}", reason));
+                }
             }
-            Ok(false) => {
-                tracing::debug!(
-                    peer_id = peer_id,
-                    "block not accepted (already have or invalid)"
-                );
-            }
-            Err(reason) => {
-                tracing::warn!(peer_id = peer_id, reason = %reason, "block rejected");
-                self.misbehaving(peer_id, &format!("invalid block: {}", reason));
+        }
+    }
+
+    /// Process buffered blocks in `header_chain` order.
+    ///
+    /// During IBD, blocks arrive from multiple peers out of order. This method
+    /// walks `header_chain` from `next_process_idx` and processes every block
+    /// whose data is already in `pending_blocks`, stopping at the first gap.
+    fn drain_processable(&mut self) {
+        while self.next_process_idx < self.header_chain.len() {
+            let hash = self.header_chain[self.next_process_idx];
+            if let Some((peer_id, data)) = self.pending_blocks.remove(&hash) {
+                match self.node.process_block(&data) {
+                    Ok(true) => {
+                        tracing::info!(
+                            height = self.next_process_idx + 1,
+                            pending = self.pending_blocks.len(),
+                            "block accepted (ordered)"
+                        );
+                    }
+                    Ok(false) => {
+                        tracing::debug!("block not accepted (already have or invalid)");
+                    }
+                    Err(reason) => {
+                        tracing::warn!(
+                            peer_id = peer_id,
+                            height = self.next_process_idx + 1,
+                            reason = %reason,
+                            "block rejected during ordered processing"
+                        );
+                        // Don't advance past a failed block — sync stalls here
+                        // until the issue is resolved.
+                        return;
+                    }
+                }
+                self.next_process_idx += 1;
+            } else {
+                // Next block in chain order hasn't arrived yet.
+                break;
             }
         }
     }
