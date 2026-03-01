@@ -495,7 +495,7 @@ impl NetProcessor {
             let msg = NetMessage::GetData(inv_list);
             let payload = serialize_message(&msg);
             self.conn_manager.send_to_peer(peer_id, "getdata", payload);
-            tracing::info!(peer_id = peer_id, count = count, "requesting blocks");
+            tracing::debug!(peer_id = peer_id, count = count, "requesting blocks");
         }
     }
 
@@ -1117,9 +1117,10 @@ impl NetProcessor {
             }
         }
         let processed = self.next_process_idx - start_idx;
-        if processed > 0 {
+        let height = self.next_process_idx;
+        if processed > 0 && (height <= 100 || height % 1000 == 0 || processed >= 10) {
             tracing::info!(
-                height = self.next_process_idx,
+                height = height,
                 batch = processed,
                 pending = self.pending_blocks.len(),
                 queued = self.blocks_to_download.len(),
