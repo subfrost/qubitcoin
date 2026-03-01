@@ -23,8 +23,8 @@
 use crate::connection::ConnectionEvent;
 use crate::connection::{serialize_message, ConnManager};
 use crate::protocol::{
-    InvType, InvVect, NetMessage, MAX_ADDR_TO_SEND, MAX_BLOCKS_IN_TRANSIT_PER_PEER,
-    MAX_HEADERS_RESULTS, MAX_INV_SIZE, PROTOCOL_VERSION,
+    InvType, InvVect, NetMessage, BLOCK_DOWNLOAD_TIMEOUT_BASE, MAX_ADDR_TO_SEND,
+    MAX_BLOCKS_IN_TRANSIT_PER_PEER, MAX_HEADERS_RESULTS, MAX_INV_SIZE, PROTOCOL_VERSION,
 };
 use qubitcoin_primitives::{BlockHash, Uint256};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -134,8 +134,8 @@ struct PeerSyncState {
     headers_requested: bool,
     /// Number of headers we have received from this peer.
     headers_received: u64,
-    /// Block hashes currently in-flight from this peer.
-    blocks_in_flight: Vec<BlockHash>,
+    /// Block hashes currently in-flight from this peer, with request timestamp.
+    blocks_in_flight: Vec<(BlockHash, Instant)>,
     /// When we last received data from this peer.
     last_activity: Instant,
     /// When we last sent a ping to this peer.
@@ -172,7 +172,7 @@ impl PeerSyncState {
             handshake_complete: false,
             headers_requested: false,
             headers_received: 0,
-            blocks_in_flight: Vec::new(),
+            blocks_in_flight: Vec::<(BlockHash, Instant)>::new(),
             last_activity: Instant::now(),
             last_ping: None,
             ping_outstanding: false,
@@ -307,41 +307,62 @@ impl NetProcessor {
     /// This method runs until the event channel is closed (i.e. the connection
     /// manager is dropped or shut down).
     pub async fn run(&mut self) {
-        while let Some(event) = self.event_rx.recv().await {
-            match event {
-                ConnectionEvent::HandshakeComplete { peer_id } => {
-                    tracing::info!(peer_id = peer_id, "handshake complete, requesting headers");
-                    let mut state = PeerSyncState::new();
-                    state.handshake_complete = true;
-                    state.headers_sync_start = Some(Instant::now());
-                    self.peer_states.insert(peer_id, state);
-                    self.notifier.on_peer_connected(peer_id);
+        let mut stall_interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        // Don't queue up stall checks if processing falls behind.
+        stall_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-                    // Send getheaders from our current tip (or genesis).
-                    self.send_getheaders(peer_id);
-                    // Also tell peer we prefer header announcements (BIP 130).
-                    self.conn_manager
-                        .send_to_peer(peer_id, "sendheaders", vec![]);
-                    // Send compact block negotiation (BIP 152).
-                    self.send_sendcmpct(peer_id);
-                }
-                ConnectionEvent::MessageReceived { peer_id, message } => {
-                    // Update activity timestamp.
-                    if let Some(state) = self.peer_states.get_mut(&peer_id) {
-                        state.mark_activity();
+        loop {
+            tokio::select! {
+                event = self.event_rx.recv() => {
+                    let event = match event {
+                        Some(e) => e,
+                        None => break, // channel closed
+                    };
+                    match event {
+                        ConnectionEvent::HandshakeComplete { peer_id } => {
+                            tracing::info!(peer_id = peer_id, "handshake complete, requesting headers");
+                            let mut state = PeerSyncState::new();
+                            state.handshake_complete = true;
+                            state.headers_sync_start = Some(Instant::now());
+                            self.peer_states.insert(peer_id, state);
+                            self.notifier.on_peer_connected(peer_id);
+
+                            // Send getheaders from our current tip (or genesis).
+                            self.send_getheaders(peer_id);
+                            // Also tell peer we prefer header announcements (BIP 130).
+                            self.conn_manager
+                                .send_to_peer(peer_id, "sendheaders", vec![]);
+                            // Send compact block negotiation (BIP 152).
+                            self.send_sendcmpct(peer_id);
+                        }
+                        ConnectionEvent::MessageReceived { peer_id, message } => {
+                            // Update activity timestamp.
+                            if let Some(state) = self.peer_states.get_mut(&peer_id) {
+                                state.mark_activity();
+                            }
+                            self.handle_message(peer_id, message).await;
+                        }
+                        ConnectionEvent::Disconnected { peer_id, reason } => {
+                            tracing::info!(peer_id = peer_id, reason = %reason, "peer disconnected");
+                            // Re-queue in-flight blocks from disconnected peer.
+                            if let Some(state) = self.peer_states.get(&peer_id) {
+                                for (hash, _) in &state.blocks_in_flight {
+                                    self.blocks_to_download.push_back(*hash);
+                                }
+                            }
+                            self.peer_states.remove(&peer_id);
+                            self.notifier.on_peer_disconnected(peer_id);
+                        }
+                        ConnectionEvent::NewInbound { peer_id, addr } => {
+                            tracing::debug!(peer_id = peer_id, addr = %addr, "new inbound peer");
+                        }
+                        ConnectionEvent::NewOutbound { peer_id, addr } => {
+                            tracing::debug!(peer_id = peer_id, addr = %addr, "new outbound peer");
+                        }
                     }
-                    self.handle_message(peer_id, message).await;
                 }
-                ConnectionEvent::Disconnected { peer_id, reason } => {
-                    tracing::info!(peer_id = peer_id, reason = %reason, "peer disconnected");
-                    self.peer_states.remove(&peer_id);
-                    self.notifier.on_peer_disconnected(peer_id);
-                }
-                ConnectionEvent::NewInbound { peer_id, addr } => {
-                    tracing::debug!(peer_id = peer_id, addr = %addr, "new inbound peer");
-                }
-                ConnectionEvent::NewOutbound { peer_id, addr } => {
-                    tracing::debug!(peer_id = peer_id, addr = %addr, "new outbound peer");
+                _ = stall_interval.tick() => {
+                    self.check_stalled_peers();
                 }
             }
         }
@@ -444,7 +465,7 @@ impl NetProcessor {
         for _ in 0..available {
             if let Some(hash) = self.blocks_to_download.pop_front() {
                 if !self.blocks_downloaded.contains(&hash) {
-                    state.blocks_in_flight.push(hash);
+                    state.blocks_in_flight.push((hash, Instant::now()));
                     inv_list.push(InvVect::new(
                         InvType::WitnessBlock,
                         qubitcoin_primitives::Uint256::from_bytes(*hash.data()),
@@ -479,8 +500,48 @@ impl NetProcessor {
             state.discouraged = true;
             state.discourage_reason = Some(reason.to_string());
         }
-        // Note: ConnManager does not yet support disconnect_peer().
-        // Discouraged peers are tracked and their messages can be ignored.
+        // Disconnect the misbehaving peer.
+        self.conn_manager.disconnect_peer(peer_id);
+    }
+
+    /// Check for stalled peers whose oldest in-flight block request has
+    /// exceeded `BLOCK_DOWNLOAD_TIMEOUT_BASE`.  Stalled peers are
+    /// discouraged, their in-flight blocks are re-queued, and the peer
+    /// is disconnected.
+    fn check_stalled_peers(&mut self) {
+        let timeout = std::time::Duration::from_secs(BLOCK_DOWNLOAD_TIMEOUT_BASE);
+        let stalled: Vec<u64> = self
+            .peer_states
+            .iter()
+            .filter_map(|(&pid, state)| {
+                if let Some((_, oldest_time)) = state.blocks_in_flight.first() {
+                    if oldest_time.elapsed() > timeout {
+                        return Some(pid);
+                    }
+                }
+                None
+            })
+            .collect();
+
+        for peer_id in stalled {
+            tracing::warn!(
+                peer_id = peer_id,
+                "peer stalled, re-queuing blocks and disconnecting"
+            );
+            // Re-queue all in-flight blocks from this peer.
+            if let Some(state) = self.peer_states.get(&peer_id) {
+                for (hash, _) in &state.blocks_in_flight {
+                    self.blocks_to_download.push_back(*hash);
+                }
+            }
+            // Mark discouraged and disconnect.
+            if let Some(state) = self.peer_states.get_mut(&peer_id) {
+                state.discouraged = true;
+                state.discourage_reason = Some("block download stall".to_string());
+                state.blocks_in_flight.clear();
+            }
+            self.conn_manager.disconnect_peer(peer_id);
+        }
     }
 
     /// Handle a single message from a peer.
@@ -579,7 +640,7 @@ impl NetProcessor {
                         if item.inv_type == InvType::Block || item.inv_type == InvType::WitnessBlock
                         {
                             let hash = BlockHash::from_bytes(*item.hash.data());
-                            state.blocks_in_flight.retain(|h| h != &hash);
+                            state.blocks_in_flight.retain(|(h, _)| h != &hash);
                         }
                     }
                 }
@@ -768,7 +829,7 @@ impl NetProcessor {
         if let Some(hash) = block_hash {
             self.blocks_downloaded.insert(hash);
             if let Some(state) = self.peer_states.get_mut(&peer_id) {
-                state.blocks_in_flight.retain(|h| h != &hash);
+                state.blocks_in_flight.retain(|(h, _)| h != &hash);
             }
 
             // Request more blocks if we have room.
@@ -1386,7 +1447,7 @@ mod tests {
         // Manually add a block to in-flight.
         let block_hash = BlockHash::from_bytes([0x42; 32]);
         if let Some(state) = processor.peer_states.get_mut(&1) {
-            state.blocks_in_flight.push(block_hash);
+            state.blocks_in_flight.push((block_hash, Instant::now()));
         }
 
         // Send notfound for that block.

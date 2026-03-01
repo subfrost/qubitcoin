@@ -98,6 +98,11 @@ impl Key {
     pub fn is_compressed(&self) -> bool {
         self.compressed
     }
+
+    /// Return the 32-byte secret key material.
+    pub fn secret_bytes(&self) -> [u8; 32] {
+        self.inner.secret_bytes()
+    }
 }
 
 /// A public key (wraps `secp256k1::PublicKey`).

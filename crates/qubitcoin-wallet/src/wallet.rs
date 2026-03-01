@@ -10,11 +10,16 @@
 //! - [`Wallet`]: The descriptor wallet managing keys, addresses, transactions, and UTXOs.
 
 use std::collections::HashMap;
+use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use qubitcoin_common::keys::{Key, PubKey, XOnlyPubKey};
-use qubitcoin_consensus::transaction::{OutPoint, TransactionRef, TxOut};
+use qubitcoin_consensus::sighash::{
+    signature_hash, taproot_signature_hash, witness_v0_signature_hash, PrecomputedTransactionData,
+    SIGHASH_ALL,
+};
+use qubitcoin_consensus::transaction::{OutPoint, Transaction, TransactionRef, TxOut, Witness};
 use qubitcoin_crypto::hash::hash160;
 use qubitcoin_primitives::{Amount, Txid};
 use qubitcoin_script::{build_p2pkh, build_p2sh, build_p2tr, build_p2wpkh, Script};
@@ -254,6 +259,198 @@ impl Wallet {
         addr_info
     }
 
+    // -- Persistence ----------------------------------------------------------
+
+    /// Serialize the wallet to bytes for disk persistence.
+    pub fn save_to_bytes(&self) -> Result<Vec<u8>, io::Error> {
+        let mut buf = Vec::new();
+
+        // Name: compact_size(len) + bytes
+        write_compact_string(&mut buf, &self.name)?;
+
+        // Descriptor type: 1 byte
+        let dt_byte = match self.descriptor_type {
+            DescriptorType::Pkh => 0u8,
+            DescriptorType::Wpkh => 1u8,
+            DescriptorType::ShWpkh => 2u8,
+            DescriptorType::Tr => 3u8,
+        };
+        buf.write_all(&[dt_byte])?;
+
+        // Indices
+        buf.write_all(&(self.next_key_index as u32).to_le_bytes())?;
+        buf.write_all(&(self.next_change_index as u32).to_le_bytes())?;
+
+        // Keys: compact_size(count) + each key
+        write_compact_size_io(&mut buf, self.keys.len() as u64)?;
+        for wk in &self.keys {
+            // compressed flag
+            buf.write_all(&[if wk.key.is_compressed() { 1u8 } else { 0u8 }])?;
+            // secret key (32 bytes)
+            buf.write_all(&wk.key.secret_bytes())?;
+            // path: compact_size(len) + each u32
+            write_compact_size_io(&mut buf, wk.path.len() as u64)?;
+            for &component in wk.path.as_slice() {
+                buf.write_all(&component.to_le_bytes())?;
+            }
+            // descriptor type
+            let wk_dt = match wk.descriptor_type {
+                DescriptorType::Pkh => 0u8,
+                DescriptorType::Wpkh => 1u8,
+                DescriptorType::ShWpkh => 2u8,
+                DescriptorType::Tr => 3u8,
+            };
+            buf.write_all(&[wk_dt])?;
+        }
+
+        // Addresses: compact_size(count) + each
+        write_compact_size_io(&mut buf, self.addresses.len() as u64)?;
+        for addr in &self.addresses {
+            write_address_info(&mut buf, addr)?;
+        }
+
+        // Change addresses
+        write_compact_size_io(&mut buf, self.change_addresses.len() as u64)?;
+        for addr in &self.change_addresses {
+            write_address_info(&mut buf, addr)?;
+        }
+
+        // UTXOs: compact_size(count) + each
+        write_compact_size_io(&mut buf, self.unspent.len() as u64)?;
+        for utxo in self.unspent.values() {
+            // outpoint: txid (32 bytes) + vout (4 bytes)
+            buf.write_all(utxo.outpoint.hash.data())?;
+            buf.write_all(&utxo.outpoint.n.to_le_bytes())?;
+            // tx_out: value (8 bytes) + script
+            buf.write_all(&utxo.tx_out.value.to_sat().to_le_bytes())?;
+            write_compact_bytes(&mut buf, utxo.tx_out.script_pubkey.as_bytes())?;
+            // height: i32 (-1 if None)
+            let h = utxo.height.unwrap_or(-1);
+            buf.write_all(&h.to_le_bytes())?;
+            // is_change
+            buf.write_all(&[if utxo.is_change { 1u8 } else { 0u8 }])?;
+        }
+
+        Ok(buf)
+    }
+
+    /// Deserialize a wallet from bytes.
+    pub fn load_from_bytes(data: &[u8]) -> Result<Self, io::Error> {
+        let mut reader = io::Cursor::new(data);
+
+        // Name
+        let name = read_compact_string(&mut reader)?;
+
+        // Descriptor type
+        let mut dt_buf = [0u8; 1];
+        reader.read_exact(&mut dt_buf)?;
+        let descriptor_type = match dt_buf[0] {
+            0 => DescriptorType::Pkh,
+            1 => DescriptorType::Wpkh,
+            2 => DescriptorType::ShWpkh,
+            3 => DescriptorType::Tr,
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid descriptor type")),
+        };
+
+        // Indices
+        let mut u32_buf = [0u8; 4];
+        reader.read_exact(&mut u32_buf)?;
+        let next_key_index = u32::from_le_bytes(u32_buf) as usize;
+        reader.read_exact(&mut u32_buf)?;
+        let next_change_index = u32::from_le_bytes(u32_buf) as usize;
+
+        // Keys
+        let key_count = read_compact_size_io(&mut reader)?;
+        let mut keys = Vec::with_capacity(key_count as usize);
+        for _ in 0..key_count {
+            let mut comp_buf = [0u8; 1];
+            reader.read_exact(&mut comp_buf)?;
+            let compressed = comp_buf[0] != 0;
+
+            let mut secret = [0u8; 32];
+            reader.read_exact(&mut secret)?;
+            let key = Key::new(&secret, compressed)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let pubkey = key.get_pubkey();
+
+            let path_len = read_compact_size_io(&mut reader)?;
+            let mut path_components = Vec::with_capacity(path_len as usize);
+            for _ in 0..path_len {
+                reader.read_exact(&mut u32_buf)?;
+                path_components.push(u32::from_le_bytes(u32_buf));
+            }
+            let path = DerivationPath::new(path_components);
+
+            let mut wk_dt_buf = [0u8; 1];
+            reader.read_exact(&mut wk_dt_buf)?;
+            let wk_dt = match wk_dt_buf[0] {
+                0 => DescriptorType::Pkh,
+                1 => DescriptorType::Wpkh,
+                2 => DescriptorType::ShWpkh,
+                3 => DescriptorType::Tr,
+                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid key descriptor type")),
+            };
+
+            keys.push(WalletKey { key, pubkey, path, descriptor_type: wk_dt });
+        }
+
+        // Addresses
+        let addr_count = read_compact_size_io(&mut reader)?;
+        let mut addresses = Vec::with_capacity(addr_count as usize);
+        for _ in 0..addr_count {
+            addresses.push(read_address_info(&mut reader)?);
+        }
+
+        // Change addresses
+        let change_count = read_compact_size_io(&mut reader)?;
+        let mut change_addresses = Vec::with_capacity(change_count as usize);
+        for _ in 0..change_count {
+            change_addresses.push(read_address_info(&mut reader)?);
+        }
+
+        // UTXOs
+        let utxo_count = read_compact_size_io(&mut reader)?;
+        let mut unspent = HashMap::with_capacity(utxo_count as usize);
+        for _ in 0..utxo_count {
+            let mut txid_buf = [0u8; 32];
+            reader.read_exact(&mut txid_buf)?;
+            reader.read_exact(&mut u32_buf)?;
+            let vout = u32::from_le_bytes(u32_buf);
+            let outpoint = OutPoint::new(qubitcoin_primitives::Txid::from_bytes(txid_buf), vout);
+
+            let mut i64_buf = [0u8; 8];
+            reader.read_exact(&mut i64_buf)?;
+            let value = qubitcoin_primitives::Amount::from_sat(i64::from_le_bytes(i64_buf));
+            let script_bytes = read_compact_bytes(&mut reader)?;
+            let script_pubkey = qubitcoin_script::Script::from_bytes(script_bytes);
+            let tx_out = TxOut::new(value, script_pubkey);
+
+            let mut i32_buf = [0u8; 4];
+            reader.read_exact(&mut i32_buf)?;
+            let h = i32::from_le_bytes(i32_buf);
+            let height = if h < 0 { None } else { Some(h) };
+
+            let mut change_buf = [0u8; 1];
+            reader.read_exact(&mut change_buf)?;
+            let is_change = change_buf[0] != 0;
+
+            let utxo = WalletUtxo { outpoint: outpoint.clone(), tx_out, height, is_change };
+            unspent.insert(outpoint, utxo);
+        }
+
+        Ok(Wallet {
+            name,
+            keys,
+            addresses,
+            change_addresses,
+            next_key_index,
+            next_change_index,
+            descriptor_type,
+            transactions: HashMap::new(), // transactions not persisted (rebuilt from chain)
+            unspent,
+        })
+    }
+
     // -- Balance / UTXO queries ---------------------------------------------
 
     /// Total confirmed + unconfirmed balance (sum of all UTXOs).
@@ -325,7 +522,143 @@ impl Wallet {
         self.transactions.values().collect()
     }
 
+    // -- Transaction signing ------------------------------------------------
+
+    /// Sign a mutable transaction in-place.
+    ///
+    /// For each input, finds the wallet key that corresponds to the
+    /// scriptPubKey being spent, computes the appropriate sighash, and
+    /// sets the scriptSig and/or witness data.
+    ///
+    /// `spent_outputs` must have one entry per input, providing the
+    /// `TxOut` being consumed (needed for the signing amount and script).
+    ///
+    /// Returns the number of successfully signed inputs.
+    pub fn sign_transaction(
+        &self,
+        tx: &mut Transaction,
+        spent_outputs: &[TxOut],
+    ) -> usize {
+        assert_eq!(tx.vin.len(), spent_outputs.len());
+
+        let precomputed = PrecomputedTransactionData::new(tx, spent_outputs);
+        let mut signed = 0usize;
+
+        for i in 0..tx.vin.len() {
+            let prev_out = &spent_outputs[i];
+            let spk = &prev_out.script_pubkey;
+
+            if let Some(wk) = self.find_key_for_script(spk) {
+                match wk.descriptor_type {
+                    DescriptorType::Pkh => {
+                        // Legacy P2PKH: sighash over the scriptPubKey.
+                        let sighash = signature_hash(spk, tx, i, SIGHASH_ALL);
+                        if let Ok(mut der_sig) = wk.key.sign(&sighash) {
+                            der_sig.push(SIGHASH_ALL as u8);
+                            let pubkey_bytes = wk.pubkey.serialize();
+
+                            // Build scriptSig: <sig> <pubkey>
+                            let mut script_sig = Script::new();
+                            script_sig.push_data(&der_sig);
+                            script_sig.push_data(&pubkey_bytes);
+                            tx.vin[i].script_sig = script_sig;
+                            signed += 1;
+                        }
+                    }
+                    DescriptorType::Wpkh => {
+                        // Native SegWit P2WPKH: BIP143 sighash.
+                        // scriptCode for P2WPKH is OP_DUP OP_HASH160 <pkh> OP_EQUALVERIFY OP_CHECKSIG
+                        let script_code = build_p2pkh(&wk.pubkey.get_id());
+                        let amount = prev_out.value.to_sat();
+                        let sighash = witness_v0_signature_hash(
+                            &script_code,
+                            tx,
+                            i,
+                            SIGHASH_ALL,
+                            amount,
+                            &precomputed,
+                        );
+                        if let Ok(mut der_sig) = wk.key.sign(&sighash) {
+                            der_sig.push(SIGHASH_ALL as u8);
+                            let pubkey_bytes = wk.pubkey.serialize();
+
+                            // Witness: [<sig>, <pubkey>]
+                            let mut witness = Witness::new();
+                            witness.stack.push(der_sig);
+                            witness.stack.push(pubkey_bytes);
+                            tx.vin[i].witness = witness;
+                            // scriptSig is empty for native segwit.
+                            tx.vin[i].script_sig = Script::new();
+                            signed += 1;
+                        }
+                    }
+                    DescriptorType::ShWpkh => {
+                        // Wrapped SegWit P2SH-P2WPKH: BIP143 sighash with
+                        // a scriptSig that pushes the witness program.
+                        let script_code = build_p2pkh(&wk.pubkey.get_id());
+                        let amount = prev_out.value.to_sat();
+                        let sighash = witness_v0_signature_hash(
+                            &script_code,
+                            tx,
+                            i,
+                            SIGHASH_ALL,
+                            amount,
+                            &precomputed,
+                        );
+                        if let Ok(mut der_sig) = wk.key.sign(&sighash) {
+                            der_sig.push(SIGHASH_ALL as u8);
+                            let pubkey_bytes = wk.pubkey.serialize();
+
+                            // Witness: [<sig>, <pubkey>]
+                            let mut witness = Witness::new();
+                            witness.stack.push(der_sig);
+                            witness.stack.push(pubkey_bytes);
+                            tx.vin[i].witness = witness;
+
+                            // scriptSig: push the witness program (P2WPKH)
+                            let redeem_script = build_p2wpkh(&wk.pubkey.get_id());
+                            let mut script_sig = Script::new();
+                            script_sig.push_data(redeem_script.as_bytes());
+                            tx.vin[i].script_sig = script_sig;
+                            signed += 1;
+                        }
+                    }
+                    DescriptorType::Tr => {
+                        // Taproot key spend: BIP341 Schnorr signature.
+                        if let Some(sighash) = taproot_signature_hash(
+                            tx, i, 0, // SIGHASH_DEFAULT (0x00) for taproot
+                            &precomputed, 0, // ext_flag = 0 for key spend
+                            None, None, None,
+                        ) {
+                            if let Ok(schnorr_sig) = wk.key.sign_schnorr(&sighash) {
+                                // Witness: [<64-byte sig>] (no sighash byte for DEFAULT)
+                                let mut witness = Witness::new();
+                                witness.stack.push(schnorr_sig.to_vec());
+                                tx.vin[i].witness = witness;
+                                tx.vin[i].script_sig = Script::new();
+                                signed += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        signed
+    }
+
     // -- Internal helpers ---------------------------------------------------
+
+    /// Find the wallet key whose address matches the given scriptPubKey.
+    fn find_key_for_script(&self, script_pubkey: &Script) -> Option<&WalletKey> {
+        // Check all addresses (receiving and change) for a match.
+        for addr in self.addresses.iter().chain(self.change_addresses.iter()) {
+            if addr.script_pubkey == *script_pubkey {
+                return self.keys.get(addr.key_index);
+            }
+        }
+        None
+    }
 
     /// Check whether `script_pubkey` matches one of the wallet's addresses.
     /// Returns `Some(is_change)` if it matches, `None` otherwise.
@@ -398,6 +731,89 @@ impl Wallet {
 
         (wk, addr_info)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Persistence helpers (compact-size I/O for wallet serialization)
+// ---------------------------------------------------------------------------
+
+fn write_compact_size_io<W: Write>(w: &mut W, n: u64) -> io::Result<()> {
+    if n < 253 {
+        w.write_all(&[n as u8])
+    } else if n <= 0xFFFF {
+        w.write_all(&[253])?;
+        w.write_all(&(n as u16).to_le_bytes())
+    } else if n <= 0xFFFF_FFFF {
+        w.write_all(&[254])?;
+        w.write_all(&(n as u32).to_le_bytes())
+    } else {
+        w.write_all(&[255])?;
+        w.write_all(&n.to_le_bytes())
+    }
+}
+
+fn read_compact_size_io<R: Read>(r: &mut R) -> io::Result<u64> {
+    let mut first = [0u8; 1];
+    r.read_exact(&mut first)?;
+    match first[0] {
+        0..=252 => Ok(first[0] as u64),
+        253 => {
+            let mut buf = [0u8; 2];
+            r.read_exact(&mut buf)?;
+            Ok(u16::from_le_bytes(buf) as u64)
+        }
+        254 => {
+            let mut buf = [0u8; 4];
+            r.read_exact(&mut buf)?;
+            Ok(u32::from_le_bytes(buf) as u64)
+        }
+        255 => {
+            let mut buf = [0u8; 8];
+            r.read_exact(&mut buf)?;
+            Ok(u64::from_le_bytes(buf))
+        }
+    }
+}
+
+fn write_compact_bytes<W: Write>(w: &mut W, data: &[u8]) -> io::Result<()> {
+    write_compact_size_io(w, data.len() as u64)?;
+    w.write_all(data)
+}
+
+fn read_compact_bytes<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
+    let len = read_compact_size_io(r)? as usize;
+    let mut buf = vec![0u8; len];
+    r.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn write_compact_string<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
+    write_compact_bytes(w, s.as_bytes())
+}
+
+fn read_compact_string<R: Read>(r: &mut R) -> io::Result<String> {
+    let bytes = read_compact_bytes(r)?;
+    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+fn write_address_info<W: Write>(w: &mut W, addr: &AddressInfo) -> io::Result<()> {
+    write_compact_string(w, &addr.address)?;
+    write_compact_bytes(w, addr.script_pubkey.as_bytes())?;
+    w.write_all(&(addr.key_index as u32).to_le_bytes())?;
+    w.write_all(&[if addr.is_change { 1u8 } else { 0u8 }])
+}
+
+fn read_address_info<R: Read>(r: &mut R) -> io::Result<AddressInfo> {
+    let address = read_compact_string(r)?;
+    let script_bytes = read_compact_bytes(r)?;
+    let script_pubkey = qubitcoin_script::Script::from_bytes(script_bytes);
+    let mut u32_buf = [0u8; 4];
+    r.read_exact(&mut u32_buf)?;
+    let key_index = u32::from_le_bytes(u32_buf) as usize;
+    let mut bool_buf = [0u8; 1];
+    r.read_exact(&mut bool_buf)?;
+    let is_change = bool_buf[0] != 0;
+    Ok(AddressInfo { address, script_pubkey, key_index, is_change })
 }
 
 // ---------------------------------------------------------------------------
@@ -556,5 +972,184 @@ mod tests {
         assert_eq!(wallet.get_balance(), Amount::from_sat(30_000));
         assert_eq!(wallet.list_unspent().len(), 2);
         assert_eq!(wallet.list_transactions().len(), 2);
+    }
+
+    #[test]
+    fn test_sign_transaction_p2pkh() {
+        let mut wallet = Wallet::new("w", DescriptorType::Pkh);
+        let addr = wallet.get_new_address();
+
+        // Create a funding output.
+        let funding_tx = make_funding_tx(addr.script_pubkey.clone(), Amount::from_sat(50_000));
+        wallet.add_transaction(funding_tx.clone(), Some(1));
+
+        // Build a spending transaction.
+        let mut external_spk = vec![0x00, 0x14];
+        external_spk.extend_from_slice(&[0xab; 20]);
+        let mut spend_tx = Transaction::new(
+            2,
+            vec![TxIn::new(
+                OutPoint::new(*funding_tx.txid(), 0),
+                Script::new(),
+                0xFFFFFFFF,
+            )],
+            vec![TxOut::new(
+                Amount::from_sat(49_000),
+                Script::from_bytes(external_spk),
+            )],
+            0,
+        );
+
+        let spent_outputs = vec![TxOut::new(
+            Amount::from_sat(50_000),
+            addr.script_pubkey.clone(),
+        )];
+
+        let signed = wallet.sign_transaction(&mut spend_tx, &spent_outputs);
+        assert_eq!(signed, 1);
+        // P2PKH should have a non-empty scriptSig.
+        assert!(!spend_tx.vin[0].script_sig.is_empty());
+    }
+
+    #[test]
+    fn test_sign_transaction_p2wpkh() {
+        let mut wallet = Wallet::new("w", DescriptorType::Wpkh);
+        let addr = wallet.get_new_address();
+
+        let funding_tx = make_funding_tx(addr.script_pubkey.clone(), Amount::from_sat(50_000));
+        wallet.add_transaction(funding_tx.clone(), Some(1));
+
+        let mut external_spk = vec![0x00, 0x14];
+        external_spk.extend_from_slice(&[0xab; 20]);
+        let mut spend_tx = Transaction::new(
+            2,
+            vec![TxIn::new(
+                OutPoint::new(*funding_tx.txid(), 0),
+                Script::new(),
+                0xFFFFFFFF,
+            )],
+            vec![TxOut::new(
+                Amount::from_sat(49_000),
+                Script::from_bytes(external_spk),
+            )],
+            0,
+        );
+
+        let spent_outputs = vec![TxOut::new(
+            Amount::from_sat(50_000),
+            addr.script_pubkey.clone(),
+        )];
+
+        let signed = wallet.sign_transaction(&mut spend_tx, &spent_outputs);
+        assert_eq!(signed, 1);
+        // P2WPKH: witness should have 2 items (sig, pubkey).
+        assert_eq!(spend_tx.vin[0].witness.stack.len(), 2);
+        // scriptSig should be empty for native segwit.
+        assert!(spend_tx.vin[0].script_sig.is_empty());
+    }
+
+    #[test]
+    fn test_sign_transaction_p2tr() {
+        let mut wallet = Wallet::new("w", DescriptorType::Tr);
+        let addr = wallet.get_new_address();
+
+        let funding_tx = make_funding_tx(addr.script_pubkey.clone(), Amount::from_sat(50_000));
+        wallet.add_transaction(funding_tx.clone(), Some(1));
+
+        let mut external_spk = vec![0x00, 0x14];
+        external_spk.extend_from_slice(&[0xab; 20]);
+        let mut spend_tx = Transaction::new(
+            2,
+            vec![TxIn::new(
+                OutPoint::new(*funding_tx.txid(), 0),
+                Script::new(),
+                0xFFFFFFFF,
+            )],
+            vec![TxOut::new(
+                Amount::from_sat(49_000),
+                Script::from_bytes(external_spk),
+            )],
+            0,
+        );
+
+        let spent_outputs = vec![TxOut::new(
+            Amount::from_sat(50_000),
+            addr.script_pubkey.clone(),
+        )];
+
+        let signed = wallet.sign_transaction(&mut spend_tx, &spent_outputs);
+        assert_eq!(signed, 1);
+        // Taproot: witness should have 1 item (64-byte Schnorr sig).
+        assert_eq!(spend_tx.vin[0].witness.stack.len(), 1);
+        assert_eq!(spend_tx.vin[0].witness.stack[0].len(), 64);
+    }
+
+    #[test]
+    fn test_wallet_save_load_roundtrip() {
+        let mut wallet = Wallet::new("test_persist", DescriptorType::Wpkh);
+
+        // Generate some addresses.
+        let addr1 = wallet.get_new_address();
+        let addr2 = wallet.get_new_address();
+        let _change = wallet.get_change_address();
+
+        // Fund the wallet.
+        let funding_tx = make_funding_tx(addr1.script_pubkey.clone(), Amount::from_sat(100_000));
+        wallet.add_transaction(funding_tx.clone(), Some(50));
+        let funding_tx2 = make_funding_tx(addr2.script_pubkey.clone(), Amount::from_sat(200_000));
+        wallet.add_transaction(funding_tx2, Some(51));
+
+        // Serialize.
+        let bytes = wallet.save_to_bytes().expect("save failed");
+
+        // Deserialize.
+        let loaded = Wallet::load_from_bytes(&bytes).expect("load failed");
+
+        // Verify state matches.
+        assert_eq!(loaded.name(), "test_persist");
+        assert_eq!(loaded.descriptor_type(), DescriptorType::Wpkh);
+        assert_eq!(loaded.get_balance(), Amount::from_sat(300_000));
+        assert_eq!(loaded.list_unspent().len(), 2);
+
+        // Verify addresses still generate correctly (indices preserved).
+        let mut loaded = loaded;
+        let addr3 = loaded.get_new_address();
+        assert_ne!(addr3.address, addr1.address);
+        assert_ne!(addr3.address, addr2.address);
+
+        // Verify keys round-trip by signing a transaction.
+        let spend_input = TxIn::new(
+            OutPoint::new(*funding_tx.txid(), 0),
+            qubitcoin_script::Script::new(),
+            0xFFFFFFFF,
+        );
+        let mut external_spk = vec![0x00, 0x14];
+        external_spk.extend_from_slice(&[0xab; 20]);
+        let mut spend_tx = Transaction::new(
+            2,
+            vec![spend_input],
+            vec![TxOut::new(
+                Amount::from_sat(99_000),
+                qubitcoin_script::Script::from_bytes(external_spk),
+            )],
+            0,
+        );
+        let spent_outputs = vec![TxOut::new(
+            Amount::from_sat(100_000),
+            addr1.script_pubkey.clone(),
+        )];
+        let signed = loaded.sign_transaction(&mut spend_tx, &spent_outputs);
+        assert_eq!(signed, 1, "signing with restored key should work");
+    }
+
+    #[test]
+    fn test_wallet_save_load_empty() {
+        let wallet = Wallet::new("empty", DescriptorType::Tr);
+        let bytes = wallet.save_to_bytes().expect("save failed");
+        let loaded = Wallet::load_from_bytes(&bytes).expect("load failed");
+        assert_eq!(loaded.name(), "empty");
+        assert_eq!(loaded.descriptor_type(), DescriptorType::Tr);
+        assert_eq!(loaded.get_balance(), Amount::ZERO);
+        assert!(loaded.list_unspent().is_empty());
     }
 }

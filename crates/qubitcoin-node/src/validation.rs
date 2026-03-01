@@ -1027,6 +1027,7 @@ pub fn connect_block(
     view: &CoinsViewCache,
     params: &ConsensusParams,
     mtp_at_height: Option<&dyn Fn(i32) -> i64>,
+    skip_scripts: bool,
 ) -> Result<BlockUndo, BlockValidationState> {
     let mut total_fees = Amount::ZERO;
     let mut block_undo = BlockUndo::with_capacity(block.vtx.len().saturating_sub(1));
@@ -1194,23 +1195,27 @@ pub fn connect_block(
     }
 
     // --- Parallel script verification (Rayon) ---
-    // Collect all script checks from non-coinbase transactions and the
-    // undo data that was just built (which contains the spent coins).
-    let spent_coins: Vec<Vec<Coin>> = block_undo
-        .tx_undo
-        .iter()
-        .map(|tu| tu.prev_coins.clone())
-        .collect();
-    // Re-use the script_flags computed above.
-    let script_checks = collect_block_script_checks(&block.vtx, &spent_coins, script_flags);
-    if let Err(script_err) = verify_scripts_parallel(&script_checks) {
-        let mut state = BlockValidationState::new();
-        state.invalid(
-            BlockValidationResult::Consensus,
-            "bad-blk-sigops",
-            &format!("{}", script_err),
-        );
-        return Err(state);
+    // When assume-valid is active for this block, skip the expensive
+    // script verification -- UTXO updates have already been applied above.
+    if !skip_scripts {
+        // Collect all script checks from non-coinbase transactions and the
+        // undo data that was just built (which contains the spent coins).
+        let spent_coins: Vec<Vec<Coin>> = block_undo
+            .tx_undo
+            .iter()
+            .map(|tu| tu.prev_coins.clone())
+            .collect();
+        // Re-use the script_flags computed above.
+        let script_checks = collect_block_script_checks(&block.vtx, &spent_coins, script_flags);
+        if let Err(script_err) = verify_scripts_parallel(&script_checks) {
+            let mut state = BlockValidationState::new();
+            state.invalid(
+                BlockValidationResult::Consensus,
+                "bad-blk-sigops",
+                &format!("{}", script_err),
+            );
+            return Err(state);
+        }
     }
 
     // Verify block reward.
@@ -1839,7 +1844,7 @@ mod tests {
         let block = Block { header, vtx };
 
         // Connect at height 0.
-        let result = connect_block(&block, 0, &cache, &params, None);
+        let result = connect_block(&block, 0, &cache, &params, None, false);
         assert!(result.is_ok());
 
         // The block undo should be empty (no non-coinbase txs).
@@ -1895,7 +1900,7 @@ mod tests {
 
         let block = Block { header, vtx };
 
-        let result = connect_block(&block, 200, &cache, &params, None);
+        let result = connect_block(&block, 200, &cache, &params, None, false);
         assert!(result.is_ok());
 
         // The block undo should have one TxUndo for the spending tx.
@@ -1951,7 +1956,7 @@ mod tests {
 
         let block = Block { header, vtx };
 
-        let result = connect_block(&block, 0, &cache, &params, None);
+        let result = connect_block(&block, 0, &cache, &params, None, false);
         assert!(result.is_err());
         let state = result.unwrap_err();
         assert_eq!(state.get_reject_reason(), "bad-cb-amount");
@@ -1986,7 +1991,7 @@ mod tests {
 
         // First, connect the block so the UTXO set has the coinbase output.
         let params = ConsensusParams::regtest();
-        let connect_result = connect_block(&block, 0, &cache, &params, None);
+        let connect_result = connect_block(&block, 0, &cache, &params, None, false);
         assert!(connect_result.is_ok());
         let block_undo = connect_result.unwrap();
 
@@ -2039,7 +2044,7 @@ mod tests {
         let block = Block { header, vtx };
 
         // Connect the block.
-        let block_undo = connect_block(&block, 200, &cache, &params, None).unwrap();
+        let block_undo = connect_block(&block, 200, &cache, &params, None, false).unwrap();
 
         // Verify state after connect.
         assert!(cache.fetch_coin(&prev_outpoint).is_none()); // spent
@@ -2091,7 +2096,7 @@ mod tests {
         let block = Block { header, vtx };
 
         // Connect.
-        let block_undo = connect_block(&block, 200, &cache, &params, None).unwrap();
+        let block_undo = connect_block(&block, 200, &cache, &params, None, false).unwrap();
         assert_eq!(block_undo.tx_undo.len(), 2);
 
         // Original coins should be gone.

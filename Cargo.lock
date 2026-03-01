@@ -960,7 +960,12 @@ dependencies = [
  "qubitcoin-node",
  "qubitcoin-primitives",
  "qubitcoin-rpc",
+ "qubitcoin-script",
+ "qubitcoin-serialize",
+ "qubitcoin-storage",
  "qubitcoin-util",
+ "qubitcoin-wallet",
+ "serde_json",
  "tokio",
  "tracing",
 ]

@@ -251,6 +251,14 @@ impl ConnManager {
         }
     }
 
+    /// Disconnect a specific peer by dropping its send channel.
+    ///
+    /// When the sender is dropped the per-peer writer task exits, which
+    /// in turn closes the TCP connection.
+    pub fn disconnect_peer(&self, peer_id: u64) {
+        self.peer_senders.write().remove(&peer_id);
+    }
+
     /// Shutdown all connections.
     ///
     /// Sends a shutdown signal to the listener task and all per-peer tasks.

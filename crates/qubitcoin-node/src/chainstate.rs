@@ -16,13 +16,14 @@ use qubitcoin_common::chain::{
     get_ancestor, get_block_proof, get_skip_height, BlockIndex, BlockStatus, Chain,
 };
 use qubitcoin_common::chainparams::ChainParams;
-use qubitcoin_common::coins::{add_coins, CoinsView, CoinsViewCache, EmptyCoinsView};
+use qubitcoin_common::coins::{add_coins, CoinsView, CoinsViewCache, EmptyCoinsView, FlushableCoinsView};
 use qubitcoin_consensus::block::{Block, BlockHeader};
 use qubitcoin_consensus::params::ConsensusParams;
 use qubitcoin_consensus::validation_state::{BlockValidationResult, BlockValidationState};
 use qubitcoin_primitives::{ArithUint256, BlockHash};
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // Validation helpers -- imported from sibling module (created in parallel).
 // These will be provided by `crate::validation` once that module lands.
@@ -192,6 +193,16 @@ impl Chainstate {
 // ChainstateManager
 // ---------------------------------------------------------------------------
 
+/// Callback type for reading blocks and undo data from disk.
+///
+/// Used by chain reorganization code to read block data that is not in memory.
+/// Returns `(Block, BlockUndo)` for the given block hash, or `None` if not found.
+/// Callback for reading blocks and undo data from disk.
+///
+/// Parameters: `(file_num, data_pos, undo_pos)` — the position fields from
+/// the block index entry.  Returns `(Block, BlockUndo)` on success.
+pub type BlockReader = Arc<dyn Fn(i32, u32, u32) -> Option<(Block, BlockUndo)> + Send + Sync>;
+
 /// Manages the blockchain state: block index, active chain, UTXO set.
 ///
 /// This is the primary entry point for processing new blocks. It owns the
@@ -205,11 +216,15 @@ pub struct ChainstateManager {
     block_index: BlockMap,
     /// The active chainstate.
     active_chainstate: Chainstate,
-    /// Stored blocks keyed by block hash (in-memory; production would use
-    /// [`BlockFileManager`] for on-disk persistence).
+    /// In-memory block cache (used by tests and as fallback).
     stored_blocks: HashMap<BlockHash, Block>,
-    /// Stored undo data keyed by block hash.
+    /// In-memory undo data cache.
     stored_undos: HashMap<BlockHash, BlockUndo>,
+    /// Optional callback for reading blocks from disk (production mode).
+    block_reader: Option<BlockReader>,
+    /// Hash of the assumed-valid block. Blocks at or below this height
+    /// skip script verification during IBD, dramatically speeding up sync.
+    assume_valid: Option<BlockHash>,
 }
 
 impl ChainstateManager {
@@ -225,7 +240,45 @@ impl ChainstateManager {
             active_chainstate: Chainstate::new(coins_view),
             stored_blocks: HashMap::new(),
             stored_undos: HashMap::new(),
+            block_reader: None,
+            assume_valid: None,
         }
+    }
+
+    /// Set a block reader callback for disk-based block retrieval.
+    pub fn set_block_reader(&mut self, reader: BlockReader) {
+        self.block_reader = Some(reader);
+    }
+
+    /// Set the undo data position for a block index entry (after writing
+    /// undo data to disk).
+    pub fn set_undo_pos(&mut self, hash: &BlockHash, undo_pos: u32) {
+        if let Some(idx) = self.block_index.find_by_hash(hash) {
+            self.block_index.get_mut(idx).undo_pos = undo_pos;
+        }
+    }
+
+    /// Set the assumed-valid block hash for IBD optimization.
+    pub fn set_assume_valid(&mut self, hash: BlockHash) {
+        self.assume_valid = Some(hash);
+    }
+
+    /// Reset the active chain to the given arena index.
+    ///
+    /// Used during crash recovery to rewind the chain tip to match the
+    /// persisted UTXO state.  Sets both the active chain tip and the
+    /// UTXO cache best block.
+    pub fn reset_active_chain_to(&mut self, arena_idx: usize) {
+        let height = self.block_index.get(arena_idx).height;
+        let hash = self.block_index.get(arena_idx).block_hash;
+        let block_index = &self.block_index;
+        self.active_chainstate
+            .chain
+            .set_tip_with(arena_idx, height, |idx| {
+                let entry = block_index.get(idx);
+                entry.prev.map(|p| (p, block_index.get(p).height))
+            });
+        self.active_chainstate.coins_tip.set_best_block(hash);
     }
 
     // -- Accessors ----------------------------------------------------------
@@ -282,6 +335,125 @@ impl ChainstateManager {
     #[inline]
     pub fn lookup_block_index(&self, hash: &BlockHash) -> Option<usize> {
         self.block_index.find_by_hash(hash)
+    }
+
+    // -- Persistence helpers -------------------------------------------------
+
+    /// Flush the UTXO cache to a persistent backing store.
+    ///
+    /// Delegates to [`CoinsViewCache::flush_to`] which writes all dirty entries
+    /// to the provided [`FlushableCoinsView`] (typically a `CoinsViewDB`).
+    pub fn flush_coins(&self, target: &dyn FlushableCoinsView) -> bool {
+        self.active_chainstate.coins_tip.flush_to(target)
+    }
+
+    /// Load block index entries from a set of records (typically loaded from
+    /// `BlockIndexDB`). Rebuilds the arena, prev/skip pointers, and finds
+    /// the best chain.
+    ///
+    /// Returns `Ok(())` on success or `Err(description)` on failure.
+    pub fn load_block_index(
+        &mut self,
+        records: &[crate::block_index_db::BlockIndexRecord],
+    ) -> Result<(), String> {
+        use qubitcoin_common::chain::BlockIndex as BI;
+
+        if records.is_empty() {
+            return Ok(());
+        }
+
+        // Sort by height for correct insertion order.
+        let mut sorted: Vec<&crate::block_index_db::BlockIndexRecord> = records.iter().collect();
+        sorted.sort_by_key(|r| r.height);
+
+        // Insert all entries into the arena.
+        for record in &sorted {
+            let mut idx = BI::new();
+            idx.block_hash = record.block_hash;
+            idx.version = record.version;
+            idx.prev_blockhash = record.prev_blockhash;
+            idx.merkle_root = record.merkle_root;
+            idx.time = record.time;
+            idx.bits = record.bits;
+            idx.nonce = record.nonce;
+            idx.height = record.height;
+            idx.status = BlockStatus::new(record.status_bits);
+            idx.file = record.file;
+            idx.data_pos = record.data_pos;
+            idx.undo_pos = record.undo_pos;
+            idx.tx_count = record.tx_count;
+            idx.chain_tx_count = record.chain_tx_count;
+            idx.chain_work = record.chain_work();
+
+            self.block_index.insert(idx);
+        }
+
+        // Resolve prev links and build skip pointers.
+        for arena_idx in 0..self.block_index.len() {
+            let prev_hash = self.block_index.get(arena_idx).prev_blockhash;
+            if !prev_hash.is_null() {
+                if let Some(prev_idx) = self.block_index.find_by_hash(&prev_hash) {
+                    self.block_index.get_mut(arena_idx).prev = Some(prev_idx);
+                    // Compute time_max from parent.
+                    let parent_time_max = self.block_index.get(prev_idx).time_max;
+                    let this_time = self.block_index.get(arena_idx).time;
+                    self.block_index.get_mut(arena_idx).time_max =
+                        std::cmp::max(parent_time_max, this_time);
+                }
+            } else {
+                // Genesis block: time_max = time.
+                let t = self.block_index.get(arena_idx).time;
+                self.block_index.get_mut(arena_idx).time_max = t;
+            }
+            self.block_index.build_skip_pointer(arena_idx);
+        }
+
+        // Find the best fully-validated chain tip and set the active chain.
+        let mut best_idx: Option<usize> = None;
+        let mut best_work = ArithUint256::zero();
+
+        for i in 0..self.block_index.len() {
+            let entry = self.block_index.get(i);
+            if entry.is_valid(BlockStatus::VALID_SCRIPTS) && entry.chain_work > best_work {
+                best_work = entry.chain_work;
+                best_idx = Some(i);
+            }
+        }
+
+        if let Some(best) = best_idx {
+            let best_height = self.block_index.get(best).height;
+            let block_index = &self.block_index;
+            self.active_chainstate
+                .chain
+                .set_tip_with(best, best_height, |idx| {
+                    let entry = block_index.get(idx);
+                    entry.prev.map(|p| (p, block_index.get(p).height))
+                });
+
+            let tip_hash = self.block_index.get(best).block_hash;
+            tracing::info!(
+                height = best_height,
+                hash = %tip_hash.to_hex(),
+                "loaded block index, best chain found"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Get all block index entries that have been modified (have HAVE_DATA set).
+    /// Used for persisting the block index to disk.
+    pub fn dirty_block_indices(&self) -> Vec<&BlockIndex> {
+        let mut result = Vec::new();
+        for i in 0..self.block_index.len() {
+            let entry = self.block_index.get(i);
+            if entry.status.contains(BlockStatus::HAVE_DATA)
+                || entry.is_valid(BlockStatus::VALID_TREE)
+            {
+                result.push(entry);
+            }
+        }
+        result
     }
 
     // -- Genesis block ------------------------------------------------------
@@ -438,7 +610,7 @@ impl ChainstateManager {
     /// 3. Contextual block checks.
     /// 4. Connect the block (update UTXO set).
     /// 5. Extend the active chain.
-    pub fn process_new_block(&mut self, block: &Block) -> Result<bool, BlockValidationState> {
+    pub fn process_new_block(&mut self, block: &Block) -> Result<(bool, Option<BlockUndo>), BlockValidationState> {
         // 1. Accept the header (idempotent if already known).
         let arena_idx = self.accept_block_header(&block.header)?;
 
@@ -450,7 +622,7 @@ impl ChainstateManager {
         {
             // Already connected -- check if it's the tip.
             let on_active = self.active_chainstate.chain.tip() == Some(arena_idx);
-            return Ok(on_active);
+            return Ok((on_active, None));
         }
 
         // 2. Context-free block body checks.
@@ -510,6 +682,13 @@ impl ChainstateManager {
         //    potential chain reorganization.
         let height = self.block_index.get(arena_idx).height;
         let block_hash = self.block_index.get(arena_idx).block_hash;
+
+        // Assume-valid optimization: skip script verification for blocks
+        // that are ancestors of the assume-valid block. This dramatically
+        // speeds up IBD by skipping the expensive parallel Rayon script
+        // checks while still fully validating UTXO state.
+        let skip_scripts = self.should_skip_scripts(arena_idx);
+
         // Build a real MTP lookup closure backed by the block index arena
         // and the active chain, for accurate BIP68 relative time-lock
         // evaluation.
@@ -529,6 +708,7 @@ impl ChainstateManager {
             &self.active_chainstate.coins_tip,
             &self.params.consensus,
             Some(&mtp_lookup),
+            skip_scripts,
         )
         .map_err(|e| {
             self.block_index
@@ -538,9 +718,13 @@ impl ChainstateManager {
             e
         })?;
 
-        // Store the block and its undo data for later use (reorg, serving).
-        self.stored_blocks.insert(block_hash, block.clone());
-        self.stored_undos.insert(block_hash, block_undo);
+        // In test mode, store undo data in-memory for existing tests.
+        // In production, return undo data to the caller for disk persistence.
+        #[cfg(test)]
+        {
+            self.stored_blocks.insert(block_hash, block.clone());
+            self.stored_undos.insert(block_hash, block_undo.clone());
+        }
 
         // Mark fully validated.
         self.block_index
@@ -552,7 +736,7 @@ impl ChainstateManager {
         self.activate_best_chain()?;
 
         let on_active = self.active_chainstate.chain.tip() == Some(arena_idx);
-        Ok(on_active)
+        Ok((on_active, Some(block_undo)))
     }
 
     // -- Internal helpers ---------------------------------------------------
@@ -609,24 +793,23 @@ impl ChainstateManager {
                     Some(idx) => idx,
                     None => continue,
                 };
-                let block_hash = self.block_index.get(idx_at_h).block_hash;
+                let entry = self.block_index.get(idx_at_h);
+                let block_hash = entry.block_hash;
+                let file = entry.file;
+                let data_pos = entry.data_pos;
+                let undo_pos = entry.undo_pos;
 
-                // Look up the stored block and undo data.
-                let block = match self.stored_blocks.get(&block_hash) {
-                    Some(b) => b.clone(),
-                    None => {
-                        // Cannot disconnect without the block data; mark unclean
-                        // but continue (best effort).
-                        continue;
+                // Look up the stored block and undo data (in-memory first, then disk).
+                let (block, undo) = if let Some(b) = self.stored_blocks.get(&block_hash) {
+                    let u = self.stored_undos.get(&block_hash).cloned().unwrap_or_else(BlockUndo::new);
+                    (b.clone(), u)
+                } else if let Some(ref reader) = self.block_reader {
+                    match reader(file, data_pos, undo_pos) {
+                        Some((b, u)) => (b, u),
+                        None => continue,
                     }
-                };
-                let undo = match self.stored_undos.get(&block_hash) {
-                    Some(u) => u.clone(),
-                    None => {
-                        // No undo data available; create empty undo and hope
-                        // for the best (this will result in an unclean disconnect).
-                        BlockUndo::new()
-                    }
+                } else {
+                    continue;
                 };
 
                 disconnect_block(&block, h, &self.active_chainstate.coins_tip, &undo);
@@ -653,14 +836,22 @@ impl ChainstateManager {
                 }
             };
 
-            // If this block is already fully validated (VALID_SCRIPTS) and its
-            // undo data is stored, we only need to replay the UTXO changes.
-            // Otherwise we need the full block to connect.
-            if let Some(block) = self.stored_blocks.get(&block_hash) {
-                let block = block.clone();
-                // If the block hasn't been connected yet (might happen with
-                // blocks on a side chain that we've accepted the header for
-                // but not yet connected), connect it now.
+            // Look up block from in-memory cache or disk reader.
+            let entry = self.block_index.get(idx_at_h);
+            let file = entry.file;
+            let data_pos = entry.data_pos;
+            let undo_pos = entry.undo_pos;
+
+            let block = if let Some(b) = self.stored_blocks.get(&block_hash) {
+                Some(b.clone())
+            } else if let Some(ref reader) = self.block_reader {
+                reader(file, data_pos, undo_pos).map(|(b, _u)| b)
+            } else {
+                None
+            };
+
+            if let Some(block) = block {
+                let skip = self.should_skip_scripts(idx_at_h);
                 if !self
                     .block_index
                     .get(idx_at_h)
@@ -672,6 +863,7 @@ impl ChainstateManager {
                         &self.active_chainstate.coins_tip,
                         &self.params.consensus,
                         Some(&mtp_lookup),
+                        skip,
                     )
                     .map_err(|e| {
                         self.block_index
@@ -685,16 +877,15 @@ impl ChainstateManager {
                         .get_mut(idx_at_h)
                         .status
                         .raise_validity(BlockStatus::VALID_SCRIPTS);
-                } else if let Some(_undo) = self.stored_undos.get(&block_hash) {
-                    // Re-apply: add coinbase outputs and replay non-coinbase
-                    // transactions. Since the block was already validated, we
-                    // trust the undo data and replay the UTXO changes directly.
-                    let _undo = connect_block(
+                } else {
+                    // Already validated; replay UTXO changes.
+                    let undo = connect_block(
                         &block,
                         h,
                         &self.active_chainstate.coins_tip,
                         &self.params.consensus,
                         Some(&mtp_lookup),
+                        skip,
                     )
                     .map_err(|e| {
                         self.block_index
@@ -703,8 +894,7 @@ impl ChainstateManager {
                             .insert(BlockStatus::FAILED_VALID);
                         e
                     })?;
-                    // Update stored undo with fresh data from the reconnection.
-                    self.stored_undos.insert(block_hash, _undo);
+                    self.stored_undos.insert(block_hash, undo);
                 }
             }
         }
@@ -757,6 +947,44 @@ impl ChainstateManager {
             }
         }
         -1 // No common ancestor (shouldn't happen if both share genesis).
+    }
+
+    /// Determine whether script verification should be skipped for a block.
+    ///
+    /// Returns `true` when assume-valid is configured and the block at
+    /// `arena_idx` is either the assume-valid block itself or an ancestor
+    /// of it. This allows IBD to skip the expensive parallel script
+    /// verification for blocks already trusted by the network.
+    fn should_skip_scripts(&self, arena_idx: usize) -> bool {
+        let assume_hash = match &self.assume_valid {
+            Some(h) => h,
+            None => return false,
+        };
+
+        let block_hash = self.block_index.get(arena_idx).block_hash;
+
+        // Exact match: this IS the assume-valid block.
+        if block_hash == *assume_hash {
+            return true;
+        }
+
+        // Check if the assume-valid block is in our index.
+        let assume_idx = match self.block_index.find_by_hash(&assume_hash) {
+            Some(idx) => idx,
+            None => return false, // Haven't seen the assume-valid block yet.
+        };
+
+        // The block at arena_idx is an ancestor of assume_valid if
+        // get_ancestor(assume_valid, block_height) == arena_idx.
+        let block_height = self.block_index.get(arena_idx).height;
+        let assume_height = self.block_index.get(assume_idx).height;
+
+        if block_height > assume_height {
+            return false; // Block is beyond the assume-valid block.
+        }
+
+        let ancestor = get_ancestor(self.block_index.as_slice(), assume_idx, block_height);
+        ancestor == Some(arena_idx)
     }
 
     /// Collect up to `count` ancestors of the block at `arena_idx`, starting
@@ -850,6 +1078,7 @@ fn connect_block(
     view: &CoinsViewCache,
     _params: &ConsensusParams,
     _mtp_at_height: Option<&dyn Fn(i32) -> i64>,
+    _skip_scripts: bool,
 ) -> Result<BlockUndo, BlockValidationState> {
     use crate::undo::TxUndo;
 
@@ -1244,8 +1473,8 @@ mod tests {
         let block1 = Block::with_header(header1);
         let block1_hash = block1.block_hash();
 
-        let result = manager.process_new_block(&block1).unwrap();
-        assert!(result); // Should be on the active chain.
+        let (on_active, _undo) = manager.process_new_block(&block1).unwrap();
+        assert!(on_active); // Should be on the active chain.
 
         assert_eq!(manager.height(), 1);
         let tip_idx = manager.tip().unwrap();
@@ -1278,8 +1507,8 @@ mod tests {
             let block = Block::with_header(header);
             prev_hash = block.block_hash();
 
-            let result = manager.process_new_block(&block).unwrap();
-            assert!(result, "block {} should be on active chain", i + 1);
+            let (on_active, _undo) = manager.process_new_block(&block).unwrap();
+            assert!(on_active, "block {} should be on active chain", i + 1);
         }
 
         assert_eq!(manager.height(), 10);

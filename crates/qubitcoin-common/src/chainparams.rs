@@ -7,8 +7,12 @@
 //! - [`ChainParams`]: Full chain parameters for a given network, including
 //!   consensus params, default port, address prefixes, and genesis block hash.
 
+use qubitcoin_consensus::block::{Block, BlockHeader};
+use qubitcoin_consensus::transaction::{TxIn, TxOut, Transaction};
 use qubitcoin_consensus::ConsensusParams;
-use qubitcoin_primitives::{BlockHash, Uint256};
+use qubitcoin_primitives::{Amount, BlockHash, Uint256};
+use qubitcoin_script::Script;
+use std::sync::Arc;
 
 /// Network type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +27,7 @@ pub enum Network {
 /// Full chain parameters including consensus params and network specifics.
 ///
 /// Port of Bitcoin Core's `CChainParams`.
+#[derive(Clone)]
 pub struct ChainParams {
     /// Which network these parameters are for.
     pub network: Network,
@@ -193,6 +198,116 @@ impl ChainParams {
             is_test_chain: true,
             minimum_chain_work: Uint256::ZERO,
             assumed_valid_block: BlockHash::ZERO,
+        }
+    }
+
+    /// Create the genesis block for this network.
+    ///
+    /// Port of Bitcoin Core's `CreateGenesisBlock()` in `src/kernel/chainparams.cpp`.
+    /// Most networks share the standard Satoshi coinbase transaction, but testnet4
+    /// uses a different message and output script.
+    pub fn create_genesis_block(&self) -> Block {
+        // Build the coinbase scriptsig and output script.
+        //
+        // Bitcoin Core constructs the scriptsig as:
+        //   CScript() << 486604799 << CScriptNum(4) << message_bytes
+        // which encodes to: 04 ffff001d 01 04 <pushdata_for_message> <message>
+        let (script_sig, genesis_output_script) = match self.network {
+            Network::Testnet4 => {
+                // Testnet4 message: "03/May/2024 000000000000000000001ebd58c244970b3aa9d783bb001011fbe8ea8e98e00e"
+                // The message is 76 bytes, so it requires OP_PUSHDATA1 (0x4c) + length byte.
+                // scriptsig: 04 ffff001d 01 04 4c 4c <76 bytes of message>
+                let script_sig = Script::from_bytes(vec![
+                    0x04, 0xff, 0xff, 0x00, 0x1d, 0x01, 0x04, 0x4c,
+                    0x4c, // OP_PUSHDATA1, length=76
+                    0x30, 0x33, 0x2f, 0x4d, 0x61, 0x79, 0x2f, 0x32,
+                    0x30, 0x32, 0x34, 0x20, 0x30, 0x30, 0x30, 0x30,
+                    0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
+                    0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
+                    0x31, 0x65, 0x62, 0x64, 0x35, 0x38, 0x63, 0x32,
+                    0x34, 0x34, 0x39, 0x37, 0x30, 0x62, 0x33, 0x61,
+                    0x61, 0x39, 0x64, 0x37, 0x38, 0x33, 0x62, 0x62,
+                    0x30, 0x30, 0x31, 0x30, 0x31, 0x31, 0x66, 0x62,
+                    0x65, 0x38, 0x65, 0x61, 0x38, 0x65, 0x39, 0x38,
+                    0x65, 0x30, 0x30, 0x65,
+                ]);
+                // Output script: push 33 zero bytes (compressed pubkey) + OP_CHECKSIG
+                let output_script = Script::from_bytes(vec![
+                    0x21, // push 33 bytes
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, // 33 zero bytes
+                    0xac, // OP_CHECKSIG
+                ]);
+                (script_sig, output_script)
+            }
+            _ => {
+                // Standard Satoshi genesis coinbase (mainnet, testnet3, regtest, signet).
+                // Message: "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks"
+                // (69 bytes, pushed with opcode 0x45)
+                // scriptsig: 04ffff001d0104455468652054696d65732030332f4a616e2f323030392043
+                //            68616e63656c6c6f72206f6e206272696e6b206f66207365636f6e642062
+                //            61696c6f757420666f722062616e6b73
+                let script_sig = Script::from_bytes(vec![
+                    0x04, 0xff, 0xff, 0x00, 0x1d, 0x01, 0x04, 0x45,
+                    0x54, 0x68, 0x65, 0x20, 0x54, 0x69, 0x6d, 0x65,
+                    0x73, 0x20, 0x30, 0x33, 0x2f, 0x4a, 0x61, 0x6e,
+                    0x2f, 0x32, 0x30, 0x30, 0x39, 0x20, 0x43, 0x68,
+                    0x61, 0x6e, 0x63, 0x65, 0x6c, 0x6c, 0x6f, 0x72,
+                    0x20, 0x6f, 0x6e, 0x20, 0x62, 0x72, 0x69, 0x6e,
+                    0x6b, 0x20, 0x6f, 0x66, 0x20, 0x73, 0x65, 0x63,
+                    0x6f, 0x6e, 0x64, 0x20, 0x62, 0x61, 0x69, 0x6c,
+                    0x6f, 0x75, 0x74, 0x20, 0x66, 0x6f, 0x72, 0x20,
+                    0x62, 0x61, 0x6e, 0x6b, 0x73,
+                ]);
+                // Output script: push 65-byte uncompressed pubkey + OP_CHECKSIG
+                let output_script = Script::from_bytes(vec![
+                    0x41, // push 65 bytes
+                    0x04, 0x67, 0x8a, 0xfd, 0xb0, 0xfe, 0x55, 0x48,
+                    0x27, 0x19, 0x67, 0xf1, 0xa6, 0x71, 0x30, 0xb7,
+                    0x10, 0x5c, 0xd6, 0xa8, 0x28, 0xe0, 0x39, 0x09,
+                    0xa6, 0x79, 0x62, 0xe0, 0xea, 0x1f, 0x61, 0xde,
+                    0xb6, 0x49, 0xf6, 0xbc, 0x3f, 0x4c, 0xef, 0x38,
+                    0xc4, 0xf3, 0x55, 0x04, 0xe5, 0x1e, 0xc1, 0x12,
+                    0xde, 0x5c, 0x38, 0x4d, 0xf7, 0xba, 0x0b, 0x8d,
+                    0x57, 0x8a, 0x4c, 0x70, 0x2b, 0x6b, 0xf1, 0x1d,
+                    0x5f, // end of 65-byte pubkey
+                    0xac, // OP_CHECKSIG
+                ]);
+                (script_sig, output_script)
+            }
+        };
+
+        let txin = TxIn::coinbase(script_sig);
+        let txout = TxOut::new(Amount::from_sat(50 * 100_000_000), genesis_output_script);
+        let genesis_tx = Transaction::new(1, vec![txin], vec![txout], 0);
+
+        // For a single-transaction block, the merkle root is simply the txid.
+        let merkle_root = genesis_tx.txid().into_uint256();
+
+        // Network-specific header parameters.
+        let (time, bits, nonce) = match self.network {
+            Network::Mainnet => (1231006505u32, 0x1d00ffffu32, 2083236893u32),
+            Network::Testnet => (1296688602, 0x1d00ffff, 414098458),
+            Network::Testnet4 => (1714777860, 0x1d00ffff, 393743547),
+            Network::Regtest => (1296688602, 0x207fffff, 2),
+            Network::Signet => (1598918400, 0x1e0377ae, 52613770),
+        };
+
+        let header = BlockHeader {
+            version: 1,
+            prev_blockhash: BlockHash::ZERO,
+            merkle_root,
+            time,
+            bits,
+            nonce,
+        };
+
+        Block {
+            header,
+            vtx: vec![Arc::new(genesis_tx)],
         }
     }
 
@@ -369,5 +484,87 @@ mod tests {
     fn test_regtest_has_no_dns_seeds() {
         let params = ChainParams::regtest();
         assert!(params.dns_seeds.is_empty());
+    }
+
+    // -- create_genesis_block tests --
+
+    #[test]
+    fn test_mainnet_genesis_block_hash() {
+        let params = ChainParams::mainnet();
+        let genesis = params.create_genesis_block();
+        assert_eq!(
+            genesis.block_hash().to_hex(),
+            "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
+        );
+    }
+
+    #[test]
+    fn test_testnet_genesis_block_hash() {
+        let params = ChainParams::testnet();
+        let genesis = params.create_genesis_block();
+        assert_eq!(
+            genesis.block_hash().to_hex(),
+            "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"
+        );
+    }
+
+    #[test]
+    fn test_testnet4_genesis_block_hash() {
+        let params = ChainParams::testnet4();
+        let genesis = params.create_genesis_block();
+        assert_eq!(
+            genesis.block_hash().to_hex(),
+            "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043"
+        );
+    }
+
+    #[test]
+    fn test_regtest_genesis_block_hash() {
+        let params = ChainParams::regtest();
+        let genesis = params.create_genesis_block();
+        assert_eq!(
+            genesis.block_hash().to_hex(),
+            "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
+        );
+    }
+
+    #[test]
+    fn test_signet_genesis_block_hash() {
+        let params = ChainParams::signet();
+        let genesis = params.create_genesis_block();
+        assert_eq!(
+            genesis.block_hash().to_hex(),
+            "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6"
+        );
+    }
+
+    #[test]
+    fn test_genesis_block_is_coinbase() {
+        let params = ChainParams::mainnet();
+        let genesis = params.create_genesis_block();
+        assert_eq!(genesis.vtx.len(), 1);
+        assert!(genesis.vtx[0].is_coinbase());
+    }
+
+    #[test]
+    fn test_genesis_block_matches_stored_hash() {
+        // Verify create_genesis_block().block_hash() matches genesis_block_hash
+        // for every network.
+        for network in &[
+            Network::Mainnet,
+            Network::Testnet,
+            Network::Testnet4,
+            Network::Regtest,
+            Network::Signet,
+        ] {
+            let params = ChainParams::for_network(*network);
+            let genesis = params.create_genesis_block();
+            assert_eq!(
+                genesis.block_hash(),
+                params.genesis_block_hash,
+                "genesis block hash mismatch for {:?}",
+                network
+            );
+        }
     }
 }

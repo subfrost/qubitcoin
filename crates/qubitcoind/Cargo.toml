@@ -18,6 +18,11 @@ qubitcoin-primitives = { workspace = true }
 qubitcoin-node = { workspace = true }
 qubitcoin-net = { workspace = true }
 qubitcoin-rpc = { workspace = true }
+qubitcoin-storage = { workspace = true }
+qubitcoin-script = { workspace = true }
+qubitcoin-serialize = { workspace = true }
+qubitcoin-wallet = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 parking_lot = { workspace = true }
+serde_json = { workspace = true }

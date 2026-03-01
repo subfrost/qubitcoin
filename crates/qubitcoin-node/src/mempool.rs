@@ -731,6 +731,22 @@ impl TxMemPool {
         self.max_mempool_size
     }
 
+    /// Estimate the current fee rate from mempool entries.
+    ///
+    /// Returns the median fee rate of all mempool entries, or
+    /// `DEFAULT_MIN_RELAY_TX_FEE` (1 sat/vB) if the mempool is empty.
+    pub fn estimate_fee_rate(&self) -> FeeRate {
+        let entries = self.entries.read();
+        if entries.is_empty() {
+            return DEFAULT_MIN_RELAY_TX_FEE;
+        }
+        let mut rates: Vec<i64> = entries.values().map(|e| e.fee_rate().sats_per_kvb()).collect();
+        rates.sort_unstable();
+        let median = rates[rates.len() / 2];
+        // Ensure at least the minimum relay fee.
+        FeeRate::new(median.max(DEFAULT_MIN_RELAY_TX_FEE.sats_per_kvb()))
+    }
+
     // -- Ancestor/descendant limit checks -----------------------------------
 
     /// Check whether adding a transaction would exceed ancestor limits.
