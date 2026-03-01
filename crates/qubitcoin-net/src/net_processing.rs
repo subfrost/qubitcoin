@@ -642,7 +642,9 @@ impl NetProcessor {
             None => return, // Not stalled or not yet in-flight.
         };
 
-        // Find a different peer with available in-flight capacity.
+        // Find a different peer with capacity.  Allow one extra in-flight
+        // block (over the normal limit) during stall recovery so that we
+        // can always find a candidate even when all peers are at capacity.
         let fast_peer = self
             .peer_states
             .iter()
@@ -650,10 +652,15 @@ impl NetProcessor {
                 pid != slow_pid
                     && state.handshake_complete
                     && !state.discouraged
-                    && state.blocks_in_flight.len() < MAX_BLOCKS_IN_TRANSIT_PER_PEER
+                    && state.blocks_in_flight.len() <= MAX_BLOCKS_IN_TRANSIT_PER_PEER
             })
             .min_by_key(|(_, state)| state.blocks_in_flight.len())
             .map(|(&pid, _)| pid);
+
+        // Remove stalled block from slow peer first so we free a slot.
+        if let Some(state) = self.peer_states.get_mut(&slow_pid) {
+            state.blocks_in_flight.retain(|(h, _)| *h != head_hash);
+        }
 
         if let Some(fast_pid) = fast_peer {
             tracing::info!(
@@ -663,11 +670,6 @@ impl NetProcessor {
                 stall_secs = stall_secs,
                 "re-requesting stalled head-of-line block"
             );
-
-            // Remove from slow peer's in-flight (steal the assignment).
-            if let Some(state) = self.peer_states.get_mut(&slow_pid) {
-                state.blocks_in_flight.retain(|(h, _)| *h != head_hash);
-            }
 
             // Assign to the faster peer.
             if let Some(state) = self.peer_states.get_mut(&fast_pid) {
@@ -681,7 +683,18 @@ impl NetProcessor {
             let payload = serialize_message(&msg);
             self.conn_manager.send_to_peer(fast_pid, "getdata", payload);
 
-            // Also fill the slow peer's freed slot with the next block from queue.
+            // Fill the slow peer's freed slot with the next block from queue.
+            self.request_blocks(slow_pid);
+        } else {
+            // All peers at capacity — re-queue the block and request from
+            // the slow peer (which now has a freed slot).
+            tracing::info!(
+                height = self.next_process_idx + 1,
+                slow_peer = slow_pid,
+                stall_secs = stall_secs,
+                "re-requesting stalled head-of-line block (no fast peer available)"
+            );
+            self.blocks_to_download.push_front(head_hash);
             self.request_blocks(slow_pid);
         }
     }
