@@ -17,3 +17,7 @@ thiserror = { workspace = true }
 qubitcoin-script = { workspace = true }
 qubitcoin-crypto = { workspace = true }
 qubitcoin-serialize = { workspace = true }
+
+[[bin]]
+name = "frost-keygen"
+path = "src/bin/frost_keygen.rs"
