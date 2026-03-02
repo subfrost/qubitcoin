@@ -1,4 +1,4 @@
-# Qubitcoin
+# qubitcoin
 
 A 1:1 Rust port of Bitcoin Core with full consensus compatibility. Qubitcoin uses custom types throughout (not rust-bitcoin) to maintain exact fidelity with the C++ reference implementation.
 
