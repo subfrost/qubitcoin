@@ -248,6 +248,8 @@ pub struct NetProcessor {
     ibd_start: Instant,
     /// State change notifier (for updating RPC-visible state).
     notifier: Arc<dyn StateNotifier>,
+    /// When we last attempted to reconnect via DNS seeds.
+    last_reconnect_attempt: Instant,
 }
 
 impl NetProcessor {
@@ -313,6 +315,7 @@ impl NetProcessor {
             is_ibd: true,
             ibd_start: Instant::now(),
             notifier,
+            last_reconnect_attempt: Instant::now(),
         }
     }
 
@@ -602,6 +605,65 @@ impl NetProcessor {
 
         // --- 3. Kick idle peers to download more blocks ---
         self.kick_idle_peers();
+
+        // --- 4. Reconnect if no active peers remain during IBD ---
+        let active_peers = self
+            .peer_states
+            .values()
+            .filter(|s| s.handshake_complete && !s.discouraged)
+            .count();
+        if active_peers == 0
+            && !self.blocks_to_download.is_empty()
+            && self.last_reconnect_attempt.elapsed() > std::time::Duration::from_secs(30)
+        {
+            self.last_reconnect_attempt = Instant::now();
+            // Clear discouraged peers so they don't linger forever.
+            self.peer_states.retain(|_, s| !s.discouraged);
+            tracing::info!(
+                blocks_queued = self.blocks_to_download.len(),
+                "no active peers, attempting DNS seed reconnection"
+            );
+            let cm = self.conn_manager.clone();
+            tokio::spawn(async move {
+                let seeds = &[
+                    "seed.bitcoin.sipa.be",
+                    "dnsseed.bluematt.me",
+                    "seed.bitcoinstats.com",
+                    "seed.bitcoin.jonasschnelli.ch",
+                    "seed.btc.petertodd.net",
+                    "seed.bitcoin.sprovoost.nl",
+                ];
+                let mut connected = 0usize;
+                for seed in seeds {
+                    if connected >= 8 {
+                        break;
+                    }
+                    if let Ok(addrs) =
+                        tokio::net::lookup_host(format!("{}:8333", seed)).await
+                    {
+                        for addr in addrs {
+                            if connected >= 8 {
+                                break;
+                            }
+                            match cm.connect_to(addr).await {
+                                Ok(pid) => {
+                                    tracing::info!(
+                                        peer_id = pid,
+                                        addr = %addr,
+                                        "reconnected to seed peer"
+                                    );
+                                    connected += 1;
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                }
+                if connected > 0 {
+                    tracing::info!(count = connected, "seed reconnection complete");
+                }
+            });
+        }
     }
 
     /// Detect head-of-line blocking and re-request the stalled block.
