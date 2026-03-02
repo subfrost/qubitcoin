@@ -228,7 +228,12 @@ impl ConnManager {
     /// Returns the peer ID on success. The handshake happens asynchronously
     /// in a spawned task; watch the event channel for `HandshakeComplete`.
     pub async fn connect_to(&self, addr: SocketAddr) -> Result<u64, Box<dyn std::error::Error>> {
-        let stream = TcpStream::connect(addr).await?;
+        let stream = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            TcpStream::connect(addr),
+        )
+        .await
+        .map_err(|_| format!("connect timeout to {}", addr))??;
         let peer_id = self.peer_manager.add_peer(addr, false);
         let _ = self
             .event_tx

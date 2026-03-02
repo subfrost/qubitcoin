@@ -706,6 +706,51 @@ async fn main() {
         }
     }
 
+    // 11. Create LiveNodeInterface and start network processor BEFORE
+    //     connecting to peers, so handshake events are processed immediately.
+    let initial_height = chainstate.lock().height();
+    let node_interface: Arc<dyn NodeInterface> = Arc::new(LiveNodeInterface {
+        chainstate: chainstate.clone(),
+        mempool: mempool.clone(),
+        block_files: block_files.clone(),
+        coins_db: coins_db.clone(),
+        block_index_db: block_index_db.clone(),
+        tx_index_db: tx_index_db.clone(),
+        node_state: node_state.clone(),
+        magic_bytes,
+        blocks_since_flush: parking_lot::Mutex::new(0),
+        dbcache_limit: (dbcache_mb as u64) * 1024 * 1024,
+        ibd_tracker: parking_lot::Mutex::new(IbdTracker {
+            last_log_time: std::time::Instant::now(),
+            last_log_height: initial_height,
+        }),
+    });
+
+    if let Some(event_rx) = event_rx {
+        let genesis_hash = ChainParams::for_network(network).genesis_block_hash;
+        let notifier: Arc<dyn StateNotifier> = Arc::new(RpcStateNotifier {
+            state: node_state.clone(),
+        });
+        let mut processor = NetProcessor::full(
+            event_rx,
+            conn_manager.clone(),
+            genesis_hash,
+            node_interface,
+            notifier,
+        );
+        let net_span = tracing::info_span!("net_processor");
+        tokio::spawn(
+            async move {
+                processor.run().await;
+            }
+            .instrument(net_span),
+        );
+    }
+
+    // Report max connections
+    let max_connections = args.get_int_arg("maxconnections").unwrap_or(125);
+    tracing::info!(max_connections = max_connections, "connection limit");
+
     // Connect to specified peers via -connect=<addr>
     let connect_targets = args.get_args("connect");
     for connect_addr in &connect_targets {
@@ -765,50 +810,6 @@ async fn main() {
             }
         }
         tracing::info!(count = connected, "connected to seed peers");
-    }
-
-    // Report max connections
-    let max_connections = args.get_int_arg("maxconnections").unwrap_or(125);
-    tracing::info!(max_connections = max_connections, "connection limit");
-
-    // 11. Create LiveNodeInterface and start network processor
-    let initial_height = chainstate.lock().height();
-    let node_interface: Arc<dyn NodeInterface> = Arc::new(LiveNodeInterface {
-        chainstate: chainstate.clone(),
-        mempool: mempool.clone(),
-        block_files: block_files.clone(),
-        coins_db: coins_db.clone(),
-        block_index_db: block_index_db.clone(),
-        tx_index_db: tx_index_db.clone(),
-        node_state: node_state.clone(),
-        magic_bytes,
-        blocks_since_flush: parking_lot::Mutex::new(0),
-        dbcache_limit: (dbcache_mb as u64) * 1024 * 1024,
-        ibd_tracker: parking_lot::Mutex::new(IbdTracker {
-            last_log_time: std::time::Instant::now(),
-            last_log_height: initial_height,
-        }),
-    });
-
-    if let Some(event_rx) = event_rx {
-        let genesis_hash = ChainParams::for_network(network).genesis_block_hash;
-        let notifier: Arc<dyn StateNotifier> = Arc::new(RpcStateNotifier {
-            state: node_state.clone(),
-        });
-        let mut processor = NetProcessor::full(
-            event_rx,
-            conn_manager.clone(),
-            genesis_hash,
-            node_interface,
-            notifier,
-        );
-        let net_span = tracing::info_span!("net_processor");
-        tokio::spawn(
-            async move {
-                processor.run().await;
-            }
-            .instrument(net_span),
-        );
     }
 
     tracing::info!("Qubitcoin Core startup complete");
