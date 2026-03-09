@@ -64,6 +64,16 @@ pub trait NodeInterface: Send + Sync {
     /// Get a serialized transaction by txid. Returns None if not in mempool.
     fn get_transaction(&self, txid: &Uint256) -> Option<Vec<u8>>;
 
+    /// Accept a block header into the block index (validate and store).
+    /// Called during headers-first sync so that the block_index tree is
+    /// fully built before block data arrives. This mirrors Bitcoin Core's
+    /// `AcceptBlockHeader()` call inside `ProcessHeadersMessage()`.
+    ///
+    /// `header_data` is the raw 80-byte serialized header.
+    /// Returns `Ok(true)` if accepted, `Ok(false)` if already known,
+    /// or `Err` on validation failure.
+    fn accept_block_header(&self, header_data: &[u8]) -> Result<bool, String>;
+
     /// Get the current chain tip height.
     fn chain_height(&self) -> i32;
 
@@ -105,6 +115,9 @@ impl NodeInterface for NullNodeInterface {
     }
     fn has_transaction(&self, _txid: &Uint256) -> bool {
         false
+    }
+    fn accept_block_header(&self, _header_data: &[u8]) -> Result<bool, String> {
+        Ok(false)
     }
     fn get_block(&self, _hash: &BlockHash) -> Option<Vec<u8>> {
         None
@@ -1050,7 +1063,13 @@ impl NetProcessor {
             return;
         }
 
-        // Parse and store header hashes, deduplicating across peers.
+        // Parse, validate, and store header hashes, deduplicating across peers.
+        //
+        // Like Bitcoin Core's ProcessHeadersMessage, we call accept_block_header
+        // for each header as it arrives. This builds the block_index tree during
+        // the header phase so that when block data arrives later, every block's
+        // parent is already known — preventing "bad-prevblk" rejections during
+        // ordered processing in drain_processable().
         let mut new_count = 0usize;
         for header_data in headers {
             if header_data.len() >= 80 {
@@ -1059,13 +1078,32 @@ impl NetProcessor {
                 let hash = BlockHash::from_bytes(hash_bytes);
                 // Only add if we haven't seen this header before.
                 if self.header_set.insert(hash) {
-                    self.header_chain.push(hash);
-                    // Queue block for download.
-                    if !self.blocks_downloaded.contains(&hash) {
-                        self.blocks_to_download.push_back(hash);
+                    // Validate the header and insert into block_index.
+                    match self.node.accept_block_header(&header_data[..80]) {
+                        Ok(_) => {
+                            self.header_chain.push(hash);
+                            // Queue block for download.
+                            if !self.blocks_downloaded.contains(&hash) {
+                                self.blocks_to_download.push_back(hash);
+                            }
+                            self.total_headers += 1;
+                            new_count += 1;
+                        }
+                        Err(reason) => {
+                            // Header failed validation — remove from set and
+                            // stop processing this batch. The peer sent an
+                            // invalid header chain.
+                            self.header_set.remove(&hash);
+                            tracing::warn!(
+                                peer_id = peer_id,
+                                hash = %hash,
+                                reason = %reason,
+                                "header rejected, stopping header processing"
+                            );
+                            self.misbehaving(peer_id, &format!("invalid header: {}", reason));
+                            return;
+                        }
                     }
-                    self.total_headers += 1;
-                    new_count += 1;
                 }
             }
         }
@@ -1195,6 +1233,10 @@ impl NetProcessor {
     /// During IBD, blocks arrive from multiple peers out of order. This method
     /// walks `header_chain` from `next_process_idx` and processes every block
     /// whose data is already in `pending_blocks`, stopping at the first gap.
+    ///
+    /// Because headers are validated at receipt time (in `handle_headers`),
+    /// every block's parent is already in the block_index. A "bad-prevblk"
+    /// error should never occur here.
     fn drain_processable(&mut self) {
         let start_idx = self.next_process_idx;
         while self.next_process_idx < self.header_chain.len() {
@@ -1221,13 +1263,13 @@ impl NetProcessor {
                             height = self.next_process_idx + 1,
                             hash = %hash,
                             reason = %reason,
-                            "block rejected during ordered processing, skipping"
+                            "block rejected during ordered processing"
                         );
-                        // Advance past the failed block to avoid a permanent
-                        // stall.  The header was already inserted into the
-                        // block_index by accept_block_header (inside
-                        // process_new_block) even if the body failed, so
-                        // subsequent blocks can still reference it as a parent.
+                        // Headers were pre-validated in handle_headers(), so
+                        // parent-not-found errors should not occur. If the
+                        // block body itself is invalid (bad merkle root, bad
+                        // transactions, etc.), advance past it — the header is
+                        // already in the block_index from the header phase.
                     }
                 }
                 self.next_process_idx += 1;

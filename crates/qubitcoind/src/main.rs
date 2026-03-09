@@ -3,7 +3,7 @@
 
 use qubitcoin_common::chainparams::{ChainParams, Network};
 use qubitcoin_common::coins::{CoinsView, CoinsViewDB, FlushableCoinsView};
-use qubitcoin_consensus::block::Block;
+use qubitcoin_consensus::block::{Block, BlockHeader};
 use qubitcoin_net::connection::{ConnConfig, ConnManager};
 use qubitcoin_net::net_processing::{NetProcessor, NodeInterface, StateNotifier};
 use qubitcoin_net::protocol::{NetworkMagic, ServiceFlags};
@@ -225,6 +225,16 @@ impl NodeInterface for LiveNodeInterface {
         }
 
         Ok(accepted)
+    }
+
+    fn accept_block_header(&self, header_data: &[u8]) -> Result<bool, String> {
+        let header: BlockHeader =
+            deserialize(header_data).map_err(|e| format!("header deserialize: {}", e))?;
+        let mut cs = self.chainstate.lock();
+        match cs.accept_block_header(&header) {
+            Ok(_) => Ok(true),
+            Err(e) => Err(format!("{:?}", e)),
+        }
     }
 
     fn process_transaction(&self, data: &[u8]) -> Result<bool, String> {
