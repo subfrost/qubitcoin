@@ -263,6 +263,20 @@ pub struct NetProcessor {
     notifier: Arc<dyn StateNotifier>,
     /// When we last attempted to reconnect via DNS seeds.
     last_reconnect_attempt: Instant,
+    /// Channel to receive block processing results from the blocking threadpool.
+    block_result_rx: mpsc::UnboundedReceiver<BlockProcessResult>,
+    /// Sender half (cloned into each spawn_blocking task).
+    block_result_tx: mpsc::UnboundedSender<BlockProcessResult>,
+    /// Whether a block is currently being processed on the blocking threadpool.
+    block_processing: bool,
+}
+
+/// Result of processing a single block on the blocking threadpool.
+struct BlockProcessResult {
+    hash: BlockHash,
+    peer_id: u64,
+    height: usize,
+    result: Result<bool, String>,
 }
 
 impl NetProcessor {
@@ -308,6 +322,7 @@ impl NetProcessor {
         node: Arc<dyn NodeInterface>,
         notifier: Arc<dyn StateNotifier>,
     ) -> Self {
+        let (block_result_tx, block_result_rx) = mpsc::unbounded_channel();
         NetProcessor {
             event_rx,
             conn_manager,
@@ -329,6 +344,9 @@ impl NetProcessor {
             ibd_start: Instant::now(),
             notifier,
             last_reconnect_attempt: Instant::now(),
+            block_result_rx,
+            block_result_tx,
+            block_processing: false,
         }
     }
 
@@ -408,8 +426,40 @@ impl NetProcessor {
                         }
                     }
                 }
+                // Block processed on the blocking threadpool — update state
+                // and start the next one.
+                Some(result) = self.block_result_rx.recv() => {
+                    self.block_processing = false;
+                    match result.result {
+                        Ok(true) => {
+                            if result.height <= 100 || result.height % 1000 == 0 {
+                                tracing::info!(
+                                    height = result.height,
+                                    pending = self.pending_blocks.len(),
+                                    "block accepted"
+                                );
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(ref reason) => {
+                            tracing::error!(
+                                peer_id = result.peer_id,
+                                height = result.height,
+                                hash = %result.hash,
+                                reason = %reason,
+                                "block rejected during ordered processing"
+                            );
+                        }
+                    }
+                    self.next_process_idx += 1;
+                    self.last_drain_time = Instant::now();
+                    // Immediately start processing the next block if available.
+                    self.try_start_next_block();
+                }
                 _ = stall_interval.tick() => {
                     self.check_stalled_peers();
+                    // Also try to start block processing if idle.
+                    self.try_start_next_block();
                 }
             }
         }
@@ -691,10 +741,9 @@ impl NetProcessor {
 
         let head_hash = self.header_chain[self.next_process_idx];
 
-        // Already in the buffer — drain_processable will handle it.
+        // Already in the buffer — try to start processing if idle.
         if self.pending_blocks.contains_key(&head_hash) {
-            // Try to drain now (might have been buffered since last drain).
-            self.drain_processable();
+            self.try_start_next_block();
             return;
         }
 
@@ -1194,8 +1243,8 @@ impl NetProcessor {
             let hash = block_hash.unwrap();
             // Buffer the block for ordered processing.
             self.pending_blocks.insert(hash, (peer_id, data.to_vec()));
-            // Drain all processable blocks in chain order.
-            self.drain_processable();
+            // Start processing if the blocking threadpool is idle.
+            self.try_start_next_block();
         } else {
             // Non-IBD block (inv/getdata announcement): process immediately.
             let in_ibd = self.next_process_idx < self.header_chain.len();
@@ -1234,61 +1283,38 @@ impl NetProcessor {
     /// walks `header_chain` from `next_process_idx` and processes every block
     /// whose data is already in `pending_blocks`, stopping at the first gap.
     ///
-    /// Because headers are validated at receipt time (in `handle_headers`),
-    /// every block's parent is already in the block_index. A "bad-prevblk"
-    /// error should never occur here.
-    fn drain_processable(&mut self) {
-        let start_idx = self.next_process_idx;
-        while self.next_process_idx < self.header_chain.len() {
-            let hash = self.header_chain[self.next_process_idx];
-            if let Some((peer_id, data)) = self.pending_blocks.remove(&hash) {
-                match self.node.process_block(&data) {
-                    Ok(true) => {
-                        let height = self.next_process_idx + 1;
-                        // Log every 1000 blocks or first 100 blocks for progress.
-                        if height <= 100 || height % 1000 == 0 {
-                            tracing::info!(
-                                height = height,
-                                pending = self.pending_blocks.len(),
-                                "block accepted"
-                            );
-                        }
-                    }
-                    Ok(false) => {
-                        tracing::debug!("block not accepted (already have or invalid)");
-                    }
-                    Err(reason) => {
-                        tracing::error!(
-                            peer_id = peer_id,
-                            height = self.next_process_idx + 1,
-                            hash = %hash,
-                            reason = %reason,
-                            "block rejected during ordered processing"
-                        );
-                        // Headers were pre-validated in handle_headers(), so
-                        // parent-not-found errors should not occur. If the
-                        // block body itself is invalid (bad merkle root, bad
-                        // transactions, etc.), advance past it — the header is
-                        // already in the block_index from the header phase.
-                    }
-                }
-                self.next_process_idx += 1;
-                self.last_drain_time = Instant::now();
-            } else {
-                // Next block in chain order hasn't arrived yet.
-                break;
-            }
+    /// Try to start processing the next block on the blocking threadpool.
+    ///
+    /// If a block is already being processed, this is a no-op. Otherwise,
+    /// extracts the next block in chain order from `pending_blocks` and
+    /// spawns it on `tokio::task::spawn_blocking`. The result comes back
+    /// via `block_result_rx` in the event loop.
+    ///
+    /// This decouples block validation (heavy CPU + I/O) from the async
+    /// network event loop, allowing the node to continue downloading
+    /// blocks while processing.
+    fn try_start_next_block(&mut self) {
+        if self.block_processing {
+            return;
         }
-        let processed = self.next_process_idx - start_idx;
-        let height = self.next_process_idx;
-        if processed > 0 && (height <= 100 || height % 1000 == 0 || processed >= 10) {
-            tracing::info!(
-                height = height,
-                batch = processed,
-                pending = self.pending_blocks.len(),
-                queued = self.blocks_to_download.len(),
-                "drain batch complete"
-            );
+        if self.next_process_idx >= self.header_chain.len() {
+            return;
+        }
+        let hash = self.header_chain[self.next_process_idx];
+        if let Some((peer_id, data)) = self.pending_blocks.remove(&hash) {
+            self.block_processing = true;
+            let node = self.node.clone();
+            let result_tx = self.block_result_tx.clone();
+            let height = self.next_process_idx + 1;
+            tokio::task::spawn_blocking(move || {
+                let result = node.process_block(&data);
+                let _ = result_tx.send(BlockProcessResult {
+                    hash,
+                    peer_id,
+                    height,
+                    result,
+                });
+            });
         }
     }
 
@@ -1984,6 +2010,10 @@ mod tests {
             } else {
                 Err("test rejection".to_string())
             }
+        }
+
+        fn accept_block_header(&self, _header_data: &[u8]) -> Result<bool, String> {
+            Ok(true)
         }
 
         fn process_transaction(&self, data: &[u8]) -> Result<bool, String> {
