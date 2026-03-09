@@ -128,6 +128,29 @@ impl<D: Database> DbWrapper<D> {
         &self.db
     }
 
+    /// Serialize and XOR-obfuscate a value, returning the raw bytes
+    /// ready for insertion into a [`DbBatch`].
+    pub fn serialize_value<V: Encodable>(&self, value: &V) -> Result<Vec<u8>, DbWrapperError> {
+        let mut serialized = Vec::new();
+        value
+            .encode(&mut serialized)
+            .map_err(|e| DbWrapperError::Serialize(e))?;
+        self.xor_bytes(&mut serialized);
+        Ok(serialized)
+    }
+
+    /// Create a new write batch on the underlying database.
+    pub fn new_batch(&self) -> D::Batch {
+        self.db.new_batch()
+    }
+
+    /// Commit a pre-built write batch.
+    pub fn write_batch(&self, batch: D::Batch, sync: bool) -> Result<(), DbWrapperError> {
+        self.db
+            .write_batch(batch, sync)
+            .map_err(|e| DbWrapperError::Db(e.to_string()))
+    }
+
     /// XOR obfuscation: XOR each byte with the obfuscation key (repeating).
     fn xor_bytes(&self, data: &mut [u8]) {
         if self.obfuscation_key.is_empty() {

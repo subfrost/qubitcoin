@@ -49,7 +49,9 @@ pub const PING_INTERVAL: u64 = 2 * 60;
 pub const HEADERS_DOWNLOAD_TIMEOUT_BASE: u64 = 15 * 60;
 
 /// Block stalling timeout in seconds.
-pub const BLOCK_STALLING_TIMEOUT: u64 = 2;
+/// Set high enough to avoid re-requesting blocks while process_block
+/// is doing heavy validation work (script checks, UTXO updates).
+pub const BLOCK_STALLING_TIMEOUT: u64 = 10;
 
 /// Block download timeout base in seconds.
 /// Bitcoin Core uses pow_target_spacing (600s) * 1 = 600s.

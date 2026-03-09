@@ -27,9 +27,21 @@ impl RocksDatabase {
     pub fn open<P: AsRef<Path>>(path: P, cache_size_mb: usize) -> Result<Self, RocksError> {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
-        opts.set_max_open_files(64);
+        opts.set_max_open_files(256);
         opts.set_write_buffer_size(cache_size_mb * 1024 * 1024);
         opts.set_compression_type(rocksdb::DBCompressionType::None);
+
+        // Block cache for read-heavy UTXO lookups — critical for IBD performance.
+        let block_cache_mb = std::cmp::max(cache_size_mb / 2, 64);
+        let mut block_opts = rocksdb::BlockBasedOptions::default();
+        block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(block_cache_mb * 1024 * 1024));
+        // Bloom filter eliminates ~99% of unnecessary disk reads for missing keys.
+        block_opts.set_bloom_filter(10.0, false);
+        opts.set_block_based_table_factory(&block_opts);
+
+        // Parallel compaction to reduce write stalls during IBD.
+        opts.increase_parallelism(4);
+        opts.set_max_background_jobs(4);
 
         let db = rocksdb::DB::open(&opts, path)?;
         Ok(RocksDatabase { db })

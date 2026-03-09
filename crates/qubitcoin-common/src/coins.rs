@@ -986,26 +986,41 @@ impl<D: Database> CoinsViewDB<D> {
     }
 
     /// Apply a batch of writes (used by [`CoinsViewCache::flush_to`]).
+    ///
+    /// All operations are accumulated into a single atomic `WriteBatch` and
+    /// committed once, avoiding the massive overhead of individual DB writes.
     pub fn batch_write_impl(
         &self,
         entries: &[(OutPoint, Option<Coin>)],
         best_block: &BlockHash,
     ) -> bool {
+        use qubitcoin_storage::traits::DbBatch;
+
+        let mut batch = self.db.new_batch();
+
         for (outpoint, maybe_coin) in entries {
+            let key = coin_db_key(outpoint);
             match maybe_coin {
                 Some(coin) => {
-                    if !self.write_coin(outpoint, coin) {
-                        return false;
+                    match self.db.serialize_value(coin) {
+                        Ok(val) => batch.put(&key, &val),
+                        Err(_) => return false,
                     }
                 }
                 None => {
-                    if !self.erase_coin(outpoint) {
-                        return false;
-                    }
+                    batch.delete(&key);
                 }
             }
         }
-        self.write_best_block(best_block)
+
+        // Also write the best block hash in the same batch.
+        let bb_key = best_block_db_key();
+        match self.db.serialize_value(best_block) {
+            Ok(val) => batch.put(&bb_key, &val),
+            Err(_) => return false,
+        }
+
+        self.db.write_batch(batch, false).is_ok()
     }
 }
 

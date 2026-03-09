@@ -225,6 +225,9 @@ pub struct ChainstateManager {
     /// Hash of the assumed-valid block. Blocks at or below this height
     /// skip script verification during IBD, dramatically speeding up sync.
     assume_valid: Option<BlockHash>,
+    /// Tracked best fully-validated tip (arena index + chain_work).
+    /// Avoids O(N) linear scan of the entire block index on every block.
+    best_valid_tip: Option<(usize, ArithUint256)>,
 }
 
 impl ChainstateManager {
@@ -242,6 +245,7 @@ impl ChainstateManager {
             stored_undos: HashMap::new(),
             block_reader: None,
             assume_valid: None,
+            best_valid_tip: None,
         }
     }
 
@@ -420,6 +424,11 @@ impl ChainstateManager {
             }
         }
 
+        // Cache the best valid tip for O(1) activate_best_chain.
+        if let Some(idx) = best_idx {
+            self.best_valid_tip = Some((idx, best_work));
+        }
+
         if let Some(best) = best_idx {
             let best_height = self.block_index.get(best).height;
             let block_index = &self.block_index;
@@ -492,8 +501,12 @@ impl ChainstateManager {
         index.status.insert(BlockStatus::HAVE_DATA);
         index.time_max = genesis.header.time;
 
+        let chain_work = index.chain_work;
         let arena_idx = self.block_index.insert(index);
         self.block_index.build_skip_pointer(arena_idx);
+
+        // Track as best valid tip.
+        self.best_valid_tip = Some((arena_idx, chain_work));
 
         // Update the active chain.
         self.active_chainstate.chain.set_tip(arena_idx, 0);
@@ -726,11 +739,15 @@ impl ChainstateManager {
             self.stored_undos.insert(block_hash, block_undo.clone());
         }
 
-        // Mark fully validated.
+        // Mark fully validated and update best valid tip tracker.
         self.block_index
             .get_mut(arena_idx)
             .status
             .raise_validity(BlockStatus::VALID_SCRIPTS);
+        let work = self.block_index.get(arena_idx).chain_work;
+        if self.best_valid_tip.map_or(true, |(_, bw)| work > bw) {
+            self.best_valid_tip = Some((arena_idx, work));
+        }
 
         // 5. Activate the best chain.  Pass the arena index of the block
         //    we just connected so activate_best_chain skips reconnecting it
@@ -757,20 +774,12 @@ impl ChainstateManager {
         &mut self,
         just_connected: Option<usize>,
     ) -> Result<(), BlockValidationState> {
-        // Find the fully-validated entry with the most work.
-        let mut best_idx: Option<usize> = None;
-        let mut best_work = ArithUint256::zero();
-
-        for i in 0..self.block_index.len() {
-            let entry = self.block_index.get(i);
-            if entry.is_valid(BlockStatus::VALID_SCRIPTS) && entry.chain_work > best_work {
-                best_work = entry.chain_work;
-                best_idx = Some(i);
-            }
-        }
-
-        let best_idx = match best_idx {
-            Some(idx) => idx,
+        // Use the tracked best valid tip (O(1)) instead of scanning the
+        // entire block index (O(N)). During normal IBD this avoids an
+        // O(N²) bottleneck — we were doing a full scan of 300k+ entries
+        // on every single block.
+        let best_idx = match self.best_valid_tip {
+            Some((idx, _)) => idx,
             None => return Ok(()), // No valid blocks at all.
         };
 
@@ -889,6 +898,10 @@ impl ChainstateManager {
                         .get_mut(idx_at_h)
                         .status
                         .raise_validity(BlockStatus::VALID_SCRIPTS);
+                    let work = self.block_index.get(idx_at_h).chain_work;
+                    if self.best_valid_tip.map_or(true, |(_, bw)| work > bw) {
+                        self.best_valid_tip = Some((idx_at_h, work));
+                    }
                 } else {
                     // Already validated; replay UTXO changes.
                     let undo = connect_block(
