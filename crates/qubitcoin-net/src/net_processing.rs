@@ -426,10 +426,10 @@ impl NetProcessor {
                         }
                     }
                 }
-                // Block processed on the blocking threadpool — update state
-                // and start the next one.
+                // Block(s) processed on the blocking threadpool — drain all
+                // available results and start the next batch.
                 Some(result) = self.block_result_rx.recv() => {
-                    self.block_processing = false;
+                    // Process this result.
                     match result.result {
                         Ok(true) => {
                             if result.height <= 100 || result.height % 1000 == 0 {
@@ -453,7 +453,36 @@ impl NetProcessor {
                     }
                     self.next_process_idx += 1;
                     self.last_drain_time = Instant::now();
-                    // Immediately start processing the next block if available.
+
+                    // Drain any additional results that arrived (from same batch).
+                    while let Ok(result) = self.block_result_rx.try_recv() {
+                        match result.result {
+                            Ok(true) => {
+                                if result.height <= 100 || result.height % 1000 == 0 {
+                                    tracing::info!(
+                                        height = result.height,
+                                        pending = self.pending_blocks.len(),
+                                        "block accepted"
+                                    );
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(ref reason) => {
+                                tracing::error!(
+                                    peer_id = result.peer_id,
+                                    height = result.height,
+                                    hash = %result.hash,
+                                    reason = %reason,
+                                    "block rejected during ordered processing"
+                                );
+                            }
+                        }
+                        self.next_process_idx += 1;
+                        self.last_drain_time = Instant::now();
+                    }
+
+                    // Batch complete — start the next batch.
+                    self.block_processing = false;
                     self.try_start_next_block();
                 }
                 _ = stall_interval.tick() => {
@@ -1283,16 +1312,16 @@ impl NetProcessor {
     /// walks `header_chain` from `next_process_idx` and processes every block
     /// whose data is already in `pending_blocks`, stopping at the first gap.
     ///
-    /// Try to start processing the next block on the blocking threadpool.
+    /// Try to start processing blocks on the blocking threadpool.
     ///
-    /// If a block is already being processed, this is a no-op. Otherwise,
-    /// extracts the next block in chain order from `pending_blocks` and
-    /// spawns it on `tokio::task::spawn_blocking`. The result comes back
+    /// If blocks are already being processed, this is a no-op. Otherwise,
+    /// extracts a batch of sequential blocks from `pending_blocks` and
+    /// spawns them on `tokio::task::spawn_blocking`. Results come back
     /// via `block_result_rx` in the event loop.
     ///
-    /// This decouples block validation (heavy CPU + I/O) from the async
-    /// network event loop, allowing the node to continue downloading
-    /// blocks while processing.
+    /// Batching amortizes the spawn_blocking overhead — critical for early
+    /// blocks which are tiny and would otherwise be dominated by task
+    /// scheduling costs.
     fn try_start_next_block(&mut self) {
         if self.block_processing {
             return;
@@ -1300,13 +1329,30 @@ impl NetProcessor {
         if self.next_process_idx >= self.header_chain.len() {
             return;
         }
-        let hash = self.header_chain[self.next_process_idx];
-        if let Some((peer_id, data)) = self.pending_blocks.remove(&hash) {
-            self.block_processing = true;
-            let node = self.node.clone();
-            let result_tx = self.block_result_tx.clone();
-            let height = self.next_process_idx + 1;
-            tokio::task::spawn_blocking(move || {
+
+        // Extract a batch of sequential blocks that are ready.
+        let mut batch: Vec<(BlockHash, u64, Vec<u8>)> = Vec::new();
+        let start_idx = self.next_process_idx;
+        while self.next_process_idx + batch.len() < self.header_chain.len() && batch.len() < 500 {
+            let idx = self.next_process_idx + batch.len();
+            let hash = self.header_chain[idx];
+            if let Some((peer_id, data)) = self.pending_blocks.remove(&hash) {
+                batch.push((hash, peer_id, data));
+            } else {
+                break;
+            }
+        }
+
+        if batch.is_empty() {
+            return;
+        }
+
+        self.block_processing = true;
+        let node = self.node.clone();
+        let result_tx = self.block_result_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            for (i, (hash, peer_id, data)) in batch.into_iter().enumerate() {
+                let height = start_idx + i + 1;
                 let result = node.process_block(&data);
                 let _ = result_tx.send(BlockProcessResult {
                     hash,
@@ -1314,8 +1360,8 @@ impl NetProcessor {
                     height,
                     result,
                 });
-            });
-        }
+            }
+        });
     }
 
     /// Handle an inv announcement.
