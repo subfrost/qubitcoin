@@ -85,6 +85,18 @@ impl RocksDatabase {
         opts.increase_parallelism(8);
         opts.set_max_background_jobs(8);
 
+        // Block cache for read-heavy UTXO lookups — critical for IBD performance.
+        let block_cache_mb = std::cmp::max(cache_size_mb / 2, 64);
+        let mut block_opts = rocksdb::BlockBasedOptions::default();
+        block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(block_cache_mb * 1024 * 1024));
+        // Bloom filter eliminates ~99% of unnecessary disk reads for missing keys.
+        block_opts.set_bloom_filter(10.0, false);
+        opts.set_block_based_table_factory(&block_opts);
+
+        // Parallel compaction to reduce write stalls during IBD.
+        opts.increase_parallelism(4);
+        opts.set_max_background_jobs(4);
+
         let db = rocksdb::DB::open(&opts, path)?;
         Ok(RocksDatabase { db })
     }
