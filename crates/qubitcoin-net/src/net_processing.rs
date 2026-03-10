@@ -1448,8 +1448,37 @@ impl NetProcessor {
             for (i, (hash, peer_id, data)) in batch.into_iter().enumerate() {
                 let height = start_idx + i + 1;
                 let is_last = i + 1 == batch_len;
-                let result = node.process_block(&data);
-                let failed = result.is_err();
+
+                // Catch panics so that block_processing doesn't get stuck
+                // if process_block panics. Without this, the cloned result_tx
+                // is dropped on panic, but the original sender in NetProcessor
+                // keeps recv() blocking forever — a permanent deadlock.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    node.process_block(&data)
+                }));
+
+                let (result, failed) = match result {
+                    Ok(r) => {
+                        let failed = r.is_err();
+                        (r, failed)
+                    }
+                    Err(panic_info) => {
+                        let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        tracing::error!(
+                            height = height,
+                            error = %msg,
+                            "process_block PANICKED"
+                        );
+                        (Err(format!("panic: {}", msg)), true)
+                    }
+                };
+
                 let _ = result_tx.send(BlockProcessResult {
                     hash,
                     peer_id,
