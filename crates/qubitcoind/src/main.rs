@@ -11,7 +11,7 @@ use qubitcoin_node::block_index_db::BlockIndexDB;
 use qubitcoin_node::tx_index_db::TxIndexDB;
 use qubitcoin_node::chainstate::ChainstateManager;
 use qubitcoin_node::mempool::{self, TxMemPool};
-use qubitcoin_primitives::{BlockHash, Uint256};
+use qubitcoin_primitives::{BlockHash, Txid, Uint256};
 use qubitcoin_rpc::http_server::{RpcServer, RpcServerConfig};
 use qubitcoin_rpc::node_rpc::{register_node_rpcs, NodeState};
 use qubitcoin_rpc::server::RpcRegistry;
@@ -110,6 +110,8 @@ struct LiveNodeInterface {
     dbcache_limit: u64,
     /// Tracks IBD progress for logging blocks/sec and ETA.
     ibd_tracker: parking_lot::Mutex<IbdTracker>,
+    /// Pending TX index entries accumulated between flushes.
+    pending_tx_index: parking_lot::Mutex<Vec<(Txid, i32, u32, u32)>>,
 }
 
 /// Tracks IBD (Initial Block Download) progress for logging.
@@ -139,6 +141,7 @@ impl NodeInterface for LiveNodeInterface {
                 let idx = cs.block_index_mut().get_mut(arena_idx);
                 idx.file = pos.file;
                 idx.data_pos = pos.pos;
+                cs.mark_dirty(arena_idx);
             }
 
             cs.process_new_block(&block).map_err(|e| format!("{:?}", e))?
@@ -155,20 +158,19 @@ impl NodeInterface for LiveNodeInterface {
         }
 
         if accepted {
-            // Index every transaction in this block for getrawtransaction.
-            let tx_entries: Vec<_> = block
-                .vtx
-                .iter()
-                .enumerate()
-                .map(|(i, tx)| (tx.txid().clone(), pos.file, pos.pos, i as u32))
-                .collect();
-            self.tx_index_db.write_tx_positions(&tx_entries);
+            // Accumulate TX index entries for batched flush (avoids per-block RocksDB writes).
+            {
+                let mut pending = self.pending_tx_index.lock();
+                for (i, tx) in block.vtx.iter().enumerate() {
+                    pending.push((tx.txid().clone(), pos.file, pos.pos, i as u32));
+                }
+            }
 
             let mut flush_count = self.blocks_since_flush.lock();
             *flush_count += 1;
 
             // Update RPC state.
-            let cs = self.chainstate.lock();
+            let mut cs = self.chainstate.lock();
             let height = cs.height();
             let tip_hash = cs
                 .tip()
@@ -206,9 +208,9 @@ impl NodeInterface for LiveNodeInterface {
             }
 
             // Memory-bounded flush: trigger when block count threshold OR cache
-            // size exceeds the -dbcache limit (default 450 MiB).
+            // size exceeds the -dbcache limit (default 1024 MiB).
             let cache_bytes = cs.coins_tip().dynamic_memory_usage();
-            let need_flush = *flush_count >= 500 || cache_bytes > self.dbcache_limit;
+            let need_flush = *flush_count >= 10_000 || cache_bytes > self.dbcache_limit;
 
             if need_flush {
                 let cache_mb = cache_bytes / (1024 * 1024);
@@ -219,6 +221,16 @@ impl NodeInterface for LiveNodeInterface {
                 let dirty = cs.dirty_block_indices();
                 let refs: Vec<&qubitcoin_common::chain::BlockIndex> = dirty.into_iter().collect();
                 self.block_index_db.write_block_indices(&refs);
+                cs.clear_dirty();
+
+                // Flush accumulated TX index entries.
+                {
+                    let mut pending = self.pending_tx_index.lock();
+                    if !pending.is_empty() {
+                        self.tx_index_db.write_tx_positions(&pending);
+                        pending.clear();
+                    }
+                }
 
                 *flush_count = 0;
             }
@@ -350,7 +362,7 @@ async fn main() {
     args.set_default("maxconnections", "125");
     args.set_default("loglevel", "info");
     args.set_default("datadir", "~/.qubitcoin");
-    args.set_default("dbcache", "450");
+    args.set_default("dbcache", "1024");
     args.parse_args(&args_vec);
 
     // Handle --help and --version
@@ -418,7 +430,7 @@ async fn main() {
     tracing::info!(datadir = %datadir.display(), "data directory initialized");
 
     // 5. Open databases
-    let dbcache_mb = args.get_int_arg("dbcache").unwrap_or(450) as usize;
+    let dbcache_mb = args.get_int_arg("dbcache").unwrap_or(1024) as usize;
     let chainstate_db = RocksDatabase::open(&chainstate_dir, dbcache_mb)
         .expect("failed to open chainstate database");
     let block_index_rocks = RocksDatabase::open(&block_index_dir, 8)
@@ -553,8 +565,9 @@ async fn main() {
     }
 
     // Set the assumed-valid block from chain params for IBD optimization.
+    // Height 900,000 matches the assume-valid hash configured in chainparams.
     if !params.assumed_valid_block.is_null() {
-        chainstate.set_assume_valid(params.assumed_valid_block);
+        chainstate.set_assume_valid(params.assumed_valid_block, 900_000);
     }
 
     // Wire the disk-backed block reader so chainstate can read blocks/undo
@@ -730,6 +743,7 @@ async fn main() {
         magic_bytes,
         blocks_since_flush: parking_lot::Mutex::new(0),
         dbcache_limit: (dbcache_mb as u64) * 1024 * 1024,
+        pending_tx_index: parking_lot::Mutex::new(Vec::new()),
         ibd_tracker: parking_lot::Mutex::new(IbdTracker {
             last_log_time: std::time::Instant::now(),
             last_log_height: initial_height,
@@ -1557,5 +1571,5 @@ fn print_usage() {
     println!("  -listen            Accept incoming connections (default: 1)");
     println!("  -maxconnections=<n> Max connections (default: 125)");
     println!("  -loglevel=<level>  Log level: error, warn, info, debug, trace");
-    println!("  -dbcache=<n>       UTXO cache size in MB (default: 450)");
+    println!("  -dbcache=<n>       UTXO cache size in MB (default: 1024)");
 }

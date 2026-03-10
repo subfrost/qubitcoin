@@ -178,6 +178,8 @@ struct PeerSyncState {
     discouraged: bool,
     /// Reason for discouragement, if any.
     discourage_reason: Option<String>,
+    /// Number of times blocks were redistributed from this peer due to stalls.
+    stall_count: u32,
 }
 
 impl PeerSyncState {
@@ -201,6 +203,7 @@ impl PeerSyncState {
             known_inv: HashSet::new(),
             discouraged: false,
             discourage_reason: None,
+            stall_count: 0,
         }
     }
 
@@ -277,6 +280,8 @@ struct BlockProcessResult {
     peer_id: u64,
     height: usize,
     result: Result<bool, String>,
+    /// True if this is the last result in the batch (batch is done).
+    batch_done: bool,
 }
 
 impl NetProcessor {
@@ -440,7 +445,15 @@ impl NetProcessor {
                                 );
                             }
                         }
-                        Ok(false) => {}
+                        Ok(false) => {
+                            if result.height % 10000 == 0 {
+                                tracing::info!(
+                                    height = result.height,
+                                    pending = self.pending_blocks.len(),
+                                    "block already known"
+                                );
+                            }
+                        }
                         Err(ref reason) => {
                             tracing::error!(
                                 peer_id = result.peer_id,
@@ -452,6 +465,7 @@ impl NetProcessor {
                         }
                     }
                     self.next_process_idx += 1;
+                    let mut done = result.batch_done;
                     self.last_drain_time = Instant::now();
 
                     // Drain any additional results that arrived (from same batch).
@@ -466,7 +480,15 @@ impl NetProcessor {
                                     );
                                 }
                             }
-                            Ok(false) => {}
+                            Ok(false) => {
+                                if result.height % 10000 == 0 {
+                                    tracing::info!(
+                                        height = result.height,
+                                        pending = self.pending_blocks.len(),
+                                        "block already known"
+                                    );
+                                }
+                            }
                             Err(ref reason) => {
                                 tracing::error!(
                                     peer_id = result.peer_id,
@@ -478,12 +500,19 @@ impl NetProcessor {
                             }
                         }
                         self.next_process_idx += 1;
+                        done = done || result.batch_done;
                         self.last_drain_time = Instant::now();
                     }
 
-                    // Batch complete — start the next batch.
-                    self.block_processing = false;
-                    self.try_start_next_block();
+                    // Only start the next batch when the current batch
+                    // signals it is done (last result has batch_done=true).
+                    // Without this guard, a new spawn_blocking batch could
+                    // run concurrently with the old one, processing blocks
+                    // out of order and corrupting the UTXO set.
+                    if done {
+                        self.block_processing = false;
+                        self.try_start_next_block();
+                    }
                 }
                 _ = stall_interval.tick() => {
                     self.check_stalled_peers();
@@ -575,17 +604,33 @@ impl NetProcessor {
     /// Pulls hashes from `blocks_to_download` up to MAX_BLOCKS_IN_TRANSIT_PER_PEER
     /// and sends a getdata message.
     fn request_blocks(&mut self, peer_id: u64) {
+        // Backpressure: stop downloading when pending blocks buffer is too large.
+        // At ~500 KB avg block size, 2000 pending blocks = ~1 GB memory.
+        if self.pending_blocks.len() > 2000 {
+            return;
+        }
+
         let state = match self.peer_states.get_mut(&peer_id) {
             Some(s) => s,
             None => return,
         };
 
+        // Reduce in-flight limit for peers that have stalled before.
+        // Peers with 1+ stalls get half the limit, 3+ get quarter.
+        let peer_limit = if state.stall_count >= 3 {
+            (MAX_BLOCKS_IN_TRANSIT_PER_PEER / 4).max(4)
+        } else if state.stall_count >= 1 {
+            (MAX_BLOCKS_IN_TRANSIT_PER_PEER / 2).max(4)
+        } else {
+            MAX_BLOCKS_IN_TRANSIT_PER_PEER
+        };
+
         // Don't request if we already have too many in-flight.
-        if state.blocks_in_flight.len() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER {
+        if state.blocks_in_flight.len() >= peer_limit {
             return;
         }
 
-        let available = MAX_BLOCKS_IN_TRANSIT_PER_PEER - state.blocks_in_flight.len();
+        let available = peer_limit - state.blocks_in_flight.len();
         let mut inv_list = Vec::new();
 
         for _ in 0..available {
@@ -704,7 +749,7 @@ impl NetProcessor {
             .values()
             .filter(|s| s.handshake_complete && !s.discouraged)
             .count();
-        if active_peers == 0
+        if active_peers < 4
             && !self.blocks_to_download.is_empty()
             && self.last_reconnect_attempt.elapsed() > std::time::Duration::from_secs(30)
         {
@@ -712,8 +757,9 @@ impl NetProcessor {
             // Clear discouraged peers so they don't linger forever.
             self.peer_states.retain(|_, s| !s.discouraged);
             tracing::info!(
+                active_peers = active_peers,
                 blocks_queued = self.blocks_to_download.len(),
-                "no active peers, attempting DNS seed reconnection"
+                "few active peers, attempting DNS seed reconnection"
             );
             let cm = self.conn_manager.clone();
             tokio::spawn(async move {
@@ -765,6 +811,13 @@ impl NetProcessor {
     /// peer and request it from a different peer with available capacity.
     fn check_head_of_line_stall(&mut self) {
         if self.next_process_idx >= self.header_chain.len() {
+            return;
+        }
+
+        // If a batch is currently being processed in spawn_blocking,
+        // the head-of-line block is in-flight on the blocking thread.
+        // Don't re-queue or re-request it.
+        if self.block_processing {
             return;
         }
 
@@ -824,7 +877,7 @@ impl NetProcessor {
                 .map(|(&pid, _)| pid)
                 .collect();
             if !peer_ids.is_empty() {
-                tracing::info!(
+                tracing::debug!(
                     height = self.next_process_idx + 1,
                     peers = peer_ids.len(),
                     "head-of-line block not in-flight, re-requesting"
@@ -856,45 +909,68 @@ impl NetProcessor {
             .min_by_key(|(_, state)| state.blocks_in_flight.len())
             .map(|(&pid, _)| pid);
 
-        // Remove stalled block from slow peer first so we free a slot.
-        if let Some(state) = self.peer_states.get_mut(&slow_pid) {
-            state.blocks_in_flight.retain(|(h, _)| *h != head_hash);
-        }
-
-        if let Some(fast_pid) = fast_peer {
-            tracing::info!(
-                height = self.next_process_idx + 1,
-                slow_peer = slow_pid,
-                fast_peer = fast_pid,
-                stall_secs = stall_secs,
-                "re-requesting stalled head-of-line block"
-            );
-
-            // Assign to the faster peer.
-            if let Some(state) = self.peer_states.get_mut(&fast_pid) {
-                state.blocks_in_flight.push((head_hash, Instant::now()));
+        // Two-tier stall recovery:
+        // 1. After BLOCK_STALLING_TIMEOUT (8s): steal head-of-line block only.
+        // 2. After 20s: redistribute ALL blocks from the slow peer.
+        if stall_secs > 20 {
+            // Full redistribution — slow peer is consistently slow.
+            let mut requeued = Vec::new();
+            if let Some(state) = self.peer_states.get_mut(&slow_pid) {
+                requeued = state.blocks_in_flight.drain(..).map(|(h, _)| h).collect();
+                state.stall_count += 1;
             }
-            let inv = vec![InvVect::new(
-                InvType::WitnessBlock,
-                qubitcoin_primitives::Uint256::from_bytes(*head_hash.data()),
-            )];
-            let msg = NetMessage::GetData(inv);
-            let payload = serialize_message(&msg);
-            self.conn_manager.send_to_peer(fast_pid, "getdata", payload);
-
-            // Fill the slow peer's freed slot with the next block from queue.
-            self.request_blocks(slow_pid);
+            if !requeued.is_empty() {
+                tracing::info!(
+                    height = self.next_process_idx + 1,
+                    slow_peer = slow_pid,
+                    blocks_requeued = requeued.len(),
+                    stall_secs = stall_secs,
+                    "redistributing slow peer's in-flight blocks"
+                );
+                for hash in requeued {
+                    self.blocks_to_download.push_front(hash);
+                }
+                let peer_ids: Vec<u64> = self
+                    .peer_states
+                    .iter()
+                    .filter(|(&pid, s)| {
+                        pid != slow_pid && s.handshake_complete && !s.discouraged
+                    })
+                    .map(|(&pid, _)| pid)
+                    .collect();
+                for pid in peer_ids {
+                    self.request_blocks(pid);
+                }
+            }
         } else {
-            // All peers at capacity — re-queue the block and request from
-            // the slow peer (which now has a freed slot).
-            tracing::info!(
-                height = self.next_process_idx + 1,
-                slow_peer = slow_pid,
-                stall_secs = stall_secs,
-                "re-requesting stalled head-of-line block (no fast peer available)"
-            );
-            self.blocks_to_download.push_front(head_hash);
-            self.request_blocks(slow_pid);
+            // Steal just the head-of-line block from slow peer.
+            if let Some(state) = self.peer_states.get_mut(&slow_pid) {
+                state.blocks_in_flight.retain(|(h, _)| *h != head_hash);
+            }
+
+            if let Some(fast_pid) = fast_peer {
+                tracing::debug!(
+                    height = self.next_process_idx + 1,
+                    slow_peer = slow_pid,
+                    fast_peer = fast_pid,
+                    stall_secs = stall_secs,
+                    "re-requesting stalled head-of-line block"
+                );
+                if let Some(state) = self.peer_states.get_mut(&fast_pid) {
+                    state.blocks_in_flight.push((head_hash, Instant::now()));
+                }
+                let inv = vec![InvVect::new(
+                    InvType::WitnessBlock,
+                    qubitcoin_primitives::Uint256::from_bytes(*head_hash.data()),
+                )];
+                let msg = NetMessage::GetData(inv);
+                let payload = serialize_message(&msg);
+                self.conn_manager.send_to_peer(fast_pid, "getdata", payload);
+                self.request_blocks(slow_pid);
+            } else {
+                self.blocks_to_download.push_front(head_hash);
+                self.request_blocks(slow_pid);
+            }
         }
     }
 
@@ -1149,6 +1225,14 @@ impl NetProcessor {
         // parent is already known — preventing "bad-prevblk" rejections during
         // ordered processing in drain_processable().
         let mut new_count = 0usize;
+        // Cache chain height to skip queuing blocks already on disk.
+        let tip_height_skip = std::cmp::max(self.node.chain_height(), 0) as usize;
+        // One-time: advance next_process_idx past already-known blocks.
+        // Only do this before any batch processing has started (next_process_idx == 0)
+        // to avoid racing with the batch result handler.
+        if self.next_process_idx == 0 && tip_height_skip > 0 && !self.block_processing {
+            self.next_process_idx = tip_height_skip;
+        }
         for header_data in headers {
             if header_data.len() >= 80 {
                 // The block hash is SHA256d of the 80-byte header.
@@ -1160,8 +1244,11 @@ impl NetProcessor {
                     match self.node.accept_block_header(&header_data[..80]) {
                         Ok(_) => {
                             self.header_chain.push(hash);
-                            // Queue block for download.
-                            if !self.blocks_downloaded.contains(&hash) {
+                            // Queue block for download — skip blocks already on disk.
+                            let idx = self.header_chain.len() - 1;
+                            if idx >= tip_height_skip
+                                && !self.blocks_downloaded.contains(&hash)
+                            {
                                 self.blocks_to_download.push_back(hash);
                             }
                             self.total_headers += 1;
@@ -1268,7 +1355,12 @@ impl NetProcessor {
             .map(|h| self.header_set.contains(&h))
             .unwrap_or(false);
 
-        if is_ibd_block {
+        // During IBD, also buffer blocks not yet in header_set — they may have
+        // arrived before their header was validated (race between block download
+        // and header sync).
+        let in_ibd = self.next_process_idx < self.header_chain.len();
+
+        if is_ibd_block || (in_ibd && block_hash.is_some()) {
             let hash = block_hash.unwrap();
             // Buffer the block for ordered processing.
             self.pending_blocks.insert(hash, (peer_id, data.to_vec()));
@@ -1337,6 +1429,7 @@ impl NetProcessor {
             let idx = self.next_process_idx + batch.len();
             let hash = self.header_chain[idx];
             if let Some((peer_id, data)) = self.pending_blocks.remove(&hash) {
+                self.blocks_downloaded.remove(&hash);
                 batch.push((hash, peer_id, data));
             } else {
                 break;
@@ -1351,15 +1444,27 @@ impl NetProcessor {
         let node = self.node.clone();
         let result_tx = self.block_result_tx.clone();
         tokio::task::spawn_blocking(move || {
+            let batch_len = batch.len();
             for (i, (hash, peer_id, data)) in batch.into_iter().enumerate() {
                 let height = start_idx + i + 1;
+                let is_last = i + 1 == batch_len;
                 let result = node.process_block(&data);
+                let failed = result.is_err();
                 let _ = result_tx.send(BlockProcessResult {
                     hash,
                     peer_id,
                     height,
                     result,
+                    batch_done: is_last || failed,
                 });
+                if failed {
+                    // Stop processing further blocks in this batch on first
+                    // failure.  Continuing would call connect_block for later
+                    // blocks whose UTXO changes leak into coins_tip when
+                    // activate_best_chain fails (the earlier failed block is
+                    // still in the chain path), corrupting the UTXO set.
+                    break;
+                }
             }
         });
     }

@@ -328,9 +328,14 @@ impl Coin {
         self.height = 0;
     }
 
-    /// Estimate dynamic memory usage of this coin (script bytes on the heap).
+    /// Estimate dynamic memory usage of this coin entry in the cache.
+    ///
+    /// Includes an approximation of the fixed per-entry overhead:
+    /// OutPoint key (36 bytes) + CoinsCacheEntry struct (~40 bytes) +
+    /// HashMap bucket overhead (~64 bytes) + heap-allocated script bytes.
     pub fn dynamic_memory_usage(&self) -> usize {
-        self.tx_out.script_pubkey.len()
+        // 140 bytes fixed overhead per HashMap<OutPoint, CoinsCacheEntry> entry
+        140 + self.tx_out.script_pubkey.len()
     }
 }
 
@@ -777,6 +782,18 @@ impl CoinsViewCache {
         total
     }
 
+    /// Check if a coin exists directly in the base view (bypassing cache).
+    /// Used for diagnostic purposes to determine if a flush lost data.
+    pub fn base_has_coin(&self, outpoint: &OutPoint) -> bool {
+        self.base.get_coin(outpoint).is_some()
+    }
+
+    /// Check if an outpoint exists in the cache (even if spent).
+    pub fn cache_contains(&self, outpoint: &OutPoint) -> bool {
+        let cache = self.cache.read();
+        cache.contains_key(outpoint)
+    }
+
     /// Flush all dirty entries to the base view.
     ///
     /// This iterates over all cache entries, writes dirty ones to the base
@@ -828,10 +845,17 @@ impl CoinsViewCache {
             }
         }
 
+        let num_writes = writes.iter().filter(|(_, c)| c.is_some()).count();
+        let num_deletes = writes.iter().filter(|(_, c)| c.is_none()).count();
+        let cache_size = cache.len();
+        tracing::info!(cache_entries = cache_size, dirty_writes = num_writes, dirty_deletes = num_deletes, best_block = %best_block.to_hex(), "flush_to");
+
         let result = target.batch_write(&writes, &best_block);
         if result {
             cache.clear();
             self.usage.store(0, Ordering::Relaxed);
+        } else {
+            tracing::error!("flush_to: batch_write FAILED");
         }
         result
     }
@@ -979,6 +1003,12 @@ impl<D: Database> CoinsViewDB<D> {
         self.db.erase(&key, false).is_ok()
     }
 
+    /// Check if a raw key exists in the database (bypasses deserialization).
+    pub fn raw_key_exists(&self, outpoint: &OutPoint) -> bool {
+        let key = coin_db_key(outpoint);
+        self.db.exists(&key).unwrap_or(false)
+    }
+
     /// Write the best block hash to the database.
     pub fn write_best_block(&self, hash: &BlockHash) -> bool {
         let key = best_block_db_key();
@@ -1029,7 +1059,15 @@ impl<D: Database> CoinsView for CoinsViewDB<D> {
         let key = coin_db_key(outpoint);
         match self.db.read::<_, Coin>(&key) {
             Ok(Some(coin)) if !coin.is_spent() => Some(coin),
-            _ => None,
+            Ok(Some(_coin)) => {
+                // Coin exists but is marked spent
+                None
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!(outpoint_hash = %outpoint.hash, outpoint_n = outpoint.n, error = %e, "get_coin DECODE ERROR");
+                None
+            }
         }
     }
 

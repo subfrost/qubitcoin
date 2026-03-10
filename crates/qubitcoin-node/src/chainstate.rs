@@ -22,7 +22,7 @@ use qubitcoin_consensus::params::ConsensusParams;
 use qubitcoin_consensus::validation_state::{BlockValidationResult, BlockValidationState};
 use qubitcoin_primitives::{ArithUint256, BlockHash};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 // Validation helpers -- imported from sibling module (created in parallel).
@@ -225,9 +225,14 @@ pub struct ChainstateManager {
     /// Hash of the assumed-valid block. Blocks at or below this height
     /// skip script verification during IBD, dramatically speeding up sync.
     assume_valid: Option<BlockHash>,
+    /// Height of the assumed-valid block. Used as a fast-path fallback
+    /// when the assume-valid header hasn't been synced yet (early IBD).
+    assume_valid_height: Option<i32>,
     /// Tracked best fully-validated tip (arena index + chain_work).
     /// Avoids O(N) linear scan of the entire block index on every block.
     best_valid_tip: Option<(usize, ArithUint256)>,
+    /// Arena indices of block index entries modified since the last flush.
+    dirty_indices: HashSet<usize>,
 }
 
 impl ChainstateManager {
@@ -245,7 +250,9 @@ impl ChainstateManager {
             stored_undos: HashMap::new(),
             block_reader: None,
             assume_valid: None,
+            assume_valid_height: None,
             best_valid_tip: None,
+            dirty_indices: HashSet::new(),
         }
     }
 
@@ -259,12 +266,14 @@ impl ChainstateManager {
     pub fn set_undo_pos(&mut self, hash: &BlockHash, undo_pos: u32) {
         if let Some(idx) = self.block_index.find_by_hash(hash) {
             self.block_index.get_mut(idx).undo_pos = undo_pos;
+            self.dirty_indices.insert(idx);
         }
     }
 
-    /// Set the assumed-valid block hash for IBD optimization.
-    pub fn set_assume_valid(&mut self, hash: BlockHash) {
+    /// Set the assumed-valid block hash and height for IBD optimization.
+    pub fn set_assume_valid(&mut self, hash: BlockHash, height: i32) {
         self.assume_valid = Some(hash);
+        self.assume_valid_height = Some(height);
     }
 
     /// Reset the active chain to the given arena index.
@@ -327,6 +336,12 @@ impl ChainstateManager {
     #[inline]
     pub fn block_index_mut(&mut self) -> &mut BlockMap {
         &mut self.block_index
+    }
+
+    /// Mark a block index entry as dirty (needs to be flushed to disk).
+    #[inline]
+    pub fn mark_dirty(&mut self, arena_idx: usize) {
+        self.dirty_indices.insert(arena_idx);
     }
 
     /// Access the UTXO cache.
@@ -450,19 +465,18 @@ impl ChainstateManager {
         Ok(())
     }
 
-    /// Get all block index entries that have been modified (have HAVE_DATA set).
+    /// Get block index entries modified since the last flush.
     /// Used for persisting the block index to disk.
     pub fn dirty_block_indices(&self) -> Vec<&BlockIndex> {
-        let mut result = Vec::new();
-        for i in 0..self.block_index.len() {
-            let entry = self.block_index.get(i);
-            if entry.status.contains(BlockStatus::HAVE_DATA)
-                || entry.is_valid(BlockStatus::VALID_TREE)
-            {
-                result.push(entry);
-            }
-        }
-        result
+        self.dirty_indices
+            .iter()
+            .map(|&i| self.block_index.get(i))
+            .collect()
+    }
+
+    /// Clear the dirty set after a successful flush.
+    pub fn clear_dirty(&mut self) {
+        self.dirty_indices.clear();
     }
 
     // -- Genesis block ------------------------------------------------------
@@ -504,6 +518,7 @@ impl ChainstateManager {
         let chain_work = index.chain_work;
         let arena_idx = self.block_index.insert(index);
         self.block_index.build_skip_pointer(arena_idx);
+        self.dirty_indices.insert(arena_idx);
 
         // Track as best valid tip.
         self.best_valid_tip = Some((arena_idx, chain_work));
@@ -601,6 +616,7 @@ impl ChainstateManager {
 
         let arena_idx = self.block_index.insert(index);
         self.block_index.build_skip_pointer(arena_idx);
+        self.dirty_indices.insert(arena_idx);
         Ok(arena_idx)
     }
 
@@ -627,15 +643,27 @@ impl ChainstateManager {
         // 1. Accept the header (idempotent if already known).
         let arena_idx = self.accept_block_header(&block.header)?;
 
-        // If the block is already fully validated, nothing more to do.
+        // If the block is already fully validated AND is in the active chain,
+        // nothing more to do. We check active chain membership to handle the
+        // case where crash recovery disconnected blocks but left VALID_SCRIPTS
+        // status — those blocks need to be re-connected to rebuild the UTXO.
         if self
             .block_index
             .get(arena_idx)
             .is_valid(BlockStatus::VALID_SCRIPTS)
         {
-            // Already connected -- check if it's the tip.
-            let on_active = self.active_chainstate.chain.tip() == Some(arena_idx);
-            return Ok((on_active, None));
+            let entry = self.block_index.get(arena_idx);
+            let in_active_chain = self
+                .active_chainstate
+                .chain
+                .get_block_index(entry.height)
+                == Some(arena_idx);
+            if in_active_chain {
+                let on_active = self.active_chainstate.chain.tip() == Some(arena_idx);
+                return Ok((on_active, None));
+            }
+            // Block has VALID_SCRIPTS but is not in active chain (crash recovery
+            // disconnected it). Fall through to re-connect it.
         }
 
         // 2. Context-free block body checks.
@@ -645,6 +673,7 @@ impl ChainstateManager {
                 .get_mut(arena_idx)
                 .status
                 .insert(BlockStatus::FAILED_VALID);
+            self.dirty_indices.insert(arena_idx);
             return Err(state);
         }
 
@@ -663,6 +692,7 @@ impl ChainstateManager {
             // Re-borrow mutably to set chain_tx_count -- we already read parent above.
             self.block_index.get_mut(arena_idx).chain_tx_count =
                 parent_chain_tx + block.vtx.len() as u64;
+            self.dirty_indices.insert(arena_idx);
         }
 
         // 3. Contextual block checks.
@@ -686,6 +716,7 @@ impl ChainstateManager {
                     .get_mut(arena_idx)
                     .status
                     .insert(BlockStatus::FAILED_VALID);
+                self.dirty_indices.insert(arena_idx);
                 return Err(state);
             }
         }
@@ -728,6 +759,7 @@ impl ChainstateManager {
                 .get_mut(arena_idx)
                 .status
                 .insert(BlockStatus::FAILED_VALID);
+            self.dirty_indices.insert(arena_idx);
             e
         })?;
 
@@ -744,6 +776,7 @@ impl ChainstateManager {
             .get_mut(arena_idx)
             .status
             .raise_validity(BlockStatus::VALID_SCRIPTS);
+        self.dirty_indices.insert(arena_idx);
         let work = self.block_index.get(arena_idx).chain_work;
         if self.best_valid_tip.map_or(true, |(_, bw)| work > bw) {
             self.best_valid_tip = Some((arena_idx, work));
@@ -891,6 +924,7 @@ impl ChainstateManager {
                             .get_mut(idx_at_h)
                             .status
                             .insert(BlockStatus::FAILED_VALID);
+                        self.dirty_indices.insert(idx_at_h);
                         e
                     })?;
                     self.stored_undos.insert(block_hash, undo);
@@ -898,6 +932,7 @@ impl ChainstateManager {
                         .get_mut(idx_at_h)
                         .status
                         .raise_validity(BlockStatus::VALID_SCRIPTS);
+                    self.dirty_indices.insert(idx_at_h);
                     let work = self.block_index.get(idx_at_h).chain_work;
                     if self.best_valid_tip.map_or(true, |(_, bw)| work > bw) {
                         self.best_valid_tip = Some((idx_at_h, work));
@@ -917,6 +952,7 @@ impl ChainstateManager {
                             .get_mut(idx_at_h)
                             .status
                             .insert(BlockStatus::FAILED_VALID);
+                        self.dirty_indices.insert(idx_at_h);
                         e
                     })?;
                     self.stored_undos.insert(block_hash, undo);
@@ -996,7 +1032,17 @@ impl ChainstateManager {
         // Check if the assume-valid block is in our index.
         let assume_idx = match self.block_index.find_by_hash(&assume_hash) {
             Some(idx) => idx,
-            None => return false, // Haven't seen the assume-valid block yet.
+            None => {
+                // Haven't seen the assume-valid header yet (early IBD,
+                // header sync hasn't reached that height).  Fall back to
+                // a height-based check so we can skip scripts immediately
+                // rather than waiting for header sync to catch up.
+                if let Some(av_height) = self.assume_valid_height {
+                    let block_height = self.block_index.get(arena_idx).height;
+                    return block_height < av_height;
+                }
+                return false;
+            }
         };
 
         // The block at arena_idx is an ancestor of assume_valid if
