@@ -74,6 +74,22 @@ pub trait NodeInterface: Send + Sync {
     /// or `Err` on validation failure.
     fn accept_block_header(&self, header_data: &[u8]) -> Result<bool, String>;
 
+    /// Accept a batch of block headers under a single lock acquisition.
+    ///
+    /// Returns a Vec of results, one per header. This avoids acquiring and
+    /// releasing the chainstate mutex 2000 times per header batch, which
+    /// causes contention with the block-processing thread.
+    fn accept_block_headers_batch(
+        &self,
+        headers: &[&[u8]],
+    ) -> Vec<Result<bool, String>> {
+        // Default implementation falls back to one-at-a-time.
+        headers
+            .iter()
+            .map(|h| self.accept_block_header(h))
+            .collect()
+    }
+
     /// Get the current chain tip height.
     fn chain_height(&self) -> i32;
 
@@ -272,6 +288,8 @@ pub struct NetProcessor {
     block_result_tx: mpsc::UnboundedSender<BlockProcessResult>,
     /// Whether a block is currently being processed on the blocking threadpool.
     block_processing: bool,
+    /// Whether we have started downloading blocks (prevents re-triggering).
+    block_download_started: bool,
 }
 
 /// Result of processing a single block on the blocking threadpool.
@@ -352,6 +370,7 @@ impl NetProcessor {
             block_result_rx,
             block_result_tx,
             block_processing: false,
+            block_download_started: false,
         }
     }
 
@@ -518,6 +537,29 @@ impl NetProcessor {
                     self.check_stalled_peers();
                     // Also try to start block processing if idle.
                     self.try_start_next_block();
+
+                    // Periodic diagnostic: detect stuck block processing.
+                    if !self.block_processing
+                        && self.next_process_idx < self.header_chain.len()
+                        && self.last_drain_time.elapsed() > std::time::Duration::from_secs(30)
+                    {
+                        let head_hash = self.header_chain[self.next_process_idx];
+                        let in_pending = self.pending_blocks.contains_key(&head_hash);
+                        let in_downloaded = self.blocks_downloaded.contains(&head_hash);
+                        let in_flight = self.peer_states.values().any(|s| {
+                            s.blocks_in_flight.iter().any(|(h, _)| *h == head_hash)
+                        });
+                        tracing::warn!(
+                            next_idx = self.next_process_idx,
+                            pending = in_pending,
+                            downloaded = in_downloaded,
+                            in_flight = in_flight,
+                            pending_count = self.pending_blocks.len(),
+                            to_download = self.blocks_to_download.len(),
+                            block_processing = self.block_processing,
+                            "block processing stalled diagnostic"
+                        );
+                    }
                 }
             }
         }
@@ -605,8 +647,11 @@ impl NetProcessor {
     /// and sends a getdata message.
     fn request_blocks(&mut self, peer_id: u64) {
         // Backpressure: stop downloading when pending blocks buffer is too large.
-        // At ~500 KB avg block size, 2000 pending blocks = ~1 GB memory.
-        if self.pending_blocks.len() > 2000 {
+        // At ~500 KB avg block size, 10000 pending blocks = ~5 GB memory.
+        // The limit needs to be high enough that out-of-order delivery from
+        // 14+ peers (each with 32 in-flight) doesn't trigger backpressure
+        // while the head-of-line block is still being served.
+        if self.pending_blocks.len() > 4000 {
             return;
         }
 
@@ -633,8 +678,14 @@ impl NetProcessor {
         let available = peer_limit - state.blocks_in_flight.len();
         let mut inv_list = Vec::new();
 
-        for _ in 0..available {
+        // Pop blocks from the download queue and assign to this peer.
+        // Skip blocks that are already downloaded (can happen after
+        // multi-peer head-of-line recovery), but don't count them
+        // against the available slots so we fill the peer's pipeline.
+        let mut pops = 0usize;
+        while inv_list.len() < available && pops < available + 64 {
             if let Some(hash) = self.blocks_to_download.pop_front() {
+                pops += 1;
                 if !self.blocks_downloaded.contains(&hash) {
                     state.blocks_in_flight.push((hash, Instant::now()));
                     inv_list.push(InvVect::new(
@@ -749,7 +800,7 @@ impl NetProcessor {
             .values()
             .filter(|s| s.handshake_complete && !s.discouraged)
             .count();
-        if active_peers < 4
+        if active_peers < 8
             && !self.blocks_to_download.is_empty()
             && self.last_reconnect_attempt.elapsed() > std::time::Duration::from_secs(30)
         {
@@ -863,27 +914,38 @@ impl NetProcessor {
         }
 
         // If the block is not in ANY peer's in-flight list, it may have been
-        // lost when a peer disconnected.  Re-queue it and request immediately.
+        // lost when a peer disconnected.  Send a direct getdata to ALL peers,
+        // bypassing request_blocks() which has backpressure that can deadlock
+        // when pending_blocks is full with higher-height blocks.
         if !in_any_flight {
-            self.blocks_to_download.push_front(head_hash);
             let peer_ids: Vec<u64> = self
                 .peer_states
                 .iter()
                 .filter(|(_, s)| {
                     s.handshake_complete
                         && !s.discouraged
-                        && s.blocks_in_flight.len() < MAX_BLOCKS_IN_TRANSIT_PER_PEER
+                        && s.blocks_in_flight.len() <= MAX_BLOCKS_IN_TRANSIT_PER_PEER
                 })
                 .map(|(&pid, _)| pid)
                 .collect();
             if !peer_ids.is_empty() {
-                tracing::debug!(
+                tracing::info!(
                     height = self.next_process_idx + 1,
                     peers = peer_ids.len(),
-                    "head-of-line block not in-flight, re-requesting"
+                    pending_blocks = self.pending_blocks.len(),
+                    "head-of-line block lost, direct-requesting from all peers"
                 );
-                for pid in peer_ids {
-                    self.request_blocks(pid);
+                let inv = vec![InvVect::new(
+                    InvType::WitnessBlock,
+                    qubitcoin_primitives::Uint256::from_bytes(*head_hash.data()),
+                )];
+                let msg = NetMessage::GetData(inv);
+                let payload = serialize_message(&msg);
+                for &pid in &peer_ids {
+                    if let Some(state) = self.peer_states.get_mut(&pid) {
+                        state.blocks_in_flight.push((head_hash, Instant::now()));
+                    }
+                    self.conn_manager.send_to_peer(pid, "getdata", payload.clone());
                 }
             }
             return;
@@ -943,29 +1005,45 @@ impl NetProcessor {
                 }
             }
         } else {
-            // Steal just the head-of-line block from slow peer.
+            // Steal head-of-line block from slow peer and request from ALL
+            // available peers simultaneously.  This dramatically reduces
+            // head-of-line blocking latency — whichever peer delivers first wins.
             if let Some(state) = self.peer_states.get_mut(&slow_pid) {
                 state.blocks_in_flight.retain(|(h, _)| *h != head_hash);
             }
 
-            if let Some(fast_pid) = fast_peer {
+            let fast_peers: Vec<u64> = self
+                .peer_states
+                .iter()
+                .filter(|(&pid, state)| {
+                    pid != slow_pid
+                        && state.handshake_complete
+                        && !state.discouraged
+                        && state.blocks_in_flight.len() <= MAX_BLOCKS_IN_TRANSIT_PER_PEER
+                })
+                .map(|(&pid, _)| pid)
+                .collect();
+
+            if !fast_peers.is_empty() {
                 tracing::debug!(
                     height = self.next_process_idx + 1,
                     slow_peer = slow_pid,
-                    fast_peer = fast_pid,
+                    fast_peers = fast_peers.len(),
                     stall_secs = stall_secs,
-                    "re-requesting stalled head-of-line block"
+                    "re-requesting stalled head-of-line block from all peers"
                 );
-                if let Some(state) = self.peer_states.get_mut(&fast_pid) {
-                    state.blocks_in_flight.push((head_hash, Instant::now()));
-                }
                 let inv = vec![InvVect::new(
                     InvType::WitnessBlock,
                     qubitcoin_primitives::Uint256::from_bytes(*head_hash.data()),
                 )];
                 let msg = NetMessage::GetData(inv);
                 let payload = serialize_message(&msg);
-                self.conn_manager.send_to_peer(fast_pid, "getdata", payload);
+                for &fast_pid in &fast_peers {
+                    if let Some(state) = self.peer_states.get_mut(&fast_pid) {
+                        state.blocks_in_flight.push((head_hash, Instant::now()));
+                    }
+                    self.conn_manager.send_to_peer(fast_pid, "getdata", payload.clone());
+                }
                 self.request_blocks(slow_pid);
             } else {
                 self.blocks_to_download.push_front(head_hash);
@@ -1233,41 +1311,48 @@ impl NetProcessor {
         if self.next_process_idx == 0 && tip_height_skip > 0 && !self.block_processing {
             self.next_process_idx = tip_height_skip;
         }
-        for header_data in headers {
+        // First pass: compute hashes and filter out duplicates.
+        // Collect new (unseen) headers with their indices for batch validation.
+        let mut new_headers: Vec<(usize, BlockHash, &[u8])> = Vec::new();
+        for (i, header_data) in headers.iter().enumerate() {
             if header_data.len() >= 80 {
-                // The block hash is SHA256d of the 80-byte header.
                 let hash_bytes = qubitcoin_crypto::hash::hash256(header_data);
                 let hash = BlockHash::from_bytes(hash_bytes);
-                // Only add if we haven't seen this header before.
                 if self.header_set.insert(hash) {
-                    // Validate the header and insert into block_index.
-                    match self.node.accept_block_header(&header_data[..80]) {
-                        Ok(_) => {
-                            self.header_chain.push(hash);
-                            // Queue block for download — skip blocks already on disk.
-                            let idx = self.header_chain.len() - 1;
-                            if idx >= tip_height_skip
-                                && !self.blocks_downloaded.contains(&hash)
-                            {
-                                self.blocks_to_download.push_back(hash);
-                            }
-                            self.total_headers += 1;
-                            new_count += 1;
+                    new_headers.push((i, hash, &header_data[..80]));
+                }
+            }
+        }
+
+        if !new_headers.is_empty() {
+            // Batch validate all new headers under a single chainstate lock.
+            let header_slices: Vec<&[u8]> =
+                new_headers.iter().map(|(_, _, data)| *data).collect();
+            let results = self.node.accept_block_headers_batch(&header_slices);
+
+            for (result, (_, hash, _)) in results.into_iter().zip(new_headers.iter()) {
+                match result {
+                    Ok(_) => {
+                        self.header_chain.push(*hash);
+                        let idx = self.header_chain.len() - 1;
+                        if idx >= tip_height_skip
+                            && !self.blocks_downloaded.contains(hash)
+                        {
+                            self.blocks_to_download.push_back(*hash);
                         }
-                        Err(reason) => {
-                            // Header failed validation — remove from set and
-                            // stop processing this batch. The peer sent an
-                            // invalid header chain.
-                            self.header_set.remove(&hash);
-                            tracing::warn!(
-                                peer_id = peer_id,
-                                hash = %hash,
-                                reason = %reason,
-                                "header rejected, stopping header processing"
-                            );
-                            self.misbehaving(peer_id, &format!("invalid header: {}", reason));
-                            return;
-                        }
+                        self.total_headers += 1;
+                        new_count += 1;
+                    }
+                    Err(reason) => {
+                        self.header_set.remove(hash);
+                        tracing::warn!(
+                            peer_id = peer_id,
+                            hash = %hash,
+                            reason = %reason,
+                            "header rejected, stopping header processing"
+                        );
+                        self.misbehaving(peer_id, &format!("invalid header: {}", reason));
+                        return;
                     }
                 }
             }
@@ -1297,6 +1382,13 @@ impl NetProcessor {
                 unique = self.header_chain.len(),
                 "header sync progress"
             );
+        }
+
+        // Progressive block download: start fetching blocks as soon as we have
+        // headers beyond our tip, don't wait for all headers to arrive.
+        if !self.block_download_started && !self.blocks_to_download.is_empty() {
+            self.block_download_started = true;
+            self.start_block_download();
         }
 
         // If we got a full batch, there are likely more -- request next batch.
@@ -1437,6 +1529,11 @@ impl NetProcessor {
         }
 
         if batch.is_empty() {
+            // Head-of-line block is not in pending_blocks.  Rather than
+            // waiting up to 500 ms for the stall checker tick, immediately
+            // check whether it needs to be re-requested.  This eliminates
+            // the average 250 ms detection delay after each batch.
+            self.check_head_of_line_stall();
             return;
         }
 

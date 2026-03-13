@@ -102,7 +102,11 @@ impl ChainParams {
             bip44_coin_type: 0,
             is_test_chain: false,
             minimum_chain_work: ConsensusParams::mainnet().minimum_chain_work,
-            assumed_valid_block: BlockHash::ZERO,
+            // Block 900,000 — skip script verification for all ancestor blocks.
+            assumed_valid_block: BlockHash::from_hex(
+                "000000000000000000010538edbfd2d5b809a33dd83f284aeea41c6d0d96968a",
+            )
+            .expect("valid assume-valid hash"),
         }
     }
 

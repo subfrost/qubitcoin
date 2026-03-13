@@ -210,7 +210,7 @@ impl NodeInterface for LiveNodeInterface {
             // Memory-bounded flush: trigger when block count threshold OR cache
             // size exceeds the -dbcache limit (default 1024 MiB).
             let cache_bytes = cs.coins_tip().dynamic_memory_usage();
-            let need_flush = *flush_count >= 10_000 || cache_bytes > self.dbcache_limit;
+            let need_flush = *flush_count >= 2_000 || cache_bytes > self.dbcache_limit;
 
             if need_flush {
                 let cache_mb = cache_bytes / (1024 * 1024);
@@ -247,6 +247,30 @@ impl NodeInterface for LiveNodeInterface {
             Ok(_) => Ok(true),
             Err(e) => Err(format!("{:?}", e)),
         }
+    }
+
+    fn accept_block_headers_batch(
+        &self,
+        headers: &[&[u8]],
+    ) -> Vec<Result<bool, String>> {
+        // Deserialize all headers first (no lock needed).
+        let parsed: Vec<Result<BlockHeader, String>> = headers
+            .iter()
+            .map(|h| deserialize(*h).map_err(|e| format!("header deserialize: {}", e)))
+            .collect();
+
+        // Single lock acquisition for the entire batch.
+        let mut cs = self.chainstate.lock();
+        parsed
+            .into_iter()
+            .map(|res| match res {
+                Ok(header) => match cs.accept_block_header(&header) {
+                    Ok(_) => Ok(true),
+                    Err(e) => Err(format!("{:?}", e)),
+                },
+                Err(e) => Err(e),
+            })
+            .collect()
     }
 
     fn process_transaction(&self, data: &[u8]) -> Result<bool, String> {
@@ -308,7 +332,11 @@ impl NodeInterface for LiveNodeInterface {
     }
 
     fn chain_height(&self) -> i32 {
-        self.chainstate.lock().height()
+        // Read from the lock-free NodeState instead of locking the chainstate
+        // mutex.  The chainstate mutex is held for seconds during connect_block,
+        // and chain_height is called from handle_headers on the event loop —
+        // locking here would block the entire event loop.
+        *self.node_state.chain_height.read()
     }
 
     fn add_address(&self, _addr: SocketAddr) {
@@ -804,7 +832,7 @@ async fn main() {
         ];
 
         let mut connected = 0usize;
-        let max_seed_connections = 8usize;
+        let max_seed_connections = 16usize;
 
         for seed in seeds {
             if connected >= max_seed_connections {

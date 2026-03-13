@@ -852,8 +852,31 @@ impl CoinsViewCache {
 
         let result = target.batch_write(&writes, &best_block);
         if result {
-            cache.clear();
-            self.usage.store(0, Ordering::Relaxed);
+            // Warm-cache optimization: instead of clearing the entire cache,
+            // remove spent entries and reset dirty flags on surviving entries.
+            // This keeps unspent coins in memory as a read cache, avoiding
+            // expensive RocksDB lookups after flush.  Matches Bitcoin Core's
+            // CCoinsViewCache::Flush behaviour.
+            // Warm-cache: retain unspent entries as a read cache, but cap
+            // at 512 MB to prevent unbounded memory growth.  Entries kept
+            // are marked clean so future flushes skip them.
+            const MAX_RETAINED_BYTES: u64 = 512 * 1024 * 1024;
+            let mut retained_usage: u64 = 0;
+            let pre_retain = cache.len();
+            cache.retain(|_, entry| {
+                if entry.coin.is_spent() {
+                    return false;
+                }
+                let coin_size = entry.coin.dynamic_memory_usage() as u64;
+                if retained_usage + coin_size > MAX_RETAINED_BYTES {
+                    return false;
+                }
+                entry.flags = CoinsCacheFlags::NONE;
+                retained_usage += coin_size;
+                true
+            });
+            self.usage.store(retained_usage, Ordering::Relaxed);
+            tracing::info!(pre_retain, retained_entries = cache.len(), retained_mb = retained_usage / (1024 * 1024), "flush_to: warm cache retained");
         } else {
             tracing::error!("flush_to: batch_write FAILED");
         }

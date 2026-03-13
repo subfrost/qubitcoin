@@ -31,7 +31,7 @@ pub const MAX_INV_SIZE: usize = 50_000;
 pub const MAX_HEADERS_RESULTS: usize = 2000;
 
 /// Maximum number of blocks we request from a single peer at once.
-pub const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
+pub const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 32;
 
 /// Maximum number of addresses in a single addr/addrv2 message.
 pub const MAX_ADDR_TO_SEND: usize = 1000;
@@ -49,9 +49,8 @@ pub const PING_INTERVAL: u64 = 2 * 60;
 pub const HEADERS_DOWNLOAD_TIMEOUT_BASE: u64 = 15 * 60;
 
 /// Block stalling timeout in seconds.
-/// Set high enough to avoid re-requesting blocks while process_block
-/// is doing heavy validation work (script checks, UTXO updates).
-pub const BLOCK_STALLING_TIMEOUT: u64 = 10;
+/// After this, the head-of-line block is reassigned to a faster peer.
+pub const BLOCK_STALLING_TIMEOUT: u64 = 8;
 
 /// Block download timeout base in seconds.
 /// Bitcoin Core uses pow_target_spacing (600s) * 1 = 600s.
