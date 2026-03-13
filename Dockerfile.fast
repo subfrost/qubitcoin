@@ -1,0 +1,27 @@
+# Fast deploy: uses pre-built binary from host
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -g 101 qubitcoin \
+    && useradd -r -u 101 -g qubitcoin -m -d /home/qubitcoin -s /bin/bash qubitcoin
+
+COPY .deploy/qubitcoind /usr/local/bin/
+COPY .deploy/qubitcoin-cli /usr/local/bin/
+COPY docker-entrypoint.sh /usr/local/bin/
+
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+EXPOSE 8333 8332 28332
+
+VOLUME /home/qubitcoin/.qubitcoin
+
+USER qubitcoin
+WORKDIR /home/qubitcoin
+
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["qubitcoind"]
