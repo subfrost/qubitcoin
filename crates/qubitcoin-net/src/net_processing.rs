@@ -651,7 +651,7 @@ impl NetProcessor {
         // The limit needs to be high enough that out-of-order delivery from
         // 14+ peers (each with 32 in-flight) doesn't trigger backpressure
         // while the head-of-line block is still being served.
-        if self.pending_blocks.len() > 4000 {
+        if self.pending_blocks.len() > 8000 {
             return;
         }
 

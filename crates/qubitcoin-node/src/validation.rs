@@ -348,6 +348,108 @@ pub fn check_tx_inputs(
     Ok(())
 }
 
+/// Like [`check_tx_inputs`] but uses pre-fetched coins instead of re-reading
+/// from the cache. This eliminates redundant RwLock + HashMap lookups when
+/// the caller has already fetched all input coins.
+fn check_tx_inputs_with_coins(
+    tx: &Transaction,
+    input_coins: &[Option<Coin>],
+    spend_height: i32,
+    tx_fee: &mut Amount,
+) -> Result<(), TxValidationState> {
+    if tx.is_coinbase() {
+        return Ok(());
+    }
+
+    let mut total_in = Amount::ZERO;
+
+    for coin_opt in input_coins {
+        let coin = match coin_opt {
+            Some(c) => c,
+            None => {
+                let mut state = TxValidationState::new();
+                state.invalid(
+                    TxValidationResult::MissingInputs,
+                    "bad-txns-inputs-missingorspent",
+                    "",
+                );
+                return Err(state);
+            }
+        };
+
+        if coin.is_spent() {
+            let mut state = TxValidationState::new();
+            state.invalid(
+                TxValidationResult::MissingInputs,
+                "bad-txns-inputs-missingorspent",
+                "",
+            );
+            return Err(state);
+        }
+
+        if coin.coinbase {
+            let maturity = spend_height - coin.height as i32;
+            if maturity < COINBASE_MATURITY {
+                let mut state = TxValidationState::new();
+                state.invalid(
+                    TxValidationResult::Consensus,
+                    "bad-txns-premature-spend-of-coinbase",
+                    &format!("tried to spend coinbase at depth {}", maturity),
+                );
+                return Err(state);
+            }
+        }
+
+        if !money_range(coin.tx_out.value.to_sat()) {
+            let mut state = TxValidationState::new();
+            state.invalid(
+                TxValidationResult::Consensus,
+                "bad-txns-inputvalues-outofrange",
+                "",
+            );
+            return Err(state);
+        }
+
+        total_in += coin.tx_out.value;
+
+        if !money_range(total_in.to_sat()) {
+            let mut state = TxValidationState::new();
+            state.invalid(
+                TxValidationResult::Consensus,
+                "bad-txns-inputvalues-outofrange",
+                "",
+            );
+            return Err(state);
+        }
+    }
+
+    let total_out = tx.get_value_out();
+
+    if total_in < total_out {
+        let mut state = TxValidationState::new();
+        state.invalid(
+            TxValidationResult::Consensus,
+            "bad-txns-in-belowout",
+            &format!(
+                "value in ({}) < value out ({})",
+                total_in.to_sat(),
+                total_out.to_sat()
+            ),
+        );
+        return Err(state);
+    }
+
+    let fee = total_in - total_out;
+    if !money_range(fee.to_sat()) {
+        let mut state = TxValidationState::new();
+        state.invalid(TxValidationResult::Consensus, "bad-txns-fee-outofrange", "");
+        return Err(state);
+    }
+
+    *tx_fee = fee;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 2. CheckBlockHeader
 // ---------------------------------------------------------------------------
@@ -1080,14 +1182,36 @@ pub fn connect_block(
     let block_hash = block.block_hash();
     let script_flags = get_block_script_flags(height, &block_hash, params);
 
+    // Prefetch all input coins for the entire block into the cache.
+    // This issues a single RocksDB multi_get for all cache misses instead
+    // of individual reads per input. Intra-block spends won't be in the
+    // UTXO DB but will be added to the cache by add_coins during processing.
+    {
+        let all_input_outpoints: Vec<OutPoint> = block
+            .vtx
+            .iter()
+            .filter(|tx| !tx.is_coinbase())
+            .flat_map(|tx| tx.vin.iter().map(|input| input.prevout.clone()))
+            .collect();
+        view.prefetch_coins(&all_input_outpoints);
+    }
+
     for tx in &block.vtx {
         // Validate inputs for non-coinbase transactions.
         if !tx.is_coinbase() {
+            // Fetch all input coins once for this transaction. After the
+            // block-level prefetch above, these should all be cache hits.
+            let input_coins: Vec<Option<Coin>> = tx
+                .vin
+                .iter()
+                .map(|input| view.fetch_coin(&input.prevout))
+                .collect();
+
+            // --- Fee validation (check_tx_inputs inlined with prefetched coins) ---
             let mut tx_fee = Amount::ZERO;
-            match check_tx_inputs(tx, view, height, &mut tx_fee) {
+            match check_tx_inputs_with_coins(tx, &input_coins, height, &mut tx_fee) {
                 Ok(()) => {
                     total_fees += tx_fee;
-                    // Check accumulated fee overflow (matches Bitcoin Core).
                     if !money_range(total_fees.to_sat()) {
                         let mut block_state = BlockValidationState::new();
                         block_state.invalid(
@@ -1109,22 +1233,13 @@ pub fn connect_block(
                 }
             }
 
-            // BIP68: Check that sequence locks are satisfied.
+            // BIP68: Check that sequence locks are satisfied using prefetched coins.
             if locktime_flags != 0 {
-                let mut prev_heights: Vec<i32> = tx
-                    .vin
+                let mut prev_heights: Vec<i32> = input_coins
                     .iter()
-                    .map(|input| {
-                        view.fetch_coin(&input.prevout)
-                            .map(|c| c.height as i32)
-                            .unwrap_or(0)
-                    })
+                    .map(|c| c.as_ref().map(|coin| coin.height as i32).unwrap_or(0))
                     .collect();
 
-                // For sequence lock evaluation we need the MTP at a given
-                // height.  When the caller supplies a real MTP function
-                // (backed by the block-index arena) we use it; otherwise
-                // fall back to the block's own header time.
                 let block_time = block.header.time as i64;
                 let mtp_at = |h: i32| -> i64 {
                     if let Some(f) = mtp_at_height {
@@ -1137,7 +1252,6 @@ pub fn connect_block(
                 let locks =
                     calculate_sequence_locks(tx, locktime_flags, &mut prev_heights, height, mtp_at);
 
-                // Evaluate: the lock pair must be less than the block values.
                 if locks.height >= height || locks.time >= block_time {
                     let mut block_state = BlockValidationState::new();
                     block_state.invalid(
@@ -1148,16 +1262,48 @@ pub fn connect_block(
                     return Err(block_state);
                 }
             }
-        }
 
-        // Accumulate sigop cost for all transactions (coinbase + non-coinbase).
-        {
+            // Sigop cost uses prefetched coins for script_pubkey lookup.
+            {
+                let flags_u32 = script_flags.bits();
+                let sigop_cost = qubitcoin_consensus::check::get_transaction_sigop_cost(
+                    tx,
+                    flags_u32,
+                    |outpoint| {
+                        // Find the matching input coin from our prefetched set.
+                        tx.vin
+                            .iter()
+                            .zip(input_coins.iter())
+                            .find(|(inp, _)| &inp.prevout == outpoint)
+                            .and_then(|(_, coin)| coin.as_ref())
+                            .map(|c| c.tx_out.script_pubkey.clone())
+                    },
+                );
+                n_sigops_cost += sigop_cost;
+                if n_sigops_cost > qubitcoin_consensus::check::MAX_BLOCK_SIGOPS_COST as i64 {
+                    let mut state = BlockValidationState::new();
+                    state.invalid(
+                        BlockValidationResult::Consensus,
+                        "bad-blk-sigops",
+                        "too many sigops",
+                    );
+                    return Err(state);
+                }
+            }
+
+            // Capture undo data and spend inputs using prefetched coins.
+            let mut tx_undo = TxUndo::with_capacity(tx.vin.len());
+            for (i, input) in tx.vin.iter().enumerate() {
+                let coin = input_coins[i].clone().unwrap_or_else(Coin::empty);
+                tx_undo.prev_coins.push(coin);
+                view.spend_coin(&input.prevout);
+            }
+            block_undo.tx_undo.push(tx_undo);
+        } else {
+            // Coinbase: sigop cost only (no input validation).
             let flags_u32 = script_flags.bits();
             let sigop_cost =
-                qubitcoin_consensus::check::get_transaction_sigop_cost(tx, flags_u32, |outpoint| {
-                    view.fetch_coin(outpoint)
-                        .map(|c| c.tx_out.script_pubkey.clone())
-                });
+                qubitcoin_consensus::check::get_transaction_sigop_cost(tx, flags_u32, |_| None);
             n_sigops_cost += sigop_cost;
             if n_sigops_cost > qubitcoin_consensus::check::MAX_BLOCK_SIGOPS_COST as i64 {
                 let mut state = BlockValidationState::new();
@@ -1168,26 +1314,6 @@ pub fn connect_block(
                 );
                 return Err(state);
             }
-        }
-
-        // For non-coinbase transactions: capture undo data, then spend inputs.
-        // This is done BEFORE adding outputs, matching Bitcoin Core's UpdateCoins
-        // order (spend first, then add) to handle edge cases correctly.
-        if !tx.is_coinbase() {
-            let mut tx_undo = TxUndo::with_capacity(tx.vin.len());
-            for input in &tx.vin {
-                // Fetch the coin *before* spending it so we can record it in
-                // the undo data. The coin is guaranteed to exist because
-                // check_tx_inputs already verified it above.
-                let coin = view.fetch_coin(&input.prevout).unwrap_or_else(|| {
-                    // Should never happen after check_tx_inputs, but
-                    // provide a safe fallback.
-                    Coin::empty()
-                });
-                tx_undo.prev_coins.push(coin);
-                view.spend_coin(&input.prevout);
-            }
-            block_undo.tx_undo.push(tx_undo);
         }
 
         // Add outputs to the UTXO set (after spending inputs, matching Bitcoin Core).

@@ -88,6 +88,26 @@ impl<D: Database> DbWrapper<D> {
         }
     }
 
+    /// Read multiple typed values in a single batch operation.
+    pub fn multi_read<V: Decodable>(&self, keys: &[Vec<u8>]) -> Vec<Result<Option<V>, DbWrapperError>> {
+        let key_refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+        self.db
+            .multi_read(&key_refs)
+            .into_iter()
+            .map(|result| {
+                match result.map_err(|e| DbWrapperError::Db(e.to_string()))? {
+                    Some(mut raw) => {
+                        self.xor_bytes(&mut raw);
+                        let value = V::decode(&mut Cursor::new(&raw))
+                            .map_err(DbWrapperError::Serialize)?;
+                        Ok(Some(value))
+                    }
+                    None => Ok(None),
+                }
+            })
+            .collect()
+    }
+
     /// Check if a key exists in the database.
     pub fn exists<K: AsRef<[u8]>>(&self, key: K) -> Result<bool, DbWrapperError> {
         self.db

@@ -530,6 +530,14 @@ pub trait CoinsView: Send + Sync {
     /// Retrieve the block hash whose state this view currently represents.
     fn get_best_block(&self) -> BlockHash;
 
+    /// Batch-fetch multiple coins in a single operation.
+    ///
+    /// Default implementation falls back to individual `get_coin` calls.
+    /// Database-backed views override this with a true multi-get.
+    fn get_coins(&self, outpoints: &[OutPoint]) -> Vec<Option<Coin>> {
+        outpoints.iter().map(|op| self.get_coin(op)).collect()
+    }
+
     /// Estimate the size of this view's backing store in bytes.
     ///
     /// Returns 0 if not implemented or not applicable.
@@ -605,6 +613,49 @@ impl CoinsViewCache {
     /// Get the approximate dynamic memory usage of cached coins.
     pub fn dynamic_memory_usage(&self) -> u64 {
         self.usage.load(Ordering::Relaxed)
+    }
+
+    /// Batch-prefetch coins into the cache.
+    ///
+    /// Checks the cache for each outpoint; any misses are fetched from the
+    /// base view in a single `get_coins` call (which maps to RocksDB
+    /// `multi_get` in production) and inserted into the cache.
+    pub fn prefetch_coins(&self, outpoints: &[OutPoint]) {
+        // Determine which outpoints are not yet cached.
+        let miss_outpoints: Vec<OutPoint> = {
+            let cache = self.cache.read();
+            outpoints
+                .iter()
+                .filter(|op| !cache.contains_key(op))
+                .cloned()
+                .collect()
+        };
+
+        if miss_outpoints.is_empty() {
+            return;
+        }
+
+        // Batch-fetch from the base view (multi_get in RocksDB).
+        let results = self.base.get_coins(&miss_outpoints);
+
+        // Insert fetched coins into the cache with a single write-lock.
+        let mut cache = self.cache.write();
+        let mut added_usage: u64 = 0;
+        for (outpoint, maybe_coin) in miss_outpoints.into_iter().zip(results) {
+            if cache.contains_key(&outpoint) {
+                continue; // Another thread inserted it.
+            }
+            if let Some(coin) = maybe_coin {
+                if !coin.is_spent() {
+                    added_usage += coin.dynamic_memory_usage() as u64;
+                    cache.insert(outpoint, CoinsCacheEntry::clean(coin));
+                }
+            }
+        }
+        drop(cache);
+        if added_usage > 0 {
+            self.usage.fetch_add(added_usage, Ordering::Relaxed);
+        }
     }
 
     /// Look up a coin, first in the cache, then in the base view.
@@ -860,7 +911,7 @@ impl CoinsViewCache {
             // Warm-cache: retain unspent entries as a read cache, but cap
             // at 512 MB to prevent unbounded memory growth.  Entries kept
             // are marked clean so future flushes skip them.
-            const MAX_RETAINED_BYTES: u64 = 512 * 1024 * 1024;
+            const MAX_RETAINED_BYTES: u64 = 1024 * 1024 * 1024;
             let mut retained_usage: u64 = 0;
             let pre_retain = cache.len();
             cache.retain(|_, entry| {
@@ -1092,6 +1143,28 @@ impl<D: Database> CoinsView for CoinsViewDB<D> {
                 None
             }
         }
+    }
+
+    fn get_coins(&self, outpoints: &[OutPoint]) -> Vec<Option<Coin>> {
+        let keys: Vec<Vec<u8>> = outpoints.iter().map(|op| coin_db_key(op)).collect();
+        self.db
+            .multi_read::<Coin>(&keys)
+            .into_iter()
+            .enumerate()
+            .map(|(i, result)| match result {
+                Ok(Some(coin)) if !coin.is_spent() => Some(coin),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::error!(
+                        outpoint_hash = %outpoints[i].hash,
+                        outpoint_n = outpoints[i].n,
+                        error = %e,
+                        "get_coins DECODE ERROR"
+                    );
+                    None
+                }
+            })
+            .collect()
     }
 
     fn get_best_block(&self) -> BlockHash {
@@ -1906,7 +1979,12 @@ mod tests {
         assert_eq!(coin.height, 42);
         assert_eq!(db_view.get_best_block(), BlockHash::from_bytes([0xee; 32]));
 
-        // Cache should be cleared.
-        assert_eq!(cache.cache_size(), 0);
+        // Warm-cache: unspent coins are retained as a clean read cache.
+        assert_eq!(cache.cache_size(), 1);
+        // The retained entry should have NONE flags (clean).
+        assert_eq!(
+            cache.get_entry_flags(&outpoint),
+            Some(CoinsCacheFlags::NONE)
+        );
     }
 }

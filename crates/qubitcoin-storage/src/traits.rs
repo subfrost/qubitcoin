@@ -22,6 +22,12 @@ pub trait Database: Send + Sync {
     /// Read a value by key. Returns None if key doesn't exist.
     fn read(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
 
+    /// Read multiple keys in a single batch operation.
+    /// Returns results in the same order as the input keys.
+    fn multi_read(&self, keys: &[&[u8]]) -> Vec<Result<Option<Vec<u8>>, Self::Error>> {
+        keys.iter().map(|k| self.read(k)).collect()
+    }
+
     /// Check if a key exists.
     fn exists(&self, key: &[u8]) -> Result<bool, Self::Error>;
 
