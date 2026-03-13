@@ -1,4 +1,3 @@
-use crate::types::VulnType;
 use bitcoin::blockdata::opcodes::all as op;
 use bitcoin::blockdata::script::Instruction;
 use bitcoin::Script;

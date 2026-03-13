@@ -85,17 +85,34 @@ impl RocksDatabase {
         opts.increase_parallelism(8);
         opts.set_max_background_jobs(8);
 
-        // Block cache for read-heavy UTXO lookups — critical for IBD performance.
-        let block_cache_mb = std::cmp::max(cache_size_mb / 2, 64);
+        // Write buffer (memtable): 64 MB is optimal for IBD batch writes.
+        // Larger values delay compaction but create huge SST files.
+        let write_buf_mb = std::cmp::min(cache_size_mb, 64);
+        opts.set_write_buffer_size(write_buf_mb * 1024 * 1024);
+        // Allow 3 memtables before stalling writes (default is 2).
+        opts.set_max_write_buffer_number(3);
+        // Trigger L0 compaction after 4 files (default).
+        opts.set_level_zero_file_num_compaction_trigger(4);
+
+        // Block cache for read-heavy UTXO lookups.
+        // Cap at 512 MB to avoid OOM on constrained VMs (the UTXO in-memory
+        // cache already provides fast reads for hot entries).
+        let block_cache_mb = std::cmp::min(
+            std::cmp::max(cache_size_mb.saturating_sub(write_buf_mb), 64),
+            512,
+        );
         let mut block_opts = rocksdb::BlockBasedOptions::default();
         block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(block_cache_mb * 1024 * 1024));
         // Bloom filter eliminates ~99% of unnecessary disk reads for missing keys.
         block_opts.set_bloom_filter(10.0, false);
         opts.set_block_based_table_factory(&block_opts);
 
-        // Parallel compaction to reduce write stalls during IBD.
-        opts.increase_parallelism(4);
-        opts.set_max_background_jobs(4);
+        // Moderate parallelism: 2 threads avoids overwhelming slow virtual disks
+        // while still allowing concurrent compaction + flush.
+        opts.increase_parallelism(2);
+        opts.set_max_background_jobs(2);
+        // Rate-limit compaction I/O to prevent disk saturation (64 MB/s).
+        opts.set_ratelimiter(64 * 1024 * 1024, 100_000, 10);
 
         let db = rocksdb::DB::open(&opts, path)?;
         Ok(RocksDatabase { db })

@@ -61,16 +61,22 @@ fn outpoint_height_ptr(op_key: &[u8]) -> IndexPointer {
     base.keyword("/height")
 }
 
-fn outpoint_score_ptr(op_key: &[u8]) -> IndexPointer {
-    let mut base = IndexPointer::from_keyword("/qday/outpoints/");
-    base = base.select(&op_key.to_vec());
-    base.keyword("/score")
-}
-
 fn outpoint_pubkey_ptr(op_key: &[u8]) -> IndexPointer {
     let mut base = IndexPointer::from_keyword("/qday/outpoints/");
     base = base.select(&op_key.to_vec());
     base.keyword("/pubkey")
+}
+
+fn outpoint_coinbase_ptr(op_key: &[u8]) -> IndexPointer {
+    let mut base = IndexPointer::from_keyword("/qday/outpoints/");
+    base = base.select(&op_key.to_vec());
+    base.keyword("/coinbase")
+}
+
+fn outpoint_pkh_ptr(op_key: &[u8]) -> IndexPointer {
+    let mut base = IndexPointer::from_keyword("/qday/outpoints/");
+    base = base.select(&op_key.to_vec());
+    base.keyword("/pkh")
 }
 
 fn scored_list_ptr() -> IndexPointer {
@@ -78,13 +84,26 @@ fn scored_list_ptr() -> IndexPointer {
 }
 
 fn exposed_keys_ptr(pubkey_hash: &[u8; 20]) -> IndexPointer {
-    let mut base = IndexPointer::from_keyword("/qday/exposed_keys/");
+    let base = IndexPointer::from_keyword("/qday/exposed_keys/");
     base.select(&pubkey_hash.to_vec())
+}
+
+fn pkh_outpoints_ptr(pkh: &[u8; 20]) -> IndexPointer {
+    let base = IndexPointer::from_keyword("/qday/pkh_outpoints/");
+    base.select(&pkh.to_vec())
 }
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Recompute score dynamically at query time.
+fn recompute_score(op_key: &[u8], current_height: u32) -> u16 {
+    let creation_height: u32 = outpoint_height_ptr(op_key).get_value();
+    let value: u64 = outpoint_value_ptr(op_key).get_value();
+    let is_coinbase: u8 = outpoint_coinbase_ptr(op_key).get_value();
+    compute_score(creation_height, current_height, value, is_coinbase != 0)
+}
 
 /// Add a vulnerable outpoint to the index.
 fn add_vulnerable(
@@ -93,17 +112,15 @@ fn add_vulnerable(
     value: u64,
     vtype: VulnType,
     height: u32,
-    current_height: u32,
     pubkey: &[u8],
     is_coinbase: bool,
 ) {
     let op_key = outpoint_key(txid, vout);
-    let score = compute_score(height, current_height, value, is_coinbase);
 
     outpoint_value_ptr(&op_key).set_value(value);
     outpoint_vtype_ptr(&op_key).set_value(vtype as u8);
     outpoint_height_ptr(&op_key).set_value(height);
-    outpoint_score_ptr(&op_key).set_value(score);
+    outpoint_coinbase_ptr(&op_key).set_value(is_coinbase as u8);
     outpoint_pubkey_ptr(&op_key).set(std::sync::Arc::new(pubkey.to_vec()));
 
     // Append to scored list
@@ -132,25 +149,34 @@ fn remove_vulnerable(op_key: &[u8]) {
         return; // Not tracked
     }
 
-    // Decrement counters
-    let count: u64 = vuln_count_ptr().get_value();
-    vuln_count_ptr().set_value(count.saturating_sub(1));
+    // Only decrement counters for real vulnerable types (0=P2PK, 1=ExposedP2PKH, 2=P2TR)
+    // Skip sentinel vtype=255 (tracked-but-not-vulnerable P2PKH)
+    if vtype <= 2 {
+        let count: u64 = vuln_count_ptr().get_value();
+        vuln_count_ptr().set_value(count.saturating_sub(1));
 
-    let total: u64 = vuln_total_sats_ptr().get_value();
-    vuln_total_sats_ptr().set_value(total.saturating_sub(value));
+        let total: u64 = vuln_total_sats_ptr().get_value();
+        vuln_total_sats_ptr().set_value(total.saturating_sub(value));
 
-    let tc: u64 = type_count_ptr(vtype).get_value();
-    type_count_ptr(vtype).set_value(tc.saturating_sub(1));
+        let tc: u64 = type_count_ptr(vtype).get_value();
+        type_count_ptr(vtype).set_value(tc.saturating_sub(1));
 
-    let ts: u64 = type_sats_ptr(vtype).get_value();
-    type_sats_ptr(vtype).set_value(ts.saturating_sub(value));
+        let ts: u64 = type_sats_ptr(vtype).get_value();
+        type_sats_ptr(vtype).set_value(ts.saturating_sub(value));
+    }
 
     // Zero out the outpoint data
     outpoint_value_ptr(op_key).set_value(0u64);
     outpoint_vtype_ptr(op_key).set_value(0u8);
     outpoint_height_ptr(op_key).set_value(0u32);
-    outpoint_score_ptr(op_key).set_value(0u16);
+    outpoint_coinbase_ptr(op_key).set_value(0u8);
     outpoint_pubkey_ptr(op_key).set(std::sync::Arc::new(vec![]));
+
+    // Clean up pkh reverse mapping
+    let pkh_data = outpoint_pkh_ptr(op_key).get();
+    if pkh_data.len() == 20 {
+        outpoint_pkh_ptr(op_key).set(std::sync::Arc::new(vec![]));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -180,7 +206,7 @@ pub extern "C" fn _start() {
     let is_first_tx_coinbase = true;
 
     // Phase 1: Scan all inputs to extract pubkeys from P2PKH spends.
-    // This reveals public keys that were previously hidden behind hashes.
+    // When a pubkey is FIRST exposed, retroactively mark existing P2PKH UTXOs.
     for tx in block.txdata.iter() {
         if tx.is_coinbase() {
             continue;
@@ -192,15 +218,42 @@ pub extern "C" fn _start() {
                 let existing: u32 = exposed_keys_ptr(&pkh).get_value();
                 if existing == 0 {
                     exposed_keys_ptr(&pkh).set_value(height);
+
+                    // Retroactively promote existing P2PKH UTXOs for this pkh
+                    let list_len: u32 = pkh_outpoints_ptr(&pkh).length();
+                    for idx in 0..list_len {
+                        let op_data = pkh_outpoints_ptr(&pkh).select_index(idx).get();
+                        if op_data.len() < 36 {
+                            continue;
+                        }
+                        let val: u64 = outpoint_value_ptr(&op_data).get_value();
+                        if val == 0 {
+                            continue; // Already spent
+                        }
+                        let vt: u8 = outpoint_vtype_ptr(&op_data).get_value();
+                        if vt != 255 {
+                            continue; // Already promoted or different type
+                        }
+                        // Update vtype from sentinel to ExposedP2PKH
+                        // We directly update rather than calling add_vulnerable to avoid
+                        // double-appending to scored_list (it was already appended as sentinel)
+                        outpoint_vtype_ptr(&op_data).set_value(VulnType::ExposedP2PKH as u8);
+                        outpoint_pubkey_ptr(&op_data).set(std::sync::Arc::new(pkh.to_vec()));
+
+                        // Now add to aggregate counters (sentinel wasn't counted)
+                        let count: u64 = vuln_count_ptr().get_value();
+                        vuln_count_ptr().set_value(count + 1);
+                        let total: u64 = vuln_total_sats_ptr().get_value();
+                        vuln_total_sats_ptr().set_value(total + val);
+                        let tc: u64 = type_count_ptr(VulnType::ExposedP2PKH as u8).get_value();
+                        type_count_ptr(VulnType::ExposedP2PKH as u8).set_value(tc + 1);
+                        let ts: u64 = type_sats_ptr(VulnType::ExposedP2PKH as u8).get_value();
+                        type_sats_ptr(VulnType::ExposedP2PKH as u8).set_value(ts + val);
+                    }
                 }
             }
         }
     }
-
-    // Phase 2: Check if any tracked P2PKH UTXOs are now exposed.
-    // (This would require iterating all P2PKH UTXOs, which is expensive.
-    // Instead, we handle this in Phase 3 by checking at insertion time
-    // whether the pubkey hash is already in exposed_keys.)
 
     // Phase 3: Scan outputs for vulnerable types.
     for (tx_idx, tx) in block.txdata.iter().enumerate() {
@@ -224,7 +277,6 @@ pub extern "C" fn _start() {
                     value,
                     VulnType::P2PK,
                     height,
-                    height,
                     &pubkey,
                     is_coinbase,
                 );
@@ -239,15 +291,20 @@ pub extern "C" fn _start() {
                     value,
                     VulnType::P2TR,
                     height,
-                    height,
                     &xonly_key,
                     is_coinbase,
                 );
                 continue;
             }
 
-            // Check P2PKH with already-exposed key
+            // Check P2PKH — track ALL P2PKH outputs
             if let Some(pkh) = is_p2pkh(script) {
+                let op_key = outpoint_key(&txid_bytes, vout as u32);
+
+                // Always track: append to pkh_outpoints list and store reverse mapping
+                pkh_outpoints_ptr(&pkh).append(std::sync::Arc::new(op_key.clone()));
+                outpoint_pkh_ptr(&op_key).set(std::sync::Arc::new(pkh.to_vec()));
+
                 let exposed_height: u32 = exposed_keys_ptr(&pkh).get_value();
                 if exposed_height > 0 {
                     // The pubkey for this address was previously revealed
@@ -257,10 +314,19 @@ pub extern "C" fn _start() {
                         value,
                         VulnType::ExposedP2PKH,
                         height,
-                        height,
-                        &pkh, // store the hash; full pubkey was in a prior tx
+                        &pkh,
                         is_coinbase,
                     );
+                } else {
+                    // Not yet exposed — store with sentinel vtype=255
+                    // so we can promote later if the key gets exposed
+                    outpoint_value_ptr(&op_key).set_value(value);
+                    outpoint_vtype_ptr(&op_key).set_value(255u8);
+                    outpoint_height_ptr(&op_key).set_value(height);
+                    outpoint_coinbase_ptr(&op_key).set_value(is_coinbase as u8);
+                    // Append to scored list so view functions can find it
+                    // (they'll skip it via value==0 check or vtype filter)
+                    scored_list_ptr().append(std::sync::Arc::new(op_key));
                 }
             }
         }
@@ -294,7 +360,7 @@ pub extern "C" fn _start() {
 
 /// Returns total vulnerable BTC stats.
 #[no_mangle]
-pub extern "C" fn total_vulnerable_btc() -> u32 {
+pub extern "C" fn total_vulnerable_btc() -> i32 {
     initialize();
     let total_sats: u64 = vuln_total_sats_ptr().get_value();
     let count: u64 = vuln_count_ptr().get_value();
@@ -305,7 +371,7 @@ pub extern "C" fn total_vulnerable_btc() -> u32 {
 
 /// Returns breakdown by vulnerability type.
 #[no_mangle]
-pub extern "C" fn vulnerable_stats() -> u32 {
+pub extern "C" fn vulnerable_stats() -> i32 {
     initialize();
     let mut by_type = Vec::new();
     for vt in 0u8..=2 {
@@ -328,7 +394,7 @@ pub extern "C" fn vulnerable_stats() -> u32 {
 
 /// Simulates seizing all outputs above a score threshold.
 #[no_mangle]
-pub extern "C" fn simulate_seize() -> u32 {
+pub extern "C" fn simulate_seize() -> i32 {
     initialize();
     let data = input();
     let req = match qday::SimulateSeizeRequest::decode(data.as_slice()) {
@@ -336,6 +402,7 @@ pub extern "C" fn simulate_seize() -> u32 {
         Err(_) => return export_bytes(vec![]),
     };
     let threshold = req.threshold as u16;
+    let current_height: u32 = height_ptr().get_value();
 
     let list_len: u32 = scored_list_ptr().length();
     let mut seized_sats: u64 = 0;
@@ -352,7 +419,11 @@ pub extern "C" fn simulate_seize() -> u32 {
         if value == 0 {
             continue; // Already spent
         }
-        let score: u16 = outpoint_score_ptr(&op_data).get_value();
+        let vtype: u8 = outpoint_vtype_ptr(&op_data).get_value();
+        if vtype > 2 {
+            continue; // Skip sentinel (non-vulnerable) entries
+        }
+        let score = recompute_score(&op_data, current_height);
 
         if score >= threshold {
             seized_sats += value;
@@ -379,13 +450,14 @@ pub extern "C" fn simulate_seize() -> u32 {
 
 /// Enumerate outpoints with pagination and minimum score filter.
 #[no_mangle]
-pub extern "C" fn enumerate_outpoints() -> u32 {
+pub extern "C" fn enumerate_outpoints() -> i32 {
     initialize();
     let data = input();
     let req = match qday::EnumerateRequest::decode(data.as_slice()) {
         Ok(r) => r,
         Err(_) => return export_bytes(vec![]),
     };
+    let current_height: u32 = height_ptr().get_value();
 
     let list_len: u32 = scored_list_ptr().length();
     let mut outpoints = Vec::new();
@@ -407,7 +479,12 @@ pub extern "C" fn enumerate_outpoints() -> u32 {
             continue;
         }
 
-        let score: u16 = outpoint_score_ptr(&op_data).get_value();
+        let vtype: u8 = outpoint_vtype_ptr(&op_data).get_value();
+        if vtype > 2 {
+            continue; // Skip sentinel entries
+        }
+
+        let score = recompute_score(&op_data, current_height);
         if (score as u32) < req.min_score {
             continue;
         }
@@ -422,7 +499,6 @@ pub extern "C" fn enumerate_outpoints() -> u32 {
             None => continue,
         };
 
-        let vtype: u8 = outpoint_vtype_ptr(&op_data).get_value();
         let height: u32 = outpoint_height_ptr(&op_data).get_value();
 
         outpoints.push(qday::OutpointInfo {
@@ -442,7 +518,7 @@ pub extern "C" fn enumerate_outpoints() -> u32 {
 
 /// Get details for a specific outpoint.
 #[no_mangle]
-pub extern "C" fn outpoint_details() -> u32 {
+pub extern "C" fn outpoint_details() -> i32 {
     initialize();
     let data = input();
     let req = match qday::OutpointDetailsRequest::decode(data.as_slice()) {
@@ -455,11 +531,12 @@ pub extern "C" fn outpoint_details() -> u32 {
         txid.copy_from_slice(&req.txid);
     }
     let op_key = outpoint_key(&txid, req.vout);
+    let current_height: u32 = height_ptr().get_value();
 
     let value: u64 = outpoint_value_ptr(&op_key).get_value();
     let vtype: u8 = outpoint_vtype_ptr(&op_key).get_value();
     let height: u32 = outpoint_height_ptr(&op_key).get_value();
-    let score: u16 = outpoint_score_ptr(&op_key).get_value();
+    let score = recompute_score(&op_key, current_height);
     let pubkey = outpoint_pubkey_ptr(&op_key).get();
 
     let resp = qday::OutpointDetailsResponse {
