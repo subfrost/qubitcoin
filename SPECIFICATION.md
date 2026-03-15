@@ -228,7 +228,86 @@ Block data stored in `blk*.dat` files with 128 MB rotation, matching Bitcoin Cor
 - Taproot key-path signing (BIP341)
 - PSBT support (BIP174)
 
-## 7. RPC Interface
+## 7. Secondary Indexer Runtime
+
+### Overview
+
+Qubitcoind embeds a metashrew-compatible WASM runtime for running secondary indexer modules in-process. This eliminates the need for separate indexer processes (Electrs, metashrew, etc.), providing:
+
+- Zero-config indexing that follows the chain tip automatically
+- Atomic reorg handling via append-only KV storage with rollback
+- Parallel execution of multiple indexers via rayon
+- Single binary deployment
+
+### WASM Runtime Configuration
+
+Dual-engine design matching metashrew-runtime:
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| Wasmtime version | 18.0.4 | ABI compatibility with existing metashrew modules |
+| NaN canonicalization | Enabled | Deterministic floating point |
+| Relaxed SIMD determinism | Enabled | Consistent SIMD results |
+| Static memory | 4GB address space | Full WASM32 range |
+| Guard pages | 64KB | Memory safety |
+| Copy-on-write | Disabled | Deterministic initialization |
+| Fuel (async engine) | u64::MAX, yield every 10,000 | Cooperative yielding for views |
+| Unknown imports | Trapped | wasm-bindgen glue compatibility |
+
+### Host Functions (Metashrew ABI)
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `__host_len` | `() -> i32` | Input data length |
+| `__load_input` | `(ptr: i32)` | Copy `[height_le32 ++ block]` to WASM memory |
+| `__get` | `(key_ptr: i32, value_ptr: i32)` | Read value from append-only store |
+| `__get_len` | `(key_ptr: i32) -> i32` | Get value length |
+| `__flush` | `(data_ptr: i32)` | Write KeyValueFlush protobuf to storage |
+| `__log` | `(ptr: i32)` | Log message |
+| `abort` | `(msg, file, line, col)` | Error handler |
+
+Memory layout: AssemblyScript ArrayBuffer convention (4-byte LE length prefix at `ptr-4`, data at `ptr`).
+
+### Storage Layout
+
+Append-only key-value model (matching metashrew-runtime):
+
+| Key Pattern | Value | Description |
+|-------------|-------|-------------|
+| `key ++ u32::MAX_le` | `u32 LE` | Entry count for logical key |
+| `key ++ index_le32` | `bytes` | Value at index N |
+| `key ++ "/__height__/" ++ index_le32` | `u32 LE` | Height at which entry was written |
+| `__HEIGHT__` | `u32 LE` | Indexer tip height |
+
+Each indexer gets an isolated RocksDB instance at `{datadir}/indexers/{label}/db/`.
+
+### Indexer RPC Methods
+
+| Method | Params | Returns |
+|--------|--------|---------|
+| `secondaryview` | `[label, view_fn, input_hex]` | `"0x..."` hex result |
+| `secondaryheight` | `[label]` | Height (integer) |
+| `secondaryhash` | `[label]` | SHA-256 hex of WASM binary |
+| `secondaryroot` | `[label]` | `"0x..."` SMT state root (if enabled) |
+
+### Verified Indexer Modules
+
+| Module | Repository | Description |
+|--------|-----------|-------------|
+| esplorashrew | [kungfuflex/esplorashrew-rs](https://github.com/kungfuflex/esplorashrew-rs) | Esplora-compatible block/tx/address API |
+| alkanes | [kungfuflex/alkanes-rs](https://github.com/kungfuflex/alkanes-rs) | Alkanes metaprotocol |
+| brc20shrew | [subfrost/brc20shrew-rs](https://github.com/subfrost/brc20shrew-rs) | BRC-20 + inscriptions |
+| opshrew | [opnet-protocol/opshrew](https://github.com/opnet-protocol/opshrew) | OP_NET smart contracts |
+
+### CLI Package Manager
+
+```bash
+qubitcoin-cli installindexer <label> <source> [--branch <tag>] [--token <pat>] [--package <name>] [--smt]
+```
+
+Supports local `.wasm` files and git URLs. For git sources: clones, builds to `wasm32-unknown-unknown`, installs to `~/.local/qubitcoin/indexers/{label}/`. Writes `indexer.toml` manifest with SHA-256, source URL, and metadata.
+
+## 8. RPC Interface
 
 ### Available Methods
 
@@ -246,6 +325,18 @@ Block data stored in `blk*.dat` files with 128 MB rotation, matching Bitcoin Cor
 | `getnettotals` | Total bytes sent/received |
 | `getmempoolinfo` | Mempool size and count |
 | `getrawmempool` | Mempool transaction list |
+| `getblock` | Block data by hash (raw hex or JSON) |
+| `gettxout` | UTXO lookup by outpoint |
+| `getrawtransaction` | Transaction by txid (hex or verbose JSON) |
+| `sendrawtransaction` | Broadcast raw transaction |
+| `secondaryview` | Call indexer view function |
+| `secondaryheight` | Get indexer tip height |
+| `secondaryhash` | Get indexer WASM hash |
+| `secondaryroot` | Get indexer SMT state root |
+| `getnewaddress` | Generate new wallet address |
+| `getbalance` | Wallet balance |
+| `listunspent` | Wallet UTXOs |
+| `sendtoaddress` | Send funds |
 | `help` | List available methods |
 | `uptime` | Daemon uptime in seconds |
 | `stop` | Graceful shutdown |
@@ -257,7 +348,7 @@ Block data stored in `blk*.dat` files with 128 MB rotation, matching Bitcoin Cor
 - HTTP/1.1 transport
 - Authentication via `-rpcuser` / `-rpcpassword`
 
-## 8. Command-Line Options
+## 9. Command-Line Options
 
 ```
 -datadir=<dir>       Data directory (default: ~/.qubitcoin)
@@ -270,13 +361,15 @@ Block data stored in `blk*.dat` files with 128 MB rotation, matching Bitcoin Cor
 -maxconnections=<n>  Max connections (default: 125)
 -loglevel=<level>    Log level: error, warn, info, debug, trace
 -dbcache=<n>         UTXO cache size in MB (default: 1024)
+-loadindexer=<l:p>   Load WASM indexer (label:path, repeatable)
+--synchronous-secondary  Block tip until all indexers finish each block
 -testnet             Use testnet3
 -testnet4            Use testnet4
 -regtest             Use regtest
 -signet              Use signet
 ```
 
-## 9. BIP Compliance
+## 10. BIP Compliance
 
 | BIP | Title | Status |
 |-----|-------|--------|
@@ -304,13 +397,15 @@ Block data stored in `blk*.dat` files with 128 MB rotation, matching Bitcoin Cor
 | 341 | Taproot (SegWit v1) | Implemented |
 | 342 | Tapscript validation | Implemented |
 
-## 10. Crate Architecture
+## 11. Crate Architecture
 
 ```
                            qubitcoind
-                          /    |     \
-                    qubitcoin-net  qubitcoin-rpc  qubitcoin-wallet
-                         \     |     /
+                        /    |    |    \
+              qubitcoin-net  |  qubitcoin-rpc  qubitcoin-wallet
+                         \  |    /
+                     qubitcoin-indexer
+                             |
                         qubitcoin-node
                              |
                         qubitcoin-common
@@ -324,23 +419,24 @@ Block data stored in `blk*.dat` files with 128 MB rotation, matching Bitcoin Cor
                    qubitcoin-crypto
 ```
 
-| Crate | Bitcoin Core Equivalent |
-|-------|------------------------|
-| `qubitcoin-crypto` | `src/crypto/` |
-| `qubitcoin-primitives` | `src/uint256.h`, `src/arith_uint256.h` |
-| `qubitcoin-serialize` | `src/serialize.h`, `src/streams.h` |
-| `qubitcoin-script` | `src/script/` |
-| `qubitcoin-consensus` | `bitcoin_consensus` static lib |
-| `qubitcoin-common` | `bitcoin_common` static lib |
-| `qubitcoin-storage` | `src/dbwrapper.h` |
-| `qubitcoin-node` | `bitcoin_node` static lib |
-| `qubitcoin-net` | `src/net.cpp`, `src/net_processing.cpp` |
-| `qubitcoin-rpc` | `src/rpc/` |
-| `qubitcoin-wallet` | `src/wallet/` |
-| `qubitcoin-util` | Utility files |
-| `qubitcoin-tx` | `src/bitcoin-tx.cpp` |
-| `qubitcoin-cli` | `src/bitcoin-cli.cpp` |
-| `qubitcoind` | `src/bitcoind.cpp` |
+| Crate | Description |
+|-------|-------------|
+| `qubitcoin-crypto` | SHA256d, RIPEMD160, SipHash, secp256k1 |
+| `qubitcoin-primitives` | Uint256, Amount, Txid, BlockHash |
+| `qubitcoin-serialize` | Encodable/Decodable, CompactSize, DataStream |
+| `qubitcoin-script` | Script interpreter, opcodes, verification |
+| `qubitcoin-consensus` | Block, Transaction, merkle, sighash |
+| `qubitcoin-common` | CoinsView, ChainParams, PoW, BlockIndex |
+| `qubitcoin-storage` | Database traits, RocksDB backend |
+| `qubitcoin-node` | Validation, ChainstateManager, mempool |
+| `qubitcoin-net` | Tokio P2P networking, protocol messages |
+| `qubitcoin-rpc` | JSON-RPC server, HTTP transport |
+| `qubitcoin-indexer` | Metashrew WASM runtime, host ABI, storage, RPC |
+| `qubitcoin-wallet` | Descriptor wallet, signing, PSBT |
+| `qubitcoin-util` | Logging, args, metrics |
+| `qubitcoin-tx` | Raw transaction tool |
+| `qubitcoin-cli` | RPC client + indexer package manager |
+| `qubitcoind` | Full node daemon |
 
 ## License
 

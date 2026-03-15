@@ -19,7 +19,8 @@ A 1:1 Rust port of Bitcoin Core with full consensus compatibility. Qubitcoin use
 | `qubitcoin-wallet` | Descriptor wallet, coin selection, transaction signing | `src/wallet/` |
 | `qubitcoin-util` | Logging, time, argument parsing, metrics | Utility files |
 | `qubitcoin-tx` | Raw transaction creation and inspection tool | `src/bitcoin-tx.cpp` |
-| `qubitcoin-cli` | Command-line RPC client | `src/bitcoin-cli.cpp` |
+| `qubitcoin-indexer` | In-process WASM secondary indexer runtime (metashrew-compatible) | - |
+| `qubitcoin-cli` | Command-line RPC client with indexer package manager | `src/bitcoin-cli.cpp` |
 | `qubitcoind` | Full node daemon binary | `src/bitcoind.cpp` |
 
 ## Quick Start
@@ -39,6 +40,26 @@ cargo build --release
 ./target/release/qubitcoin-cli getblockchaininfo
 ```
 
+**Run with secondary indexers:**
+```bash
+# Install indexer modules from git
+./target/release/qubitcoin-cli installindexer esplora https://github.com/kungfuflex/esplorashrew-rs
+./target/release/qubitcoin-cli installindexer alkanes https://github.com/kungfuflex/alkanes-rs --branch v2.1.6
+./target/release/qubitcoin-cli installindexer brc20 https://github.com/subfrost/brc20shrew-rs --package shrew-brc20
+./target/release/qubitcoin-cli installindexer opnet https://github.com/opnet-protocol/opshrew --token $PAT
+
+# Run with all indexers
+./target/release/qubitcoind \
+  -loadindexer=esplora:~/.local/qubitcoin/indexers/esplora \
+  -loadindexer=alkanes:~/.local/qubitcoin/indexers/alkanes \
+  -loadindexer=brc20:~/.local/qubitcoin/indexers/brc20 \
+  -loadindexer=opnet:~/.local/qubitcoin/indexers/opnet
+
+# Query indexers via RPC
+./target/release/qubitcoin-cli secondaryheight esplora
+./target/release/qubitcoin-cli secondaryview esplora tipheight ""
+```
+
 **Run all tests:**
 ```bash
 cargo test --workspace
@@ -55,9 +76,11 @@ Crates are layered bottom-up by dependency:
 
 ```
                            qubitcoind
-                          /    |     \
-                    qubitcoin-net  qubitcoin-rpc  qubitcoin-wallet
-                         \     |     /
+                        /    |    |    \
+              qubitcoin-net  |  qubitcoin-rpc  qubitcoin-wallet
+                         \  |    /
+                     qubitcoin-indexer
+                             |
                         qubitcoin-node
                              |
                         qubitcoin-common
@@ -84,17 +107,19 @@ Binary crates (`qubitcoin-cli`, `qubitcoin-tx`) have minimal internal dependenci
 - **Assume-valid optimization**: Skip script verification for blocks below a trusted hash
 - **Memory-bounded UTXO cache**: Automatic flush to RocksDB when exceeding `-dbcache` limit
 - **Custom types**: Uint256, Amount, Script, Transaction, etc. are all custom implementations for 1:1 fidelity with Bitcoin Core, not wrappers around rust-bitcoin
+- **In-process WASM indexers**: Metashrew-compatible secondary indexer runtime with dual wasmtime engines (sync for blocks, async with fuel-based yielding for views), parallel execution via rayon, append-only KV storage with rollback support
 
 ## Test Coverage
 
 | Category | Count |
 |----------|-------|
-| Unit tests | 1,044+ |
+| Unit tests | 1,115+ |
 | Script test vectors | 1,217 |
 | Transaction test vectors | 214 |
+| Indexer runtime tests | 71 |
 | Fuzz targets | 6 (tx, block, script, compact_size, arith_uint256, net messages) |
 
-All tests pass. Mainnet P2P sync verified: 938K+ headers and 73K+ blocks processed from real Bitcoin peers.
+All tests pass. Mainnet P2P sync verified: 938K+ headers and 73K+ blocks processed from real Bitcoin peers. All 4 known metaprotocol indexers (esplora, alkanes, brc20, opnet) verified running in-process with 0 errors.
 
 ## BIP Support
 
