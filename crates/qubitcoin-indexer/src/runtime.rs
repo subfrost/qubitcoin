@@ -63,16 +63,17 @@ fn new_state(
     }
 }
 
-/// Grow WASM memory to 4GB for deterministic execution.
-fn grow_memory_to_max(instance: &Instance, store: &mut Store<WasmState>) {
-    if let Some(memory) = instance.get_memory(&mut *store, "memory") {
-        let current = memory.size(&*store);
-        let max_pages: u64 = 65536; // 4GB
-        let to_grow = max_pages.saturating_sub(current);
-        if to_grow > 0 {
-            let _ = memory.grow(&mut *store, to_grow);
-        }
-    }
+/// Ensure WASM memory can grow on demand.
+///
+/// Unlike metashrew's single-indexer setup which pre-allocates 4GB,
+/// we run multiple indexers so we let memory grow on demand via
+/// wasmtime's StoreLimits (set to usize::MAX). The static_memory
+/// config ensures the address space is reserved without committing
+/// physical pages.
+fn prepare_memory(_instance: &Instance, _store: &mut Store<WasmState>) {
+    // Memory grows on demand via StoreLimits. No pre-allocation needed
+    // since static_memory_maximum_size(4GB) reserves virtual address space
+    // and memory_init_cow(false) ensures deterministic initial state.
 }
 
 /// A compiled WASM indexer runtime with dual engines.
@@ -125,7 +126,7 @@ impl WasmIndexerRuntime {
         store.limiter(|s| &mut s.limits);
 
         let instance = self.instantiate_sync(&mut store)?;
-        grow_memory_to_max(&instance, &mut store);
+        prepare_memory(&instance, &mut store);
 
         let start_fn = instance
             .get_typed_func::<(), ()>(&mut store, "_start")
@@ -170,7 +171,7 @@ impl WasmIndexerRuntime {
             .map_err(|e| format!("fuel yield interval: {}", e))?;
 
         let instance = self.instantiate_async(&mut store).await?;
-        grow_memory_to_max(&instance, &mut store);
+        prepare_memory(&instance, &mut store);
 
         let view_fn = instance
             .get_typed_func::<(), i32>(&mut store, fn_name)
@@ -201,7 +202,7 @@ impl WasmIndexerRuntime {
         store.limiter(|s| &mut s.limits);
 
         let instance = self.instantiate_sync(&mut store)?;
-        grow_memory_to_max(&instance, &mut store);
+        prepare_memory(&instance, &mut store);
 
         let view_fn = instance
             .get_typed_func::<(), i32>(&mut store, fn_name)
