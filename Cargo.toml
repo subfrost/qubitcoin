@@ -15,6 +15,7 @@ members = [
     "crates/qubitcoin-wallet",
     "crates/qubitcoin-cli",
     "crates/qubitcoin-tx",
+    "crates/qubitcoin-indexer",
     "crates/qubitcoind",
 ]
 
@@ -38,6 +39,7 @@ qubitcoin-node = { path = "crates/qubitcoin-node" }
 qubitcoin-net = { path = "crates/qubitcoin-net" }
 qubitcoin-rpc = { path = "crates/qubitcoin-rpc" }
 qubitcoin-wallet = { path = "crates/qubitcoin-wallet" }
+qubitcoin-indexer = { path = "crates/qubitcoin-indexer" }
 
 # External dependencies
 secp256k1 = { version = "0.29", features = ["global-context", "rand-std"] }
@@ -58,6 +60,10 @@ tokio = { version = "1", features = ["full"] }
 rocksdb = "0.22"
 bitflags = "2"
 rayon = "1.10"
+sha2 = "0.10"
+wasmtime = "18.0.4"
+prost = "0.12"
+toml = "0.8"
 memmap2 = "0.9"
 tempfile = "3"
 prometheus = "0.13"

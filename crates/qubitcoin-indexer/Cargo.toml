@@ -1,0 +1,28 @@
+[package]
+name = "qubitcoin-indexer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "In-process WASM secondary indexer runtime for Qubitcoin"
+
+[dependencies]
+rocksdb = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rayon = { workspace = true }
+tokio = { workspace = true }
+wasmtime = "18.0.4"
+prost = "0.12"
+sha2 = "0.10"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
+wat = "1.0"
+
+[build-dependencies]
+prost-build = "0.12"

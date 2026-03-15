@@ -21,6 +21,7 @@ use qubitcoin_storage::traits::{Database, DbBatch};
 use qubitcoin_storage::RocksDatabase;
 use qubitcoin_util::args::ArgsManager;
 use qubitcoin_util::logging::{self, LogLevel};
+use qubitcoin_indexer::{IndexerManager, IndexerMode};
 use qubitcoin_wallet::wallet::{DescriptorType, Wallet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -112,6 +113,8 @@ struct LiveNodeInterface {
     ibd_tracker: parking_lot::Mutex<IbdTracker>,
     /// Pending TX index entries accumulated between flushes.
     pending_tx_index: parking_lot::Mutex<Vec<(Txid, i32, u32, u32)>>,
+    /// Optional in-process WASM secondary indexer manager.
+    indexer_manager: Option<Arc<IndexerManager>>,
 }
 
 /// Tracks IBD (Initial Block Download) progress for logging.
@@ -205,6 +208,11 @@ impl NodeInterface for LiveNodeInterface {
 
                 tracker.last_log_time = std::time::Instant::now();
                 tracker.last_log_height = height;
+            }
+
+            // Notify secondary indexers of the new block.
+            if let Some(ref im) = self.indexer_manager {
+                im.on_block_connected(height as u32, data);
             }
 
             // Memory-bounded flush: trigger when block count threshold OR cache
@@ -645,6 +653,70 @@ async fn main() {
     let wallet_db = Arc::new(wallet_db);
     tracing::info!("wallet initialized");
 
+    // 7c. Initialize secondary indexers (if any -loadindexer args provided).
+    let indexer_manager: Option<Arc<IndexerManager>> = {
+        let indexer_args = args.get_args("loadindexer");
+        if indexer_args.is_empty() {
+            None
+        } else {
+            let mode = if args.get_bool_arg("synchronous-secondary") {
+                IndexerMode::Synchronous
+            } else {
+                IndexerMode::Async
+            };
+            let configs = qubitcoin_indexer::config::parse_load_indexer_args(&indexer_args);
+            match IndexerManager::new(configs, &datadir, mode) {
+                Ok(mgr) => {
+                    let mgr = Arc::new(mgr);
+
+                    // Catch up indexers that are behind the chain tip.
+                    let chain_h = chainstate.lock().height() as u32;
+                    if chain_h > 0 {
+                        let bf = block_files.clone();
+                        let cs_catchup = chainstate.clone();
+                        mgr.catch_up(chain_h, |h| {
+                            let cs = cs_catchup.lock();
+                            let idx = cs.active_chain().get_block_index(h as i32)?;
+                            let entry = cs.block_index().get(idx);
+                            if entry.file < 0 {
+                                return None;
+                            }
+                            let pos = DiskBlockPos { file: entry.file, pos: entry.data_pos };
+                            let block = bf.read_block(&pos).ok()?;
+                            serialize(&block).ok()
+                        });
+                    }
+
+                    // Roll back any indexers that are ahead of the chain tip.
+                    for label in mgr.labels() {
+                        if let Some(ih) = mgr.indexer_height(label) {
+                            if ih > chain_h {
+                                tracing::warn!(
+                                    indexer = %label,
+                                    indexer_height = ih,
+                                    chain_height = chain_h,
+                                    "indexer ahead of chain, rolling back"
+                                );
+                                mgr.on_reorg(chain_h);
+                            }
+                        }
+                    }
+
+                    tracing::info!(
+                        count = mgr.labels().len(),
+                        mode = ?mode,
+                        "secondary indexers initialized"
+                    );
+                    Some(mgr)
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to initialize secondary indexers");
+                    None
+                }
+            }
+        }
+    };
+
     // 8. Initialize shared node state for RPC
     let chain_name = match network {
         Network::Mainnet => "main",
@@ -703,6 +775,30 @@ async fn main() {
         mempool.clone(),
         wallet_db.clone(),
     );
+
+    // Register secondary indexer RPCs (if indexers are loaded).
+    if let Some(ref im) = indexer_manager {
+        use qubitcoin_rpc::server::{RpcRequest, RpcResponse, RPC_MISC_ERROR};
+        qubitcoin_indexer::rpc::register_indexer_rpcs(
+            &mut |name: &str, handler: Box<dyn Fn(&serde_json::Value) -> serde_json::Value + Send + Sync>| {
+                registry.register(name, move |req: &RpcRequest| {
+                    let params = req.params.clone().unwrap_or(serde_json::Value::Array(vec![]));
+                    let result = handler(&params);
+                    if let Some(err) = result.get("error") {
+                        RpcResponse::error(
+                            req.id.clone(),
+                            RPC_MISC_ERROR,
+                            err.as_str().unwrap_or("unknown error").to_string(),
+                        )
+                    } else {
+                        RpcResponse::success(req.id.clone(), result)
+                    }
+                });
+            },
+            im.clone(),
+        );
+        tracing::info!("secondary indexer RPCs registered");
+    }
 
     let rpc_bind_addr = rpc_config.bind_addr;
     let rpc_server = RpcServer::new(rpc_config, registry);
@@ -776,6 +872,7 @@ async fn main() {
             last_log_time: std::time::Instant::now(),
             last_log_height: initial_height,
         }),
+        indexer_manager: indexer_manager.clone(),
     });
 
     if let Some(event_rx) = event_rx {
