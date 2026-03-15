@@ -232,7 +232,23 @@ impl IndexerManager {
         }
     }
 
-    /// Call a view function on an indexer.
+    /// Call a view function on an indexer (async, with fuel-based yielding).
+    pub async fn call_view_async(
+        &self,
+        label: &str,
+        fn_name: &str,
+        input: Vec<u8>,
+    ) -> Result<Vec<u8>, String> {
+        let inst = self
+            .get_indexer(label)
+            .ok_or_else(|| format!("indexer '{}' not found", label))?;
+        let runtime = inst.runtime.lock();
+        runtime
+            .call_view_async(fn_name, input, inst.storage.clone(), label)
+            .await
+    }
+
+    /// Call a view function on an indexer (sync, for non-async contexts).
     pub fn call_view(
         &self,
         label: &str,

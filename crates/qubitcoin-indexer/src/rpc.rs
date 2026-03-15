@@ -151,7 +151,15 @@ where
                     }
                 };
 
-                match mgr.call_view(label, view_fn, input_bytes) {
+                // Use async view with fuel-based cooperative yielding.
+                // Since RPC handlers are sync, use tokio::task::block_in_place
+                // to call the async view without blocking the runtime.
+                let result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        mgr.call_view_async(label, view_fn, input_bytes),
+                    )
+                });
+                match result {
                     Ok(result) => {
                         let hex: String =
                             result.iter().map(|b| format!("{:02x}", b)).collect();

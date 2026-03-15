@@ -1,7 +1,8 @@
 //! WASM indexer runtime using wasmtime.
 //!
-//! Implements the metashrew host ABI (6 host functions) and provides
-//! `run_block()` for indexing and `call_view()` for read-only queries.
+//! Dual-engine design matching metashrew-runtime:
+//! - **Sync engine**: for `run_block()` (called from rayon threads)
+//! - **Async engine**: for `call_view()` with fuel-based cooperative yielding
 
 use crate::storage::IndexerStorage;
 use prost::Message;
@@ -15,91 +16,117 @@ mod proto {
 
 /// Host state threaded through the wasmtime `Store`.
 pub struct WasmState {
-    /// Input data: `[height_le32 ++ block_data]`.
     pub input_data: Vec<u8>,
-    /// Pending key-value pairs from `__flush`.
     pub pending_flush: Option<Vec<(Vec<u8>, Vec<u8>)>>,
-    /// Reference to the indexer's storage.
     pub storage: Arc<IndexerStorage>,
-    /// Whether the WASM module hit an error (abort).
     pub had_failure: bool,
-    /// Whether `__flush` was called (module completed successfully).
     pub completed: bool,
-    /// Label for logging.
     pub label: String,
-    /// Whether this is a view-only call (no-op flush).
     pub view_mode: bool,
-    /// Resource limits (matching metashrew State).
     pub limits: StoreLimits,
 }
 
-/// A compiled WASM indexer runtime.
+/// Build the deterministic engine config matching metashrew-runtime.
+fn base_config() -> Config {
+    let mut config = Config::new();
+    config.wasm_bulk_memory(true);
+    config.wasm_multi_value(true);
+    config.wasm_reference_types(true);
+    config.wasm_simd(true);
+    config.cranelift_nan_canonicalization(true);
+    config.relaxed_simd_deterministic(true);
+    config.static_memory_maximum_size(0x100000000); // 4GB
+    config.static_memory_guard_size(0x10000); // 64KB
+    config.memory_init_cow(false);
+    config
+}
+
+fn new_state(
+    input_data: Vec<u8>,
+    storage: Arc<IndexerStorage>,
+    label: &str,
+    view_mode: bool,
+) -> WasmState {
+    WasmState {
+        input_data,
+        pending_flush: None,
+        storage,
+        had_failure: false,
+        completed: false,
+        label: label.to_string(),
+        view_mode,
+        limits: StoreLimitsBuilder::new()
+            .memories(usize::MAX)
+            .tables(usize::MAX)
+            .instances(usize::MAX)
+            .build(),
+    }
+}
+
+/// Grow WASM memory to 4GB for deterministic execution.
+fn grow_memory_to_max(instance: &Instance, store: &mut Store<WasmState>) {
+    if let Some(memory) = instance.get_memory(&mut *store, "memory") {
+        let current = memory.size(&*store);
+        let max_pages: u64 = 65536; // 4GB
+        let to_grow = max_pages.saturating_sub(current);
+        if to_grow > 0 {
+            let _ = memory.grow(&mut *store, to_grow);
+        }
+    }
+}
+
+/// A compiled WASM indexer runtime with dual engines.
 pub struct WasmIndexerRuntime {
+    /// Sync engine for block processing.
     engine: Engine,
     module: Module,
+    /// Async engine with fuel for view functions.
+    async_engine: Engine,
+    async_module: Module,
 }
 
 impl WasmIndexerRuntime {
     /// Compile a WASM module from bytes.
     pub fn new(wasm_bytes: &[u8]) -> Result<Self, String> {
-        let mut config = Config::new();
-        // Match metashrew-runtime engine config for deterministic execution.
-        config.wasm_bulk_memory(true);
-        config.wasm_multi_value(true);
-        config.wasm_reference_types(true);
-        config.wasm_simd(true);
-        config.cranelift_nan_canonicalization(true);
-        config.relaxed_simd_deterministic(true);
-        config.static_memory_maximum_size(0x100000000); // 4GB
-        config.static_memory_guard_size(0x10000); // 64KB
-        config.memory_init_cow(false);
-
+        // Sync engine for block processing.
+        let config = base_config();
         let engine = Engine::new(&config).map_err(|e| format!("wasmtime engine: {}", e))?;
         let module =
             Module::new(&engine, wasm_bytes).map_err(|e| format!("wasmtime compile: {}", e))?;
 
-        Ok(WasmIndexerRuntime { engine, module })
+        // Async engine with fuel for view functions.
+        let mut async_config = base_config();
+        async_config.async_support(true);
+        async_config.consume_fuel(true);
+        let async_engine =
+            Engine::new(&async_config).map_err(|e| format!("async wasmtime engine: {}", e))?;
+        let async_module = Module::new(&async_engine, wasm_bytes)
+            .map_err(|e| format!("async wasmtime compile: {}", e))?;
+
+        Ok(WasmIndexerRuntime {
+            engine,
+            module,
+            async_engine,
+            async_module,
+        })
     }
 
-    /// Run `_start()` on the WASM module with the given block data.
+    /// Run `_start()` synchronously for block processing.
     ///
-    /// `input_data` is `[height_le32 ++ serialized_block]`.
+    /// Called from rayon threads. Uses the sync engine.
     pub fn run_block(
         &self,
         input_data: Vec<u8>,
         storage: Arc<IndexerStorage>,
         label: &str,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
-        let state = WasmState {
-            input_data,
-            pending_flush: None,
-            storage,
-            had_failure: false,
-            completed: false,
-            label: label.to_string(),
-            view_mode: false,
-            limits: StoreLimitsBuilder::new()
-                .memories(usize::MAX)
-                .tables(usize::MAX)
-                .instances(usize::MAX)
-                .build(),
-        };
-
+        let state = new_state(input_data, storage, label, false);
         let mut store = Store::new(&self.engine, state);
         store.limiter(|s| &mut s.limits);
-        let instance = self.instantiate(&mut store)?;
 
-        // Grow memory to max for deterministic execution (matching metashrew).
-        if let Some(memory) = instance.get_memory(&mut store, "memory") {
-            let current = memory.size(&store);
-            let max_pages: u64 = 65536; // 4GB
-            let to_grow = max_pages.saturating_sub(current);
-            if to_grow > 0 {
-                let _ = memory.grow(&mut store, to_grow);
-            }
-        }
+        let instance = self.instantiate_sync(&mut store)?;
+        grow_memory_to_max(&instance, &mut store);
 
-        // Call _start
         let start_fn = instance
             .get_typed_func::<(), ()>(&mut store, "_start")
             .map_err(|e| format!("missing _start: {}", e))?;
@@ -119,11 +146,49 @@ impl WasmIndexerRuntime {
         Ok(state.pending_flush.unwrap_or_default())
     }
 
-    /// Call a view function on the WASM module.
+    /// Call a view function asynchronously with fuel-based cooperative yielding.
     ///
-    /// Creates a fresh instance in view mode (no-op flush) and calls the
-    /// named export with `input_data` available via `__host_len`/`__load_input`.
-    /// Returns the bytes written to the output buffer via `__flush`.
+    /// Uses the async engine so long-running view queries yield back to the
+    /// tokio runtime periodically, improving concurrency.
+    pub async fn call_view_async(
+        &self,
+        fn_name: &str,
+        input_data: Vec<u8>,
+        storage: Arc<IndexerStorage>,
+        label: &str,
+    ) -> Result<Vec<u8>, String> {
+        let state = new_state(input_data, storage, label, true);
+        let mut store = Store::new(&self.async_engine, state);
+        store.limiter(|s| &mut s.limits);
+
+        // Set fuel for cooperative yielding (matching metashrew).
+        store
+            .set_fuel(u64::MAX)
+            .map_err(|e| format!("set fuel: {}", e))?;
+        store
+            .fuel_async_yield_interval(Some(10000))
+            .map_err(|e| format!("fuel yield interval: {}", e))?;
+
+        let instance = self.instantiate_async(&mut store).await?;
+        grow_memory_to_max(&instance, &mut store);
+
+        let view_fn = instance
+            .get_typed_func::<(), i32>(&mut store, fn_name)
+            .map_err(|e| format!("missing view fn '{}': {}", fn_name, e))?;
+
+        let result_ptr = view_fn
+            .call_async(&mut store, ())
+            .await
+            .map_err(|e| format!("view fn '{}' failed: {}", fn_name, e))?;
+
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or("no memory export")?;
+
+        read_arraybuffer(&store, &memory, result_ptr)
+    }
+
+    /// Synchronous view call (for use from non-async contexts like tests).
     pub fn call_view(
         &self,
         fn_name: &str,
@@ -131,36 +196,13 @@ impl WasmIndexerRuntime {
         storage: Arc<IndexerStorage>,
         label: &str,
     ) -> Result<Vec<u8>, String> {
-        let state = WasmState {
-            input_data,
-            pending_flush: None,
-            storage,
-            had_failure: false,
-            completed: false,
-            label: label.to_string(),
-            view_mode: true,
-            limits: StoreLimitsBuilder::new()
-                .memories(usize::MAX)
-                .tables(usize::MAX)
-                .instances(usize::MAX)
-                .build(),
-        };
-
+        let state = new_state(input_data, storage, label, true);
         let mut store = Store::new(&self.engine, state);
         store.limiter(|s| &mut s.limits);
-        let instance = self.instantiate(&mut store)?;
 
-        // Grow memory to max for deterministic execution.
-        if let Some(memory) = instance.get_memory(&mut store, "memory") {
-            let current = memory.size(&store);
-            let max_pages: u64 = 65536;
-            let to_grow = max_pages.saturating_sub(current);
-            if to_grow > 0 {
-                let _ = memory.grow(&mut store, to_grow);
-            }
-        }
+        let instance = self.instantiate_sync(&mut store)?;
+        grow_memory_to_max(&instance, &mut store);
 
-        // Call the view function — it returns an i32 pointer to the result.
         let view_fn = instance
             .get_typed_func::<(), i32>(&mut store, fn_name)
             .map_err(|e| format!("missing view fn '{}': {}", fn_name, e))?;
@@ -169,174 +211,303 @@ impl WasmIndexerRuntime {
             .call(&mut store, ())
             .map_err(|e| format!("view fn '{}' failed: {}", fn_name, e))?;
 
-        // Read the result from WASM memory using AssemblyScript ArrayBuffer layout.
         let memory = instance
             .get_memory(&mut store, "memory")
             .ok_or("no memory export")?;
 
-        let result = read_arraybuffer(&store, &memory, result_ptr)?;
-        Ok(result)
+        read_arraybuffer(&store, &memory, result_ptr)
     }
 
-    /// Create an instance with all host functions linked.
-    fn instantiate(&self, store: &mut Store<WasmState>) -> Result<Instance, String> {
+    /// Link host functions and instantiate synchronously.
+    fn instantiate_sync(&self, store: &mut Store<WasmState>) -> Result<Instance, String> {
         let mut linker = Linker::new(&self.engine);
-
-        // __host_len() -> i32
+        link_host_functions_sync(&mut linker)?;
         linker
-            .func_wrap("env", "__host_len", |caller: Caller<'_, WasmState>| -> i32 {
-                caller.data().input_data.len() as i32
-            })
-            .map_err(|e| format!("link __host_len: {}", e))?;
-
-        // __load_input(ptr: i32)
+            .define_unknown_imports_as_traps(&self.module)
+            .map_err(|e| format!("define unknown imports: {}", e))?;
         linker
-            .func_wrap(
-                "env",
-                "__load_input",
-                |mut caller: Caller<'_, WasmState>, ptr: i32| {
+            .instantiate(&mut *store, &self.module)
+            .map_err(|e| format!("wasmtime instantiate: {}", e))
+    }
+
+    /// Link host functions and instantiate asynchronously.
+    async fn instantiate_async(
+        &self,
+        store: &mut Store<WasmState>,
+    ) -> Result<Instance, String> {
+        let mut linker = Linker::new(&self.async_engine);
+        link_host_functions_async(&mut linker)?;
+        linker
+            .define_unknown_imports_as_traps(&self.async_module)
+            .map_err(|e| format!("define unknown imports: {}", e))?;
+        linker
+            .instantiate_async(&mut *store, &self.async_module)
+            .await
+            .map_err(|e| format!("wasmtime instantiate_async: {}", e))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sync host function linking (for block processing)
+// ---------------------------------------------------------------------------
+
+fn link_host_functions_sync(linker: &mut Linker<WasmState>) -> Result<(), String> {
+    linker
+        .func_wrap("env", "__host_len", |caller: Caller<'_, WasmState>| -> i32 {
+            caller.data().input_data.len() as i32
+        })
+        .map_err(|e| format!("link __host_len: {}", e))?;
+
+    linker
+        .func_wrap(
+            "env",
+            "__load_input",
+            |mut caller: Caller<'_, WasmState>, ptr: i32| {
+                let data = caller.data().input_data.clone();
+                let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
+                memory.write(&mut caller, ptr as usize, &data).ok();
+            },
+        )
+        .map_err(|e| format!("link __load_input: {}", e))?;
+
+    linker
+        .func_wrap(
+            "env",
+            "__get_len",
+            |mut caller: Caller<'_, WasmState>, key_ptr: i32| -> i32 {
+                let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let key = match read_arraybuffer(&caller, &memory, key_ptr) {
+                    Ok(k) => k,
+                    Err(_) => return 0,
+                };
+                match caller.data().storage.get_latest(&key) {
+                    Some(v) => v.len() as i32,
+                    None => 0,
+                }
+            },
+        )
+        .map_err(|e| format!("link __get_len: {}", e))?;
+
+    linker
+        .func_wrap(
+            "env",
+            "__get",
+            |mut caller: Caller<'_, WasmState>, key_ptr: i32, value_ptr: i32| {
+                let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let key = match read_arraybuffer(&caller, &memory, key_ptr) {
+                    Ok(k) => k,
+                    Err(_) => return,
+                };
+                if let Some(value) = caller.data().storage.get_latest(&key) {
+                    memory.write(&mut caller, value_ptr as usize, &value).ok();
+                }
+            },
+        )
+        .map_err(|e| format!("link __get: {}", e))?;
+
+    linker
+        .func_wrap(
+            "env",
+            "__flush",
+            |mut caller: Caller<'_, WasmState>, data_ptr: i32| {
+                flush_handler(&mut caller, data_ptr);
+            },
+        )
+        .map_err(|e| format!("link __flush: {}", e))?;
+
+    linker
+        .func_wrap(
+            "env",
+            "__log",
+            |mut caller: Caller<'_, WasmState>, ptr: i32| {
+                log_handler(&mut caller, ptr);
+            },
+        )
+        .map_err(|e| format!("link __log: {}", e))?;
+
+    linker
+        .func_wrap(
+            "env",
+            "abort",
+            |mut caller: Caller<'_, WasmState>, msg_ptr: i32, _file: i32, line: i32, col: i32| {
+                abort_handler(&mut caller, msg_ptr, line, col);
+            },
+        )
+        .map_err(|e| format!("link abort: {}", e))?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Async host function linking (for view functions with fuel yielding)
+// ---------------------------------------------------------------------------
+
+fn link_host_functions_async(linker: &mut Linker<WasmState>) -> Result<(), String> {
+    linker
+        .func_wrap0_async(
+            "env",
+            "__host_len",
+            |caller: Caller<'_, WasmState>| {
+                Box::new(async move { caller.data().input_data.len() as i32 })
+            },
+        )
+        .map_err(|e| format!("link async __host_len: {}", e))?;
+
+    linker
+        .func_wrap1_async(
+            "env",
+            "__load_input",
+            |mut caller: Caller<'_, WasmState>, ptr: i32| {
+                Box::new(async move {
                     let data = caller.data().input_data.clone();
                     let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
-                    memory.write(&mut caller, ptr as usize, &data).ok();
-                },
-            )
-            .map_err(|e| format!("link __load_input: {}", e))?;
+                    memory
+                        .write(&mut caller, ptr as usize, &data)
+                        .expect("FATAL: __load_input memory write failed");
+                })
+            },
+        )
+        .map_err(|e| format!("link async __load_input: {}", e))?;
 
-        // __get_len(key_ptr: i32) -> i32
-        linker
-            .func_wrap(
-                "env",
-                "__get_len",
-                |mut caller: Caller<'_, WasmState>, key_ptr: i32| -> i32 {
+    linker
+        .func_wrap1_async(
+            "env",
+            "__get_len",
+            |mut caller: Caller<'_, WasmState>, key_ptr: i32| {
+                Box::new(async move {
                     let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
                     let key = match read_arraybuffer(&caller, &memory, key_ptr) {
                         Ok(k) => k,
-                        Err(_) => return 0,
+                        Err(_) => return 0i32,
                     };
-                    let storage = &caller.data().storage;
-                    match storage.get_latest(&key) {
+                    match caller.data().storage.get_latest(&key) {
                         Some(v) => v.len() as i32,
                         None => 0,
                     }
-                },
-            )
-            .map_err(|e| format!("link __get_len: {}", e))?;
+                })
+            },
+        )
+        .map_err(|e| format!("link async __get_len: {}", e))?;
 
-        // __get(key_ptr: i32, value_ptr: i32)
-        linker
-            .func_wrap(
-                "env",
-                "__get",
-                |mut caller: Caller<'_, WasmState>, key_ptr: i32, value_ptr: i32| {
+    linker
+        .func_wrap2_async(
+            "env",
+            "__get",
+            |mut caller: Caller<'_, WasmState>, key_ptr: i32, value_ptr: i32| {
+                Box::new(async move {
                     let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
                     let key = match read_arraybuffer(&caller, &memory, key_ptr) {
                         Ok(k) => k,
                         Err(_) => return,
                     };
-                    let storage = &caller.data().storage;
-                    if let Some(value) = storage.get_latest(&key) {
-                        memory.write(&mut caller, value_ptr as usize, &value).ok();
+                    if let Some(value) = caller.data().storage.get_latest(&key) {
+                        memory
+                            .write(&mut caller, value_ptr as usize, &value)
+                            .expect("FATAL: __get memory write failed");
                     }
-                },
-            )
-            .map_err(|e| format!("link __get: {}", e))?;
+                })
+            },
+        )
+        .map_err(|e| format!("link async __get: {}", e))?;
 
-        // __flush(data_ptr: i32)
-        linker
-            .func_wrap(
-                "env",
-                "__flush",
-                |mut caller: Caller<'_, WasmState>, data_ptr: i32| {
-                    let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
-                    let data = match read_arraybuffer(&caller, &memory, data_ptr) {
-                        Ok(d) => d,
-                        Err(e) => {
-                            tracing::error!(error = %e, "failed to read __flush data");
-                            caller.data_mut().had_failure = true;
-                            return;
-                        }
-                    };
+    linker
+        .func_wrap1_async(
+            "env",
+            "__flush",
+            |mut caller: Caller<'_, WasmState>, data_ptr: i32| {
+                Box::new(async move {
+                    flush_handler(&mut caller, data_ptr);
+                })
+            },
+        )
+        .map_err(|e| format!("link async __flush: {}", e))?;
 
-                    // Decode protobuf KeyValueFlush.
-                    let flush_msg = match proto::KeyValueFlush::decode(data.as_slice()) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            tracing::error!(error = %e, "failed to decode KeyValueFlush");
-                            caller.data_mut().had_failure = true;
-                            return;
-                        }
-                    };
+    linker
+        .func_wrap1_async(
+            "env",
+            "__log",
+            |mut caller: Caller<'_, WasmState>, ptr: i32| {
+                Box::new(async move {
+                    log_handler(&mut caller, ptr);
+                })
+            },
+        )
+        .map_err(|e| format!("link async __log: {}", e))?;
 
-                    // Parse key-value pairs from the list (alternating key, value).
-                    let mut pairs = Vec::new();
-                    let list = &flush_msg.list;
-                    let mut i = 0;
-                    while i + 1 < list.len() {
-                        pairs.push((list[i].to_vec(), list[i + 1].to_vec()));
-                        i += 2;
-                    }
+    linker
+        .func_wrap4_async(
+            "env",
+            "abort",
+            |mut caller: Caller<'_, WasmState>, msg_ptr: i32, _file: i32, line: i32, col: i32| {
+                Box::new(async move {
+                    abort_handler(&mut caller, msg_ptr, line, col);
+                })
+            },
+        )
+        .map_err(|e| format!("link async abort: {}", e))?;
 
-                    caller.data_mut().pending_flush = Some(pairs);
-                    caller.data_mut().completed = true;
-                },
-            )
-            .map_err(|e| format!("link __flush: {}", e))?;
+    Ok(())
+}
 
-        // __log(ptr: i32)
-        linker
-            .func_wrap(
-                "env",
-                "__log",
-                |mut caller: Caller<'_, WasmState>, ptr: i32| {
-                    let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
-                    if let Ok(msg_bytes) = read_arraybuffer(&caller, &memory, ptr) {
-                        let msg = String::from_utf8_lossy(&msg_bytes);
-                        let label = &caller.data().label;
-                        tracing::info!(indexer = %label, "{}", msg);
-                    }
-                },
-            )
-            .map_err(|e| format!("link __log: {}", e))?;
+// ---------------------------------------------------------------------------
+// Shared host function implementations
+// ---------------------------------------------------------------------------
 
-        // abort(msg: i32, file: i32, line: i32, col: i32)
-        linker
-            .func_wrap(
-                "env",
-                "abort",
-                |mut caller: Caller<'_, WasmState>,
-                 msg_ptr: i32,
-                 _file_ptr: i32,
-                 line: i32,
-                 col: i32| {
-                    let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
-                    let msg = read_arraybuffer(&caller, &memory, msg_ptr)
-                        .ok()
-                        .map(|b| String::from_utf8_lossy(&b).to_string())
-                        .unwrap_or_else(|| "<unreadable>".into());
-                    let label = caller.data().label.clone();
-                    tracing::error!(
-                        indexer = %label,
-                        line = line,
-                        col = col,
-                        "WASM abort: {}",
-                        msg
-                    );
-                    caller.data_mut().had_failure = true;
-                },
-            )
-            .map_err(|e| format!("link abort: {}", e))?;
+fn flush_handler(caller: &mut Caller<'_, WasmState>, data_ptr: i32) {
+    let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
+    let data = match read_arraybuffer(&*caller, &memory, data_ptr) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to read __flush data");
+            caller.data_mut().had_failure = true;
+            return;
+        }
+    };
 
-        // Stub any remaining unknown imports (e.g. wasm-bindgen placeholders)
-        // as traps so modules that include unused wasm-bindgen glue still load.
-        linker
-            .define_unknown_imports_as_traps(&self.module)
-            .map_err(|e| format!("define unknown imports: {}", e))?;
+    let flush_msg = match proto::KeyValueFlush::decode(data.as_slice()) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to decode KeyValueFlush");
+            caller.data_mut().had_failure = true;
+            return;
+        }
+    };
 
-        linker
-            .instantiate(&mut *store, &self.module)
-            .map_err(|e| format!("wasmtime instantiate: {}", e))
+    let mut pairs = Vec::new();
+    let list = &flush_msg.list;
+    let mut i = 0;
+    while i + 1 < list.len() {
+        pairs.push((list[i].to_vec(), list[i + 1].to_vec()));
+        i += 2;
+    }
+
+    caller.data_mut().pending_flush = Some(pairs);
+    caller.data_mut().completed = true;
+}
+
+fn log_handler(caller: &mut Caller<'_, WasmState>, ptr: i32) {
+    let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
+    if let Ok(msg_bytes) = read_arraybuffer(&*caller, &memory, ptr) {
+        let msg = String::from_utf8_lossy(&msg_bytes);
+        let label = &caller.data().label;
+        tracing::info!(indexer = %label, "{}", msg);
     }
 }
+
+fn abort_handler(caller: &mut Caller<'_, WasmState>, msg_ptr: i32, line: i32, col: i32) {
+    let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
+    let msg = read_arraybuffer(&*caller, &memory, msg_ptr)
+        .ok()
+        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .unwrap_or_else(|| "<unreadable>".into());
+    let label = caller.data().label.clone();
+    tracing::error!(indexer = %label, line = line, col = col, "WASM abort: {}", msg);
+    caller.data_mut().had_failure = true;
+}
+
+// ---------------------------------------------------------------------------
+// ArrayBuffer helper
+// ---------------------------------------------------------------------------
 
 /// Read an AssemblyScript ArrayBuffer from WASM memory.
 ///
@@ -372,6 +543,10 @@ fn read_arraybuffer(
     Ok(mem_data[data_offset..data_offset + len].to_vec())
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,12 +559,6 @@ mod tests {
         (storage, dir)
     }
 
-    /// Build a minimal WASM module that:
-    /// 1. Calls __host_len to get input size
-    /// 2. Calls __flush with an empty protobuf (just sets completed=true)
-    ///
-    /// The module creates a zero-length KeyValueFlush protobuf at memory offset 100,
-    /// with the ArrayBuffer length prefix at offset 96.
     fn build_minimal_wasm() -> Vec<u8> {
         wat::parse_str(r#"
             (module
@@ -403,22 +572,14 @@ mod tests {
                 (memory (export "memory") 1)
 
                 (func (export "_start")
-                    ;; Get input length (just to exercise __host_len).
                     (drop (call $host_len))
-
-                    ;; Build an empty protobuf KeyValueFlush at memory offset 100.
-                    ;; ArrayBuffer layout: [length_u32_le @ offset 96][data @ offset 100]
-                    ;; Empty protobuf = 0 bytes.
                     (i32.store (i32.const 96) (i32.const 0))
-
-                    ;; Call __flush with ptr=100 (the data starts here, length at 96).
                     (call $flush (i32.const 100))
                 )
             )
         "#).expect("failed to parse WAT")
     }
 
-    /// Build a WASM module that calls __host_len and returns it as a view result.
     fn build_view_wasm() -> Vec<u8> {
         wat::parse_str(r#"
             (module
@@ -432,12 +593,8 @@ mod tests {
                 (memory (export "memory") 1)
 
                 (func (export "get_input_len") (result i32)
-                    ;; Store the input length as a 4-byte LE value at offset 204.
-                    ;; ArrayBuffer: length at 200, data at 204.
                     (i32.store (i32.const 200) (i32.const 4))
                     (i32.store (i32.const 204) (call $host_len))
-
-                    ;; Return pointer to the data (204).
                     (i32.const 204)
                 )
             )
@@ -447,14 +604,12 @@ mod tests {
     #[test]
     fn test_compile_wasm() {
         let wasm = build_minimal_wasm();
-        let runtime = WasmIndexerRuntime::new(&wasm);
-        assert!(runtime.is_ok());
+        assert!(WasmIndexerRuntime::new(&wasm).is_ok());
     }
 
     #[test]
     fn test_compile_invalid_wasm() {
-        let result = WasmIndexerRuntime::new(b"not wasm");
-        assert!(result.is_err());
+        assert!(WasmIndexerRuntime::new(b"not wasm").is_err());
     }
 
     #[test]
@@ -463,32 +618,41 @@ mod tests {
         let runtime = WasmIndexerRuntime::new(&wasm).unwrap();
         let (storage, _dir) = temp_storage();
 
-        // Build input: height=100 + empty block data.
         let mut input = Vec::new();
         input.extend_from_slice(&100u32.to_le_bytes());
         input.extend_from_slice(b"fake_block_data");
 
         let result = runtime.run_block(input, storage, "test");
         assert!(result.is_ok());
-        let pairs = result.unwrap();
-        // Empty flush = no key-value pairs.
-        assert!(pairs.is_empty());
+        assert!(result.unwrap().is_empty());
     }
 
     #[test]
-    fn test_call_view() {
+    fn test_call_view_sync() {
         let wasm = build_view_wasm();
         let runtime = WasmIndexerRuntime::new(&wasm).unwrap();
         let (storage, _dir) = temp_storage();
 
-        let input = b"hello".to_vec();
-        let result = runtime.call_view("get_input_len", input.clone(), storage, "test");
-        assert!(result.is_ok());
+        let result = runtime
+            .call_view("get_input_len", b"hello".to_vec(), storage, "test")
+            .unwrap();
+        assert_eq!(result.len(), 4);
+        let len = u32::from_le_bytes([result[0], result[1], result[2], result[3]]);
+        assert_eq!(len, 5);
+    }
 
-        let output = result.unwrap();
-        // Output should be 4 bytes (u32 LE) containing the input length (5).
-        assert_eq!(output.len(), 4);
-        let len = u32::from_le_bytes([output[0], output[1], output[2], output[3]]);
+    #[tokio::test]
+    async fn test_call_view_async() {
+        let wasm = build_view_wasm();
+        let runtime = WasmIndexerRuntime::new(&wasm).unwrap();
+        let (storage, _dir) = temp_storage();
+
+        let result = runtime
+            .call_view_async("get_input_len", b"hello".to_vec(), storage, "test")
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 4);
+        let len = u32::from_le_bytes([result[0], result[1], result[2], result[3]]);
         assert_eq!(len, 5);
     }
 
@@ -509,7 +673,6 @@ mod tests {
         let runtime = WasmIndexerRuntime::new(&wasm).unwrap();
         let (storage, _dir) = temp_storage();
 
-        // Test with different input sizes.
         for size in [0, 1, 100, 1000] {
             let input = vec![0u8; size];
             let result = runtime
