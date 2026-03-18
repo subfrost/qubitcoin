@@ -85,12 +85,26 @@ impl DevnetState {
         // Index through alkanes
         let pairs = self.alkanes_runtime.run_block(alkanes_height, block_bytes.to_vec(), &self.alkanes_storage)
             .map_err(|e| anyhow::anyhow!("alkanes index: {:?}", e))?;
+        let rune_before = self.alkanes_storage.map().keys()
+            .filter(|k| k.starts_with(b"/runes/proto/")).count();
+
         for (key, value) in &pairs {
-            // Must use append() to match the append-only model that
-            // __get_len/__get use via get_latest(). Using put() would
-            // store raw keys that get_latest() can't find.
             self.alkanes_storage.append(key, value, alkanes_height)
                 .map_err(|e| anyhow::anyhow!("alkanes storage append: {}", e))?;
+        }
+
+        let rune_after = self.alkanes_storage.map().keys()
+            .filter(|k| k.starts_with(b"/runes/proto/")).count();
+        let rune_flushed = pairs.iter().filter(|(k, _)| k.starts_with(b"/runes/proto/")).count();
+
+        if rune_flushed > 0 {
+            // This block flushed rune keys — verify they were stored
+            if rune_after <= rune_before {
+                return Err(anyhow::anyhow!(
+                    "BUG: flushed {} rune keys at height {} but count stayed {}/{}",
+                    rune_flushed, alkanes_height, rune_before, rune_after
+                ));
+            }
         }
         self.alkanes_storage.set_tip_height(alkanes_height + 1)
             .map_err(|e| anyhow::anyhow!("alkanes set height: {}", e))?;

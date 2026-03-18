@@ -160,10 +160,43 @@ impl WebIndexerRuntime {
                     Err(_) => return 0,
                 };
                 let storage = unsafe { &*st.storage_ref };
-                match storage.get_latest(&key) {
-                    Some(v) => v.len() as i32,
-                    None => 0,
+                let result = storage.get_latest(&key);
+                let len = result.as_ref().map(|v| v.len() as i32).unwrap_or(0);
+
+                // Debug: log protorune balance lookups with storage size
+                if key.starts_with(b"/runes/proto/") && key.len() > 60 {
+                    let total_keys = storage.map().len();
+                    // Count rune keys in storage
+                    let rune_keys_in_storage = storage.map().keys()
+                        .filter(|k| k.starts_with(b"/runes/proto/"))
+                        .count();
+                    // Check raw get for the key
+                    let raw_exists = storage.get(&key).is_some();
+                    // Check the append-model wrapper
+                    let len_key = qubitcoin_indexer_core::state::length_key(&key);
+                    let has_length_key = storage.get(&len_key).is_some();
+                    // Check if the length_key is in the HashMap
+                    let len_key_exists_raw = storage.map().contains_key(&len_key);
+                    // Also check if ANY key ends with ffffffff (the length sentinel)
+                    let sentinel_keys = storage.map().keys()
+                        .filter(|k| k.ends_with(&[0xff, 0xff, 0xff, 0xff]) && k.starts_with(b"/runes/proto/"))
+                        .count();
+                    let sample_stored: String = storage.map().keys()
+                        .find(|k| k.ends_with(&[0xff, 0xff, 0xff, 0xff]) && k.starts_with(b"/runes/proto/"))
+                        .map(|k| k.iter().map(|b| format!("{:02x}", b)).collect::<String>())
+                        .unwrap_or_else(|| "none".to_string());
+                    let queried: String = key.iter().map(|b| format!("{:02x}", b)).collect();
+                    let len_key_hex: String = len_key.iter().map(|b| format!("{:02x}", b)).collect();
+                    web_sys::console::log_1(&format!(
+                        "[__get_len] MISMATCH rune_in_store={} sentinel_keys={} len_key_raw={} queried_len={} stored_sample_len={}",
+                        rune_keys_in_storage, sentinel_keys, len_key_exists_raw, key.len(), sample_stored.len() / 2
+                    ).into());
+                    web_sys::console::log_1(&format!("[__get_len] queried: {}", &queried[..queried.len().min(160)]).into());
+                    web_sys::console::log_1(&format!("[__get_len] stored:  {}", &sample_stored[..sample_stored.len().min(160)]).into());
+                    web_sys::console::log_1(&format!("[__get_len] len_key: {}", &len_key_hex[..len_key_hex.len().min(160)]).into());
                 }
+
+                len
             }) as Box<dyn Fn(i32) -> i32>);
             Reflect::set(&env, &"__get_len".into(), closure.as_ref())?;
             closure.forget();
@@ -220,10 +253,51 @@ impl WebIndexerRuntime {
                 let mut pairs = Vec::new();
                 let list = &flush_msg.list;
                 let mut i = 0;
+                let mut rune_keys = 0u32;
+                let mut rune_any_keys = 0u32;
                 while i + 1 < list.len() {
-                    pairs.push((list[i].to_vec(), list[i + 1].to_vec()));
+                    let key = &list[i];
+                    if key.starts_with(b"/runes/byoutpoint/") {
+                        rune_keys += 1;
+                    }
+                    if key.starts_with(b"/runes/proto/") {
+                        rune_any_keys += 1;
+                        let key_hex: String = key.iter().map(|b| format!("{:02x}", b)).collect();
+                        web_sys::console::log_1(&format!(
+                            "[__flush] RUNE KEY len={}: {}", key.len(), key_hex
+                        ).into());
+                    } else if key.starts_with(b"/runes/") || key.starts_with(b"/protorune") {
+                        rune_any_keys += 1;
+                    }
+                    pairs.push((key.to_vec(), list[i + 1].to_vec()));
                     i += 2;
                 }
+                // Log a sample of keys for debugging
+                let sample: Vec<String> = pairs.iter().take(5).map(|(k, v)| {
+                    let key_str = if let Ok(s) = std::str::from_utf8(k) {
+                        s.to_string()
+                    } else {
+                        format!("hex:{}", k.iter().take(30).map(|b| format!("{:02x}", b)).collect::<String>())
+                    };
+                    format!("{}({}b)", key_str, v.len())
+                }).collect();
+                // After storing, verify a rune key is readable (if any)
+                let storage = unsafe { &*st.storage_ref };
+                let mut rune_verify = String::from("n/a");
+                for (key, _val) in &pairs {
+                    if key.starts_with(b"/runes/proto/") {
+                        // Try to read this key back AFTER appending
+                        // (We haven't appended yet — this tests PREVIOUS blocks' data)
+                        let check = storage.get_latest(key);
+                        rune_verify = format!("key_len={} readable={}", key.len(), check.is_some());
+                        break;
+                    }
+                }
+
+                web_sys::console::log_1(&format!(
+                    "[__flush] {} pairs, {} rune_byoutpoint, {} rune_any, verify={}, sample: {:?}",
+                    pairs.len(), rune_keys, rune_any_keys, rune_verify, sample
+                ).into());
                 st.pending_flush = Some(pairs);
                 st.completed = true;
             }) as Box<dyn Fn(i32)>);

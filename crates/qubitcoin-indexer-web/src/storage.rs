@@ -25,7 +25,7 @@ impl WebIndexerStorage {
     }
 
     /// Shared borrow of the inner map.
-    fn map(&self) -> &HashMap<Vec<u8>, Vec<u8>> {
+    pub fn map(&self) -> &HashMap<Vec<u8>, Vec<u8>> {
         // SAFETY: single-threaded WASM — no concurrent access.
         unsafe { &*self.kv.get() }
     }
