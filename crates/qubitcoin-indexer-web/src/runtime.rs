@@ -160,11 +160,17 @@ impl WebIndexerRuntime {
                     Err(_) => return 0,
                 };
                 let storage = unsafe { &*st.storage_ref };
-                // Use raw get — the WASM manages its own key layout
-                match storage.get(&key) {
+                let result = match storage.get(&key) {
                     Some(v) => v.len() as i32,
                     None => 0,
+                };
+                // Log ALL non-zero reads for protorune keys
+                if result > 0 && key.starts_with(b"/runes/proto/") {
+                    web_sys::console::log_1(&format!(
+                        "[__get_len] HIT proto key_len={} val_len={}", key.len(), result
+                    ).into());
                 }
+                result
             }) as Box<dyn Fn(i32) -> i32>);
             Reflect::set(&env, &"__get_len".into(), closure.as_ref())?;
             closure.forget();
