@@ -59,29 +59,31 @@ impl DevnetState {
 
     /// Feed a block through all loaded indexers.
     fn index_block(&mut self, block_bytes: &[u8]) -> Result<()> {
+        // Current tip height (before this block)
+        let alkanes_height = self.alkanes_storage.tip_height();
+
         // Index through alkanes
-        let pairs = self.alkanes_runtime.run_block(block_bytes.to_vec(), &self.alkanes_storage)
+        let pairs = self.alkanes_runtime.run_block(alkanes_height, block_bytes.to_vec(), &self.alkanes_storage)
             .map_err(|e| anyhow::anyhow!("alkanes index: {:?}", e))?;
         for (key, value) in &pairs {
             self.alkanes_storage.put(key, value)
                 .map_err(|e| anyhow::anyhow!("alkanes storage put: {}", e))?;
         }
-        let h = self.alkanes_storage.tip_height();
-        self.alkanes_storage.set_tip_height(h + 1)
+        self.alkanes_storage.set_tip_height(alkanes_height + 1)
             .map_err(|e| anyhow::anyhow!("alkanes set height: {}", e))?;
 
         // Index through esplora (if loaded)
         if let (Some(ref runtime), Some(ref mut storage)) =
             (&self.esplora_runtime, &mut self.esplora_storage)
         {
-            let pairs = runtime.run_block(block_bytes.to_vec(), storage)
+            let esplora_height = storage.tip_height();
+            let pairs = runtime.run_block(esplora_height, block_bytes.to_vec(), storage)
                 .map_err(|e| anyhow::anyhow!("esplora index: {:?}", e))?;
             for (key, value) in &pairs {
                 storage.put(key, value)
                     .map_err(|e| anyhow::anyhow!("esplora storage put: {}", e))?;
             }
-            let h = storage.tip_height();
-            storage.set_tip_height(h + 1)
+            storage.set_tip_height(esplora_height + 1)
                 .map_err(|e| anyhow::anyhow!("esplora set height: {}", e))?;
         }
 
@@ -295,14 +297,26 @@ impl MetashrewBackend for DevnetMetashrewBackend {
                 let hex_input = request.params.get(1)
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                let block_tag = request.params.get(2)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("latest");
 
                 let input_hex = hex_input.strip_prefix("0x").unwrap_or(hex_input);
                 let input_bytes = hex::decode(input_hex)
                     .map_err(|e| anyhow::anyhow!("invalid hex input: {}", e))?;
 
                 let state = self.state.borrow();
+
+                // Resolve block_tag to height
+                let height = if block_tag == "latest" {
+                    state.alkanes_storage.tip_height().saturating_sub(1)
+                } else {
+                    block_tag.parse::<u32>().unwrap_or(0)
+                };
+
                 let result = state.alkanes_runtime.call_view(
                     view_method,
+                    height,
                     input_bytes,
                     &state.alkanes_storage,
                 ).map_err(|e| anyhow::anyhow!("view call failed: {:?}", e))?;
@@ -369,7 +383,8 @@ impl EsploraBackend for DevnetEsploraBackend {
                 let addr = path.strip_prefix("/address/")
                     .and_then(|s| s.strip_suffix("/utxo"))
                     .unwrap_or("");
-                if let Ok(result) = runtime.call_view("address_utxo", addr.as_bytes().to_vec(), storage) {
+                let esplora_height = storage.tip_height().saturating_sub(1);
+                if let Ok(result) = runtime.call_view("address_utxo", esplora_height, addr.as_bytes().to_vec(), storage) {
                     if let Ok(json_str) = String::from_utf8(result) {
                         if let Ok(parsed) = serde_json::from_str::<Value>(&json_str) {
                             return Ok(parsed);
@@ -423,7 +438,8 @@ impl EsploraBackend for DevnetEsploraBackend {
         if let (Some(ref runtime), Some(ref storage)) =
             (&state.esplora_runtime, &state.esplora_storage)
         {
-            if let Ok(result) = runtime.call_view("rest", path.as_bytes().to_vec(), storage) {
+            let esplora_height = storage.tip_height().saturating_sub(1);
+            if let Ok(result) = runtime.call_view("rest", esplora_height, path.as_bytes().to_vec(), storage) {
                 if let Ok(json_str) = String::from_utf8(result) {
                     if let Ok(parsed) = serde_json::from_str::<Value>(&json_str) {
                         return Ok(parsed);

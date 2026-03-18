@@ -28,12 +28,21 @@ impl WebIndexerRuntime {
 
     /// Run `_start()` for block processing.
     ///
+    /// The `height` is prepended as a 4-byte little-endian prefix to `block_data`,
+    /// matching the metashrew ABI that WASM indexers expect from `__load_input`.
+    ///
     /// Returns the key-value pairs to flush to storage.
     pub fn run_block(
         &self,
-        input_data: Vec<u8>,
+        height: u32,
+        block_data: Vec<u8>,
         storage: &WebIndexerStorage,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, JsValue> {
+        // Metashrew ABI: input = [height_le32 ++ block_data]
+        let mut input_data = Vec::with_capacity(4 + block_data.len());
+        input_data.extend_from_slice(&height.to_le_bytes());
+        input_data.extend_from_slice(&block_data);
+
         let state = Rc::new(RefCell::new(HostState {
             input_data,
             pending_flush: None,
@@ -67,12 +76,21 @@ impl WebIndexerRuntime {
     }
 
     /// Call a view function.
+    ///
+    /// The `height` is prepended as a 4-byte little-endian prefix to `payload`,
+    /// matching the metashrew ABI that WASM indexers expect from `__load_input`.
     pub fn call_view(
         &self,
         fn_name: &str,
-        input_data: Vec<u8>,
+        height: u32,
+        payload: Vec<u8>,
         storage: &WebIndexerStorage,
     ) -> Result<Vec<u8>, JsValue> {
+        // Metashrew ABI: input = [height_le32 ++ payload]
+        let mut input_data = Vec::with_capacity(4 + payload.len());
+        input_data.extend_from_slice(&height.to_le_bytes());
+        input_data.extend_from_slice(&payload);
+
         let state = Rc::new(RefCell::new(HostState {
             input_data,
             pending_flush: None,

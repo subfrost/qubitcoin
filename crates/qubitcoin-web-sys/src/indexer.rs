@@ -36,7 +36,8 @@ impl SecondaryIndexer {
     /// flushed to the in-memory store.
     #[wasm_bindgen(js_name = "processBlock")]
     pub fn process_block(&mut self, block_data: &[u8]) -> Result<(), JsValue> {
-        let pairs = self.runtime.run_block(block_data.to_vec(), &self.storage)?;
+        let h = self.storage.tip_height();
+        let pairs = self.runtime.run_block(h, block_data.to_vec(), &self.storage)?;
 
         // Apply key-value pairs to storage.
         for (key, value) in &pairs {
@@ -45,7 +46,6 @@ impl SecondaryIndexer {
         }
 
         // Bump tip height.
-        let h = self.storage.tip_height();
         self.storage.set_tip_height(h + 1)
             .map_err(|e| JsValue::from_str(&e))?;
         Ok(())
@@ -53,10 +53,11 @@ impl SecondaryIndexer {
 
     /// Call a named view function on the indexer.
     ///
+    /// `height` is the block height context for the view call.
     /// Returns the raw result bytes.
     #[wasm_bindgen(js_name = "callView")]
-    pub fn call_view(&self, fn_name: &str, input: &[u8]) -> Result<Vec<u8>, JsValue> {
-        self.runtime.call_view(fn_name, input.to_vec(), &self.storage)
+    pub fn call_view(&self, fn_name: &str, height: u32, input: &[u8]) -> Result<Vec<u8>, JsValue> {
+        self.runtime.call_view(fn_name, height, input.to_vec(), &self.storage)
     }
 
     /// Current indexer tip height.

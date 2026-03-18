@@ -50,11 +50,12 @@ export class IndexerRuntime {
   /**
    * Call a named view function on the indexer.
    *
+   * `height` is the block height context for the view call.
    * Returns the raw result bytes. Interpretation depends on the
    * specific indexer module.
    */
-  callView(name: string, input: Uint8Array): Uint8Array {
-    return this.inner.callView(name, input);
+  callView(name: string, height: number, input: Uint8Array): Uint8Array {
+    return this.inner.callView(name, height, input);
   }
 
   /** Compute the sparse Merkle tree state root. */

@@ -31,10 +31,11 @@ export declare class IndexerRuntime {
     /**
      * Call a named view function on the indexer.
      *
+     * `height` is the block height context for the view call.
      * Returns the raw result bytes. Interpretation depends on the
      * specific indexer module.
      */
-    callView(name: string, input: Uint8Array): Uint8Array;
+    callView(name: string, height: number, input: Uint8Array): Uint8Array;
     /** Compute the sparse Merkle tree state root. */
     stateRoot(): Uint8Array;
     /**
