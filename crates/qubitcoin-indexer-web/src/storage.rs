@@ -158,6 +158,71 @@ mod tests {
     }
 
     #[test]
+    fn test_protorune_balance_sheet_pattern() {
+        // Simulate the exact pattern the protorune runtime uses:
+        // 1. Block N: Flush writes balance sheet for outpoint
+        // 2. Block N+1: __get_len/__get reads it back via get_latest
+        let storage = WebIndexerStorage::new();
+
+        // Simulate flush from block 100 (DIESEL mint)
+        // Key: /runes/byoutpoint/<outpoint_bytes>/<sub_key>
+        let outpoint = b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20\x00\x00\x00\x00";
+        let base_key = b"/runes/byoutpoint/";
+
+        // Full key with outpoint (36 bytes for txid:vout)
+        let mut full_key = Vec::new();
+        full_key.extend_from_slice(base_key);
+        full_key.extend_from_slice(outpoint);
+
+        let value = b"some_balance_data";
+
+        // Store via append (simulating what index_block does with flush pairs)
+        storage.append(&full_key, value, 100).unwrap();
+
+        // Read via get_latest (simulating what __get_len/__get does)
+        let result = storage.get_latest(&full_key);
+        assert_eq!(result, Some(value.to_vec()), "get_latest should find the appended value");
+
+        // Also test the IndexPointer-style nested key pattern
+        // /runes/byoutpoint/<outpoint>/length
+        let mut length_key = full_key.clone();
+        length_key.extend_from_slice(b"/length");
+
+        storage.append(&length_key, &1u32.to_le_bytes(), 100).unwrap();
+
+        let length_result = storage.get_latest(&length_key);
+        assert_eq!(length_result, Some(1u32.to_le_bytes().to_vec()));
+
+        // Test /runes/byoutpoint/<outpoint>/0
+        let mut index_key = full_key.clone();
+        index_key.extend_from_slice(b"/0");
+
+        storage.append(&index_key, b"entry_0_data", 100).unwrap();
+
+        let index_result = storage.get_latest(&index_key);
+        assert_eq!(index_result, Some(b"entry_0_data".to_vec()));
+    }
+
+    #[test]
+    fn test_multiple_block_append_get_latest() {
+        // Verify that data appended in block N is readable in block N+1
+        let storage = WebIndexerStorage::new();
+
+        let key = b"/test/key";
+
+        // Block 0: append "first"
+        storage.append(key, b"first", 0).unwrap();
+        assert_eq!(storage.get_latest(key), Some(b"first".to_vec()));
+
+        // Block 1: append "second" (same key, new value)
+        storage.append(key, b"second", 1).unwrap();
+        assert_eq!(storage.get_latest(key), Some(b"second".to_vec()));
+
+        // Length should be 2
+        assert_eq!(storage.get_length(key), 2);
+    }
+
+    #[test]
     fn test_keys_with_lengths() {
         let storage = WebIndexerStorage::new();
         storage.append(b"alpha", b"val1", 10).unwrap();
