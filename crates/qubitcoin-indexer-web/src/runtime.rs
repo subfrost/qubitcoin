@@ -160,7 +160,8 @@ impl WebIndexerRuntime {
                     Err(_) => return 0,
                 };
                 let storage = unsafe { &*st.storage_ref };
-                match storage.get_latest(&key) {
+                // Use raw get — the WASM manages its own key layout
+                match storage.get(&key) {
                     Some(v) => v.len() as i32,
                     None => 0,
                 }
@@ -183,7 +184,8 @@ impl WebIndexerRuntime {
                     Err(_) => return,
                 };
                 let storage = unsafe { &*st.storage_ref };
-                if let Some(value) = storage.get_latest(&key) {
+                // Use raw get — matches raw put in index_block
+                if let Some(value) = storage.get(&key) {
                     write_to_memory(memory, value_ptr as u32, &value);
                 }
             }) as Box<dyn Fn(i32, i32)>);

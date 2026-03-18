@@ -91,8 +91,13 @@ impl DevnetState {
         let keys_after_run = self.alkanes_storage.map().len();
 
         for (key, value) in &pairs {
-            self.alkanes_storage.append(key, value, alkanes_height)
-                .map_err(|e| anyhow::anyhow!("alkanes storage append: {}", e))?;
+            // Use raw put instead of append — the WASM manages its own
+            // key layout (IndexPointer with /length, /N suffixes).
+            // The append-only wrapping with u32::MAX sentinels is WRONG
+            // for this use case — it double-wraps keys that are already
+            // structured by the WASM's IndexPointer.
+            self.alkanes_storage.put(key, value)
+                .map_err(|e| anyhow::anyhow!("alkanes storage put: {}", e))?;
         }
 
         let keys_after_append = self.alkanes_storage.map().len();
