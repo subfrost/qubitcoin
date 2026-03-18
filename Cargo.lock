@@ -3613,6 +3613,7 @@ dependencies = [
  "alkanes-rpc-core",
  "anyhow",
  "async-trait",
+ "bech32 0.11.1",
  "hex",
  "js-sys",
  "qubitcoin-common",
@@ -3628,6 +3629,7 @@ dependencies = [
  "qubitcoin-util",
  "serde",
  "serde_json",
+ "sha2",
  "wasm-bindgen",
 ]
 

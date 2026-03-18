@@ -25,6 +25,26 @@ use qubitcoin_primitives::Amount;
 
 use crate::types;
 
+/// Decode a bech32/bech32m segwit address to its witness program scriptPubKey.
+///
+/// Returns `Some(script_bytes)` for valid segwit addresses (bc1/tb1/bcrt1).
+/// The scriptPubKey format is: `[witness_version_opcode] [push_len] [witness_program]`
+fn address_to_script(address: &str) -> Option<Vec<u8>> {
+    // segwit_decode handles both bech32 (v0) and bech32m (v1+)
+    let (_, witness_version, program) = bech32::segwit::decode(address).ok()?;
+
+    // Build scriptPubKey
+    let version_opcode = match witness_version.to_u8() {
+        0 => 0x00u8,  // OP_0
+        n => 0x50 + n, // OP_1..OP_16
+    };
+    let mut script = Vec::with_capacity(2 + program.len());
+    script.push(version_opcode);
+    script.push(program.len() as u8);
+    script.extend_from_slice(&program);
+    Some(script)
+}
+
 /// Shared devnet state accessible by all backends via Rc<RefCell<...>>.
 pub struct DevnetState {
     pub chain: TestChain,
@@ -347,15 +367,46 @@ pub struct DevnetEsploraBackend {
 }
 
 impl DevnetEsploraBackend {
-    /// Scan the chain for unspent outputs matching the coinbase script.
+    /// Scan the chain for unspent outputs matching a given address.
     ///
-    /// This is the devnet fallback when no esplora indexer is loaded.
-    /// Since all mining rewards go to the devnet key, this covers the
-    /// primary use case for integration tests.
-    fn coinbase_utxos_as_esplora(&self, state: &DevnetState) -> Value {
-        let script = state.chain.coinbase_script();
-        let utxos = state.chain.utxos_for_script(script);
+    /// Tries the esplora indexer's `utxosbyscripthash` view function first.
+    /// Falls back to scanning the chain's UTXO set by scriptPubKey.
+    fn utxos_for_address(&self, state: &DevnetState, address: &str) -> Value {
+        let script = match address_to_script(address) {
+            Some(s) => s,
+            None => return json!([]),
+        };
 
+        // Try esplora indexer with scripthash
+        if let (Some(ref runtime), Some(ref storage)) =
+            (&state.esplora_runtime, &state.esplora_storage)
+        {
+            use sha2::{Sha256, Digest};
+            let mut hasher = Sha256::new();
+            hasher.update(&script);
+            let script_hash: [u8; 32] = hasher.finalize().into();
+            let sh_hex = hex::encode(script_hash);
+
+            let esplora_height = storage.tip_height().saturating_sub(1);
+            if let Ok(result) = runtime.call_view(
+                "utxosbyscripthash",
+                esplora_height,
+                sh_hex.as_bytes().to_vec(),
+                storage,
+            ) {
+                if let Ok(json_str) = String::from_utf8(result) {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&json_str) {
+                        if parsed.is_array() {
+                            return parsed;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: scan chain UTXO set directly by scriptPubKey
+        let script_ref = qubitcoin_script::Script::from_bytes(script);
+        let utxos = state.chain.utxos_for_script(&script_ref);
         let result: Vec<Value> = utxos.iter().map(|(outpoint, value, height)| {
             json!({
                 "txid": outpoint.hash.to_hex(),
@@ -367,7 +418,6 @@ impl DevnetEsploraBackend {
                 }
             })
         }).collect();
-
         json!(result)
     }
 }
@@ -379,24 +429,10 @@ impl EsploraBackend for DevnetEsploraBackend {
 
         // Route esplora REST paths
         if path.starts_with("/address/") && path.ends_with("/utxo") {
-            // Try esplora indexer first
-            if let (Some(ref runtime), Some(ref storage)) =
-                (&state.esplora_runtime, &state.esplora_storage)
-            {
-                let addr = path.strip_prefix("/address/")
-                    .and_then(|s| s.strip_suffix("/utxo"))
-                    .unwrap_or("");
-                let esplora_height = storage.tip_height().saturating_sub(1);
-                if let Ok(result) = runtime.call_view("address_utxo", esplora_height, addr.as_bytes().to_vec(), storage) {
-                    if let Ok(json_str) = String::from_utf8(result) {
-                        if let Ok(parsed) = serde_json::from_str::<Value>(&json_str) {
-                            return Ok(parsed);
-                        }
-                    }
-                }
-            }
-            // Fallback: return coinbase UTXOs (devnet mines to its own key)
-            return Ok(self.coinbase_utxos_as_esplora(&state));
+            let addr = path.strip_prefix("/address/")
+                .and_then(|s| s.strip_suffix("/utxo"))
+                .unwrap_or("");
+            return Ok(self.utxos_for_address(&state, addr));
         }
 
         if path == "/fee-estimates" {
