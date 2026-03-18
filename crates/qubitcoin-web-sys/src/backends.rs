@@ -66,8 +66,11 @@ impl DevnetState {
         let pairs = self.alkanes_runtime.run_block(alkanes_height, block_bytes.to_vec(), &self.alkanes_storage)
             .map_err(|e| anyhow::anyhow!("alkanes index: {:?}", e))?;
         for (key, value) in &pairs {
-            self.alkanes_storage.put(key, value)
-                .map_err(|e| anyhow::anyhow!("alkanes storage put: {}", e))?;
+            // Must use append() to match the append-only model that
+            // __get_len/__get use via get_latest(). Using put() would
+            // store raw keys that get_latest() can't find.
+            self.alkanes_storage.append(key, value, alkanes_height)
+                .map_err(|e| anyhow::anyhow!("alkanes storage append: {}", e))?;
         }
         self.alkanes_storage.set_tip_height(alkanes_height + 1)
             .map_err(|e| anyhow::anyhow!("alkanes set height: {}", e))?;
@@ -80,8 +83,8 @@ impl DevnetState {
             let pairs = runtime.run_block(esplora_height, block_bytes.to_vec(), storage)
                 .map_err(|e| anyhow::anyhow!("esplora index: {:?}", e))?;
             for (key, value) in &pairs {
-                storage.put(key, value)
-                    .map_err(|e| anyhow::anyhow!("esplora storage put: {}", e))?;
+                storage.append(key, value, esplora_height)
+                    .map_err(|e| anyhow::anyhow!("esplora storage append: {}", e))?;
             }
             storage.set_tip_height(esplora_height + 1)
                 .map_err(|e| anyhow::anyhow!("esplora set height: {}", e))?;

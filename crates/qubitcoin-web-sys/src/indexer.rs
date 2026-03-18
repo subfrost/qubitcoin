@@ -39,9 +39,9 @@ impl SecondaryIndexer {
         let h = self.storage.tip_height();
         let pairs = self.runtime.run_block(h, block_data.to_vec(), &self.storage)?;
 
-        // Apply key-value pairs to storage.
+        // Apply key-value pairs using append-only model (matches get_latest() reads).
         for (key, value) in &pairs {
-            self.storage.put(key, value)
+            self.storage.append(key, value, h)
                 .map_err(|e| JsValue::from_str(&e))?;
         }
 
