@@ -240,9 +240,12 @@ impl WebIndexerRuntime {
                     Some(m) => m,
                     None => return,
                 };
-                // Best-effort: read the message and ignore it.
-                // web_sys::console::log would require adding the web-sys dep.
-                let _ = read_arraybuffer(memory, ptr);
+                // Read and log the message via web_sys::console
+                if let Ok(msg_bytes) = read_arraybuffer(memory, ptr) {
+                    if let Ok(msg) = String::from_utf8(msg_bytes) {
+                        web_sys::console::log_1(&msg.into());
+                    }
+                }
             }) as Box<dyn Fn(i32)>);
             Reflect::set(&env, &"__log".into(), closure.as_ref())?;
             closure.forget();
