@@ -83,26 +83,44 @@ impl DevnetState {
         let alkanes_height = self.alkanes_storage.tip_height();
 
         // Index through alkanes
+        let keys_before = self.alkanes_storage.map().len();
+
         let pairs = self.alkanes_runtime.run_block(alkanes_height, block_bytes.to_vec(), &self.alkanes_storage)
             .map_err(|e| anyhow::anyhow!("alkanes index: {:?}", e))?;
-        let rune_before = self.alkanes_storage.map().keys()
-            .filter(|k| k.starts_with(b"/runes/proto/")).count();
+
+        let keys_after_run = self.alkanes_storage.map().len();
 
         for (key, value) in &pairs {
             self.alkanes_storage.append(key, value, alkanes_height)
                 .map_err(|e| anyhow::anyhow!("alkanes storage append: {}", e))?;
         }
 
-        let rune_after = self.alkanes_storage.map().keys()
-            .filter(|k| k.starts_with(b"/runes/proto/")).count();
-        let rune_flushed = pairs.iter().filter(|(k, _)| k.starts_with(b"/runes/proto/")).count();
+        let keys_after_append = self.alkanes_storage.map().len();
 
-        if rune_flushed > 0 {
-            // This block flushed rune keys — verify they were stored
-            if rune_after <= rune_before {
+        // CRITICAL CHECK: did run_block MODIFY the storage?
+        if keys_after_run != keys_before {
+            return Err(anyhow::anyhow!(
+                "BUG: run_block modified storage! height={} before={} after_run={} after_append={}",
+                alkanes_height, keys_before, keys_after_run, keys_after_append
+            ));
+        }
+
+        // Store a sentinel key that we can check later
+        if keys_after_append > keys_before {
+            let sentinel = format!("__test_sentinel_{}", alkanes_height);
+            self.alkanes_storage.put(sentinel.as_bytes(), &keys_after_append.to_le_bytes())
+                .map_err(|e| anyhow::anyhow!("sentinel put: {}", e))?;
+        }
+
+        // Check previous sentinel (did data survive from previous block?)
+        if alkanes_height > 1 {
+            let prev_sentinel = format!("__test_sentinel_{}", alkanes_height - 1);
+            let check = self.alkanes_storage.get(prev_sentinel.as_bytes());
+            if check.is_none() && alkanes_height < 5 {
+                // Only check first few blocks to avoid noise
                 return Err(anyhow::anyhow!(
-                    "BUG: flushed {} rune keys at height {} but count stayed {}/{}",
-                    rune_flushed, alkanes_height, rune_before, rune_after
+                    "BUG: sentinel from height {} not found at height {}! keys_before={}",
+                    alkanes_height - 1, alkanes_height, keys_before
                 ));
             }
         }
