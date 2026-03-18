@@ -214,10 +214,39 @@ impl BitcoinBackend for DevnetBitcoinBackend {
                 Ok(JsonRpcResponse::success(json!(txid), id))
             }
             "getrawtransaction" => {
-                // Not easily supported without a tx index — return error
+                let txid_hex = params.get(0)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let verbose = params.get(1)
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+
+                let state = self.state.borrow();
+                // Scan blocks for matching txid
+                for block in (0..=state.chain.height()).filter_map(|h| state.chain.block_at(h)) {
+                    for tx in &block.vtx {
+                        if tx.txid().to_hex() == txid_hex {
+                            if verbose == 0 {
+                                // Return raw hex
+                                if let Ok(bytes) = serialize(tx.as_ref()) {
+                                    return Ok(JsonRpcResponse::success(json!(hex::encode(&bytes)), id));
+                                }
+                            } else {
+                                // Return basic tx info (verbose)
+                                if let Ok(bytes) = serialize(tx.as_ref()) {
+                                    return Ok(JsonRpcResponse::success(json!({
+                                        "hex": hex::encode(&bytes),
+                                        "txid": txid_hex,
+                                        "size": bytes.len(),
+                                    }), id));
+                                }
+                            }
+                        }
+                    }
+                }
                 Ok(JsonRpcResponse::error(
                     INTERNAL_ERROR,
-                    "getrawtransaction not supported in devnet".to_string(),
+                    format!("Transaction not found: {}", txid_hex),
                     id,
                 ))
             }
