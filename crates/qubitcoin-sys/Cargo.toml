@@ -1,0 +1,29 @@
+[package]
+name = "qubitcoin-sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Native embedding library for Qubitcoin — RocksDB storage, full validation, indexer runtime"
+
+[dependencies]
+# Core crates with native features
+qubitcoin-crypto = { workspace = true, features = ["native"] }
+qubitcoin-primitives = { workspace = true }
+qubitcoin-serialize = { workspace = true }
+qubitcoin-script = { workspace = true }
+qubitcoin-consensus = { workspace = true }
+qubitcoin-storage = { workspace = true, features = ["rocksdb-backend"] }
+qubitcoin-util = { workspace = true, features = ["native"] }
+qubitcoin-common = { workspace = true, features = ["native"] }
+qubitcoin-node = { workspace = true, features = ["filesystem", "parallel", "native-deps"] }
+qubitcoin-indexer = { workspace = true }
+qubitcoin-indexer-core = { workspace = true }
+
+# External
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }

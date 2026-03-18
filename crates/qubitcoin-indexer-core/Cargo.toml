@@ -1,0 +1,14 @@
+[package]
+name = "qubitcoin-indexer-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared indexer traits and state layout for Qubitcoin secondary indexers"
+
+[dependencies]
+prost = "0.12"
+sha2 = "0.10"
+
+[build-dependencies]
+prost-build = "0.12"

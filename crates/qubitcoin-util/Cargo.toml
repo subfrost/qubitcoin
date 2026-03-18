@@ -6,10 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 description = "Utility functions for Qubitcoin: logging, time, fs, args, thread names"
 
+[features]
+default = ["native"]
+native = ["tracing-subscriber"]
+wasm = []
+
 [dependencies]
 log = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 

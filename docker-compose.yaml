@@ -1,0 +1,27 @@
+services:
+  qubitcoind:
+    build: .
+    container_name: qubitcoind
+    restart: unless-stopped
+    ports:
+      - "8333:8333"   # P2P
+      - "8332:8332"   # RPC
+    volumes:
+      - qbc-data:/home/qubitcoin/.qubitcoin
+    command:
+      - qubitcoind
+      - -dbcache=2048
+      - -maxconnections=32
+      - -rpcallowip=0.0.0.0/0
+      - -rpcbind=0.0.0.0
+      - -rpcuser=qubitcoin
+      - -rpcpassword=qubitcoin
+      - -printtoconsole
+    deploy:
+      resources:
+        limits:
+          memory: 8g
+    stop_grace_period: 600s
+
+volumes:
+  qbc-data:

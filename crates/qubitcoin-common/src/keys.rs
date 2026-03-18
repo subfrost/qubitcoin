@@ -49,6 +49,7 @@ impl Key {
     }
 
     /// Generate a new random private key (compressed by default).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn generate() -> Self {
         let secp = secp256k1::Secp256k1::new();
         let (secret_key, _) = secp.generate_keypair(&mut rand::thread_rng());
@@ -85,7 +86,10 @@ impl Key {
         let secp = secp256k1::Secp256k1::new();
         let keypair = secp256k1::Keypair::from_secret_key(&secp, &self.inner);
         let msg = secp256k1::Message::from_digest_slice(hash.as_bytes())?;
+        #[cfg(feature = "rand")]
         let sig = secp.sign_schnorr(&msg, &keypair);
+        #[cfg(not(feature = "rand"))]
+        let sig = secp.sign_schnorr_no_aux_rand(&msg, &keypair);
         Ok(sig.serialize())
     }
 

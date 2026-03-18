@@ -22,6 +22,7 @@ use qubitcoin_script::script::Script;
 use qubitcoin_script::script_error::ScriptError;
 use qubitcoin_script::script_num::ScriptNum;
 use qubitcoin_script::verify_flags::ScriptVerifyFlags;
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use std::sync::Arc;
 
@@ -503,10 +504,22 @@ pub fn verify_scripts_parallel(checks: &[ScriptCheck]) -> Result<(), ScriptCheck
         return Ok(());
     }
 
-    // Use Rayon's parallel iterator with early termination via try_for_each
-    checks
-        .par_iter()
-        .try_for_each(|check| verify_single_script(check))
+    #[cfg(feature = "parallel")]
+    {
+        // Use Rayon's parallel iterator with early termination via try_for_each
+        checks
+            .par_iter()
+            .try_for_each(|check| verify_single_script(check))
+    }
+
+    #[cfg(not(feature = "parallel"))]
+    {
+        // Sequential fallback for WASM and other non-parallel targets
+        for check in checks {
+            verify_single_script(check)?;
+        }
+        Ok(())
+    }
 }
 
 /// Verify a single script check.
@@ -634,6 +647,7 @@ impl Default for ScriptCheckConfig {
 
 impl ScriptCheckConfig {
     /// Initialize the global Rayon thread pool with our configuration.
+    #[cfg(feature = "parallel")]
     pub fn init_thread_pool(&self) -> Result<(), rayon::ThreadPoolBuildError> {
         let mut builder = rayon::ThreadPoolBuilder::new();
         if self.max_threads > 0 {

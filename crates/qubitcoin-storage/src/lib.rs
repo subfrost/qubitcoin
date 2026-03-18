@@ -10,6 +10,7 @@
 //! - [`BlockFileManager`] -- flat-file block storage (`blk?????.dat`).
 
 /// Flat-file block storage manager. Equivalent to `FlatFileSeq` / `BlockManager` in Bitcoin Core.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod block_file;
 /// In-memory database backend for testing.
 pub mod memory;
@@ -21,6 +22,7 @@ pub mod traits;
 /// Typed serialization wrapper with XOR obfuscation. Equivalent to `CDBWrapper` in Bitcoin Core.
 pub mod wrapper;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use block_file::{
     BlockFileManager, BlockFilePos, MAINNET_MAGIC, MAX_BLOCKFILE_SIZE, STORAGE_HEADER_BYTES,
 };

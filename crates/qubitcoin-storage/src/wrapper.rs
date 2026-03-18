@@ -44,9 +44,12 @@ impl<D: Database> DbWrapper<D> {
                 key
             } else {
                 // Generate new key
+                #[cfg(feature = "rand")]
                 let key: Vec<u8> = (0..OBFUSCATION_KEY_LEN)
                     .map(|_| rand::random::<u8>())
                     .collect();
+                #[cfg(not(feature = "rand"))]
+                let key: Vec<u8> = vec![0x1a, 0x2b, 0x3c, 0x4d, 0x5e, 0x6f, 0x70, 0x81];
                 // Store it
                 let mut batch = db.new_batch();
                 batch.put(OBFUSCATION_KEY_KEY, &key);

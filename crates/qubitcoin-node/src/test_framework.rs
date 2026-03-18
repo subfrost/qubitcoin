@@ -51,12 +51,9 @@ pub struct TestChain {
 }
 
 impl TestChain {
-    /// Create a new `TestChain` with regtest parameters.
-    ///
-    /// Automatically mines the genesis block so the chain starts at height 0.
-    pub fn new() -> Self {
+    /// Create a new `TestChain` with a specific coinbase key (P2PKH outputs).
+    pub fn new_with_key(coinbase_key: Key) -> Self {
         let params = ChainParams::regtest();
-        let coinbase_key = Key::generate();
         let coinbase_pubkey = coinbase_key.get_pubkey();
         let pubkey_hash = coinbase_pubkey.get_id();
         let coinbase_script = build_p2pkh(&pubkey_hash);
@@ -78,6 +75,71 @@ impl TestChain {
 
         chain.initialize_genesis();
         chain
+    }
+
+    /// Create a new `TestChain` with P2WPKH coinbase outputs (native segwit).
+    ///
+    /// Use this when the coinbase outputs need to be spendable by wallets
+    /// that expect BIP84 native segwit addresses (bcrt1q...).
+    pub fn new_with_key_wpkh(coinbase_key: Key) -> Self {
+        use qubitcoin_script::build_p2wpkh;
+        let params = ChainParams::regtest();
+        let coinbase_pubkey = coinbase_key.get_pubkey();
+        let pubkey_hash = coinbase_pubkey.get_id();
+        let coinbase_script = build_p2wpkh(&pubkey_hash);
+
+        let coins = CoinsViewCache::new(Box::new(EmptyCoinsView));
+
+        let mut chain = TestChain {
+            params,
+            blocks: Vec::new(),
+            headers: Vec::new(),
+            coins,
+            height: -1,
+            tip_hash: BlockHash::ZERO,
+            coinbase_key,
+            coinbase_pubkey,
+            coinbase_script,
+            coinbase_txns: Vec::new(),
+        };
+
+        chain.initialize_genesis();
+        chain
+    }
+
+    /// Create a new `TestChain` with a custom coinbase script.
+    ///
+    /// The key is still needed for signing, but the script determines which
+    /// address receives mining rewards.
+    pub fn new_with_key_and_script(coinbase_key: Key, coinbase_script: Script) -> Self {
+        let params = ChainParams::regtest();
+        let coinbase_pubkey = coinbase_key.get_pubkey();
+
+        let coins = CoinsViewCache::new(Box::new(EmptyCoinsView));
+
+        let mut chain = TestChain {
+            params,
+            blocks: Vec::new(),
+            headers: Vec::new(),
+            coins,
+            height: -1,
+            tip_hash: BlockHash::ZERO,
+            coinbase_key,
+            coinbase_pubkey,
+            coinbase_script,
+            coinbase_txns: Vec::new(),
+        };
+
+        chain.initialize_genesis();
+        chain
+    }
+
+    /// Create a new `TestChain` with regtest parameters and a random key.
+    ///
+    /// Automatically mines the genesis block so the chain starts at height 0.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new() -> Self {
+        Self::new_with_key(Key::generate())
     }
 
     // --- Public accessors ------------------------------------------------
@@ -288,6 +350,36 @@ impl TestChain {
             }
         }
         None
+    }
+
+    /// Return all unspent transaction outputs whose scriptPubKey matches `script`.
+    ///
+    /// Iterates all blocks, all transactions, all outputs, and checks the
+    /// UTXO set. Suitable for devnet where the chain is small.
+    pub fn utxos_for_script(&self, script: &Script) -> Vec<(OutPoint, Amount, i32)> {
+        let mut result = Vec::new();
+        for (h, block) in self.blocks.iter().enumerate() {
+            let height = h as i32;
+            for (tx_idx, tx) in block.vtx.iter().enumerate() {
+                for (vout_idx, txout) in tx.vout.iter().enumerate() {
+                    if txout.script_pubkey == *script {
+                        let outpoint = OutPoint::new(*tx.txid(), vout_idx as u32);
+                        if self.coins.have_coin(&outpoint) {
+                            // For coinbase outputs, check maturity
+                            if tx_idx == 0 {
+                                // Coinbase: must have COINBASE_MATURITY confirmations
+                                let depth = self.height - height;
+                                if depth < COINBASE_MATURITY {
+                                    continue;
+                                }
+                            }
+                            result.push((outpoint, txout.value, height));
+                        }
+                    }
+                }
+            }
+        }
+        result
     }
 
     // --- Internal helpers --------------------------------------------------

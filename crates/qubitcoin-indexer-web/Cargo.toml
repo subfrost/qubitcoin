@@ -1,0 +1,13 @@
+[package]
+name = "qubitcoin-indexer-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Browser-compatible WASM indexer runtime using js-sys WebAssembly API"
+
+[dependencies]
+qubitcoin-indexer-core = { workspace = true }
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }
+prost = "0.12"

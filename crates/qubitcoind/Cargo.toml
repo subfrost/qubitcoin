@@ -11,14 +11,14 @@ name = "qubitcoind"
 path = "src/main.rs"
 
 [dependencies]
-qubitcoin-util = { workspace = true }
-qubitcoin-common = { workspace = true }
+qubitcoin-util = { workspace = true, features = ["native"] }
+qubitcoin-common = { workspace = true, features = ["native"] }
 qubitcoin-consensus = { workspace = true }
 qubitcoin-primitives = { workspace = true }
-qubitcoin-node = { workspace = true }
+qubitcoin-node = { workspace = true, features = ["filesystem", "parallel"] }
 qubitcoin-net = { workspace = true }
 qubitcoin-rpc = { workspace = true }
-qubitcoin-storage = { workspace = true }
+qubitcoin-storage = { workspace = true, features = ["rocksdb-backend"] }
 qubitcoin-script = { workspace = true }
 qubitcoin-serialize = { workspace = true }
 qubitcoin-wallet = { workspace = true }

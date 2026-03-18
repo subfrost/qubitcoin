@@ -26,6 +26,7 @@ pub mod block_index_db;
 
 /// Block storage using flat files (`blk*.dat` and `rev*.dat`).
 /// Equivalent to `src/node/blockstorage.cpp` in Bitcoin Core.
+#[cfg(feature = "filesystem")]
 pub mod block_storage;
 
 /// Transaction index database: maps txid to on-disk position.
@@ -42,6 +43,7 @@ pub mod mempool;
 
 /// Memory-mapped block file I/O for zero-copy reads.
 /// An improvement over Bitcoin Core's standard file I/O approach.
+#[cfg(feature = "filesystem")]
 pub mod mmap_storage;
 
 /// Parallel script verification using Rayon's work-stealing scheduler.

@@ -7,9 +7,9 @@ license.workspace = true
 description = "JSON-RPC server for Qubitcoin"
 
 [dependencies]
-qubitcoin-node = { workspace = true }
-qubitcoin-common = { workspace = true }
-qubitcoin-util = { workspace = true }
+qubitcoin-node = { workspace = true, features = ["filesystem", "parallel"] }
+qubitcoin-common = { workspace = true, features = ["native"] }
+qubitcoin-util = { workspace = true, features = ["native"] }
 qubitcoin-primitives = { workspace = true }
 qubitcoin-consensus = { workspace = true }
 thiserror = { workspace = true }

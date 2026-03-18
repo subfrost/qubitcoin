@@ -6,18 +6,23 @@ rust-version.workspace = true
 license.workspace = true
 description = "Common types for Qubitcoin: CoinsView, ChainParams, PoW, policy, keys, CBlockIndex"
 
+[features]
+default = ["native"]
+native = ["secp256k1/rand-std", "rand", "qubitcoin-crypto/native", "qubitcoin-util/native", "qubitcoin-storage/rocksdb-backend"]
+wasm = ["qubitcoin-util/wasm"]
+
 [dependencies]
 qubitcoin-consensus = { workspace = true }
-qubitcoin-storage = { workspace = true }
+qubitcoin-storage = { workspace = true, default-features = false }
 qubitcoin-serialize = { workspace = true }
 qubitcoin-primitives = { workspace = true }
 qubitcoin-crypto = { workspace = true }
-qubitcoin-util = { workspace = true }
+qubitcoin-util = { workspace = true, default-features = false }
 qubitcoin-script = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 secp256k1 = { workspace = true }
-rand = { workspace = true }
+rand = { workspace = true, optional = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

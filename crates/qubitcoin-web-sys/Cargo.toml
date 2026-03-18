@@ -1,0 +1,38 @@
+[package]
+name = "qubitcoin-web-sys"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "WASM bindings for Qubitcoin — wasm-bindgen exports for browser and Node.js"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Core chain crates (all wasm-compatible with these features)
+qubitcoin-crypto = { workspace = true, default-features = false, features = ["wasm"] }
+qubitcoin-primitives = { workspace = true }
+qubitcoin-serialize = { workspace = true }
+qubitcoin-script = { workspace = true }
+qubitcoin-consensus = { workspace = true }
+qubitcoin-storage = { workspace = true, default-features = false }
+qubitcoin-util = { workspace = true, default-features = false, features = ["wasm"] }
+qubitcoin-common = { workspace = true, default-features = false, features = ["wasm"] }
+qubitcoin-node = { workspace = true, default-features = false, features = ["wasm"] }
+
+# Indexer crates
+qubitcoin-indexer-core = { workspace = true }
+qubitcoin-indexer-web = { workspace = true }
+
+# RPC core (alkanes dispatch + codec)
+alkanes-rpc-core = { path = "../../../alkanes-rs/crates/alkanes-rpc-core", default-features = false, features = ["web-compat"] }
+
+# WASM bindings
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = "0.1"
+hex = "0.4"
+anyhow = "1.0"

@@ -7,12 +7,12 @@ license.workspace = true
 description = "P2P networking for Qubitcoin: tokio-based, protocol messages, peer management"
 
 [dependencies]
-qubitcoin-common = { workspace = true }
-qubitcoin-node = { workspace = true }
-qubitcoin-util = { workspace = true }
+qubitcoin-common = { workspace = true, features = ["native"] }
+qubitcoin-node = { workspace = true, features = ["filesystem", "parallel"] }
+qubitcoin-util = { workspace = true, features = ["native"] }
 qubitcoin-serialize = { workspace = true }
 qubitcoin-primitives = { workspace = true }
-qubitcoin-crypto = { workspace = true }
+qubitcoin-crypto = { workspace = true, features = ["native"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -8,14 +8,14 @@ description = "Database abstraction for Qubitcoin: trait-based with RocksDB and 
 
 [features]
 default = ["rocksdb-backend"]
-rocksdb-backend = ["rocksdb"]
+rocksdb-backend = ["rocksdb", "rand"]
 
 [dependencies]
 qubitcoin-serialize = { workspace = true }
 rocksdb = { workspace = true, optional = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
-rand = { workspace = true }
+rand = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

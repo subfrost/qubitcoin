@@ -1,0 +1,34 @@
+{
+  "name": "@qubitcoin/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for Qubitcoin — in-process devnet, chain ops, and indexer management",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./wasm": {
+      "import": "./src/wasm/qubitcoin_web_sys.js",
+      "types": "./src/wasm/qubitcoin_web_sys.d.ts"
+    }
+  },
+  "scripts": {
+    "build:wasm": "wasm-pack build ../crates/qubitcoin-web-sys --target web --out-dir ../../ts-sdk/src/wasm",
+    "build:wasm:node": "wasm-pack build ../crates/qubitcoin-web-sys --target nodejs --out-dir ../../ts-sdk/src/wasm-node",
+    "build": "tsc && cp -r src/wasm dist/wasm",
+    "test": "vitest",
+    "clean": "rm -rf dist src/wasm src/wasm-node"
+  },
+  "files": [
+    "dist",
+    "src/wasm"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.4",
+    "vitest": "^1.6"
+  }
+}
