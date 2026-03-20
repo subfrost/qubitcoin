@@ -158,7 +158,13 @@ impl WasmIndexerRuntime {
         storage: Arc<IndexerStorage>,
         label: &str,
     ) -> Result<Vec<u8>, String> {
-        let state = new_state(input_data, storage, label, true);
+        // Metashrew ABI: view functions also expect [height_le32 ++ payload].
+        // Use the current tip height from storage.
+        let tip_height = storage.tip_height();
+        let mut prefixed_input = Vec::with_capacity(4 + input_data.len());
+        prefixed_input.extend_from_slice(&tip_height.to_le_bytes());
+        prefixed_input.extend_from_slice(&input_data);
+        let state = new_state(prefixed_input, storage, label, true);
         let mut store = Store::new(&self.async_engine, state);
         store.limiter(|s| &mut s.limits);
 
@@ -197,7 +203,12 @@ impl WasmIndexerRuntime {
         storage: Arc<IndexerStorage>,
         label: &str,
     ) -> Result<Vec<u8>, String> {
-        let state = new_state(input_data, storage, label, true);
+        // Metashrew ABI: view functions expect [height_le32 ++ payload].
+        let tip_height = storage.tip_height();
+        let mut prefixed_input = Vec::with_capacity(4 + input_data.len());
+        prefixed_input.extend_from_slice(&tip_height.to_le_bytes());
+        prefixed_input.extend_from_slice(&input_data);
+        let state = new_state(prefixed_input, storage, label, true);
         let mut store = Store::new(&self.engine, state);
         store.limiter(|s| &mut s.limits);
 

@@ -112,8 +112,8 @@ impl SignatureChecker for TransactionSignatureChecker {
             return false;
         }
 
-        // Schnorr signatures are only valid in tapscript context.
-        if sigversion != SigVersion::Tapscript {
+        // Schnorr signatures are valid in both Taproot (key-path) and Tapscript (script-path).
+        if sigversion != SigVersion::Tapscript && sigversion != SigVersion::Taproot {
             *error = ScriptError::SchnorrSig;
             return false;
         }

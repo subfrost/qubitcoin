@@ -200,12 +200,23 @@ impl RpcRegistry {
     pub fn dispatch(&self, request: &RpcRequest) -> RpcResponse {
         match self.methods.get(&request.method) {
             Some(handler) => handler(request),
-            None => RpcResponse::error(
-                request.id.clone(),
-                RPC_METHOD_NOT_FOUND,
-                format!("Method not found: {}", request.method),
-            ),
+            None => {
+                // Debug: log the method name bytes to catch encoding issues
+                let method_bytes: Vec<u8> = request.method.bytes().collect();
+                eprintln!("[RPC dispatch] Method not found: {:?} (bytes: {:?}, registry has {} methods)",
+                    request.method, &method_bytes[..method_bytes.len().min(30)], self.methods.len());
+                RpcResponse::error(
+                    request.id.clone(),
+                    RPC_METHOD_NOT_FOUND,
+                    format!("Method not found: {}", request.method),
+                )
+            }
         }
+    }
+
+    /// Return the number of registered methods.
+    pub fn method_count(&self) -> usize {
+        self.methods.len()
     }
 
     /// Check whether a method is registered.

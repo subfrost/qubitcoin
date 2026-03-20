@@ -70,13 +70,57 @@ impl RpcServer {
             let auth_pass = self.config.rpc_password.clone();
 
             tokio::spawn(async move {
-                // Read HTTP request -- cap at 64 KiB.
-                let mut buf = vec![0u8; 64 * 1024];
-                let n = match stream.read(&mut buf).await {
-                    Ok(n) => n,
-                    Err(_) => return,
-                };
-                buf.truncate(n);
+                // Read HTTP request — support large payloads (up to 8 MiB for WASM envelopes).
+                let max_size = 8 * 1024 * 1024;
+                let mut buf = Vec::with_capacity(64 * 1024);
+                let mut tmp = vec![0u8; 64 * 1024];
+
+                // Phase 1: Read headers (until \r\n\r\n).
+                loop {
+                    let n = match stream.read(&mut tmp).await {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.len() >= max_size { break; }
+                    // Check for end-of-headers
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                }
+
+                // Phase 2: If we have Content-Length, read remaining body bytes.
+                let header_str = String::from_utf8_lossy(&buf);
+                let content_length: usize = header_str
+                    .lines()
+                    .find(|l| l.to_lowercase().starts_with("content-length:"))
+                    .and_then(|l| l.split(':').nth(1))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+
+                if content_length > 0 {
+                    // Find where body starts (after \r\n\r\n).
+                    let body_start = buf.windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|p| p + 4)
+                        .unwrap_or(buf.len());
+                    let body_so_far = buf.len() - body_start;
+                    let remaining = content_length.saturating_sub(body_so_far);
+
+                    if remaining > 0 && remaining < max_size {
+                        buf.reserve(remaining);
+                        let mut left = remaining;
+                        while left > 0 {
+                            let to_read = left.min(tmp.len());
+                            let n = match stream.read(&mut tmp[..to_read]).await {
+                                Ok(0) => break,
+                                Ok(n) => n,
+                                Err(_) => break,
+                            };
+                            buf.extend_from_slice(&tmp[..n]);
+                            left -= n;
+                        }
+                    }
+                }
 
                 let request_str = String::from_utf8_lossy(&buf);
 
@@ -146,7 +190,9 @@ fn parse_http_request(raw: &str) -> Option<(String, String)> {
 /// Validate HTTP Basic Auth credentials against the `Authorization` header.
 fn check_auth(headers: &str, user: &str, pass: &str) -> bool {
     for line in headers.lines() {
-        if let Some(value) = line.strip_prefix("Authorization: Basic ") {
+        let lower = line.to_lowercase();
+        if lower.starts_with("authorization: basic ") {
+            let value = &line[21..]; // "authorization: basic " is 21 chars
             let expected = base64_encode(&format!("{}:{}", user, pass));
             return value.trim() == expected;
         }

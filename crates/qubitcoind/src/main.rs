@@ -798,8 +798,262 @@ async fn main() {
             im.clone(),
         );
         tracing::info!("secondary indexer RPCs registered");
+
+        // metashrew_view/metashrew_height aliases are registered via register_indexer_rpcs above
     }
 
+    // Register real generatetoaddress for regtest mining.
+    if network == Network::Regtest {
+        use qubitcoin_rpc::server::{RpcRequest, RpcResponse, RPC_INVALID_PARAMS, RPC_MISC_ERROR};
+        use qubitcoin_consensus::merkle::block_merkle_root;
+        use qubitcoin_consensus::check::get_block_subsidy;
+        use qubitcoin_consensus::transaction::{Transaction, TxIn, TxOut, OutPoint, Witness, TransactionRef, SEQUENCE_FINAL};
+        use qubitcoin_primitives::ArithUint256;
+        use qubitcoin_primitives::arith_uint256::uint256_to_arith;
+
+        let cs_gen = chainstate.clone();
+        let bf_gen = block_files.clone();
+        let cdb_gen = coins_db.clone();
+        let ns_gen = node_state.clone();
+        let im_gen = indexer_manager.clone();
+        let mp_gen = mempool.clone();
+        let params_gen = params.clone();
+        let magic_gen = magic_bytes;
+
+        registry.register("generatetoaddress", move |req: &RpcRequest| {
+            let params_arr = match req.params.as_ref().and_then(|p| p.as_array()) {
+                Some(a) => a.clone(),
+                None => return RpcResponse::error(req.id.clone(), RPC_INVALID_PARAMS, "expected array params".into()),
+            };
+            let nblocks = params_arr.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+            let address_str = match params_arr.get(1).and_then(|v| v.as_str()) {
+                Some(a) => a.to_string(),
+                None => return RpcResponse::error(req.id.clone(), RPC_INVALID_PARAMS, "missing address".into()),
+            };
+
+            // Build coinbase output script from address (P2WPKH/P2TR bech32).
+            let coinbase_script = {
+                if let Ok((_, version, program)) = bech32::segwit::decode(&address_str) {
+                    let ver_op: u8 = match version.to_u8() { 0 => 0x00, n => 0x50 + n };
+                    let mut raw = Vec::with_capacity(2 + program.len());
+                    raw.push(ver_op);
+                    raw.push(program.len() as u8);
+                    raw.extend_from_slice(&program);
+                    qubitcoin_script::Script::from(raw)
+                } else {
+                    // Fallback: OP_TRUE (anyone-can-spend) for regtest.
+                    qubitcoin_script::Script::from(vec![0x51u8])
+                }
+            };
+
+            let mut hashes = Vec::new();
+            let wall_clock = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as u32;
+            let mut last_time = {
+                let cs = cs_gen.lock();
+                let tip_time = if let Some(tip) = cs.tip() {
+                    cs.block_index().get(tip).time
+                } else {
+                    0
+                };
+                // Use whichever is later: wall clock or tip time
+                std::cmp::max(wall_clock, tip_time)
+            };
+            for _ in 0..nblocks {
+                let mut cs = cs_gen.lock();
+                let height = cs.height() + 1;
+                let subsidy = get_block_subsidy(height, &params_gen.consensus);
+
+                // Collect mempool transactions.
+                let mempool_txids = mp_gen.get_txids();
+                let mut user_txs: Vec<TransactionRef> = Vec::new();
+                let mut has_witness = false;
+                for txid in &mempool_txids {
+                    if let Some(tx) = mp_gen.get(txid) {
+                        // Check if any tx has witness data
+                        for input in &tx.vin {
+                            if !input.witness.is_empty() {
+                                has_witness = true;
+                            }
+                        }
+                        user_txs.push(tx);
+                    }
+                }
+
+                // Create coinbase with optional witness commitment (BIP141).
+                let mut sig_script = qubitcoin_script::Script::new();
+                sig_script.push_int(height as i64);
+                if sig_script.len() < 2 { sig_script.push_int(0); }
+
+                let mut coinbase_outputs = vec![TxOut::new(subsidy, coinbase_script.clone())];
+                let mut coinbase_witness = Witness::new();
+
+                if has_witness {
+                    // Compute witness commitment for BIP141.
+                    // witness_root = merkle_root of all wtxids (coinbase wtxid = 0x00..00)
+                    use qubitcoin_crypto::hash::hash256;
+                    let mut witness_hashes: Vec<Uint256> = Vec::new();
+                    witness_hashes.push(Uint256::default()); // coinbase wtxid = 0
+                    for tx in &user_txs {
+                        witness_hashes.push(tx.wtxid().into_uint256());
+                    }
+                    // Simple merkle root of witness hashes
+                    let mut level = witness_hashes;
+                    while level.len() > 1 {
+                        let mut next = Vec::new();
+                        for i in (0..level.len()).step_by(2) {
+                            let left = &level[i];
+                            let right = if i + 1 < level.len() { &level[i + 1] } else { &level[i] };
+                            let mut combined = [0u8; 64];
+                            combined[..32].copy_from_slice(left.as_bytes());
+                            combined[32..].copy_from_slice(right.as_bytes());
+                            let hash = hash256(&combined);
+                            next.push(Uint256::from_bytes(hash));
+                        }
+                        level = next;
+                    }
+                    let witness_root = if level.is_empty() { Uint256::default() } else { level[0] };
+
+                    // witness_commitment = SHA256d(witness_root || witness_nonce)
+                    // witness_nonce = 0x00..00 (32 bytes)
+                    let witness_nonce = [0u8; 32];
+                    let mut commitment_preimage = [0u8; 64];
+                    commitment_preimage[..32].copy_from_slice(witness_root.as_bytes());
+                    commitment_preimage[32..].copy_from_slice(&witness_nonce);
+                    let witness_commitment = hash256(&commitment_preimage);
+
+                    // Add OP_RETURN output with witness commitment
+                    // Format: OP_RETURN OP_PUSHBYTES_36 0xaa21a9ed <32-byte commitment>
+                    let mut commitment_script = Vec::with_capacity(38);
+                    commitment_script.push(0x6a); // OP_RETURN
+                    commitment_script.push(0x24); // OP_PUSHBYTES_36
+                    commitment_script.extend_from_slice(&[0xaa, 0x21, 0xa9, 0xed]); // witness magic
+                    commitment_script.extend_from_slice(&witness_commitment);
+                    coinbase_outputs.push(TxOut::new(
+                        qubitcoin_primitives::Amount::from_sat(0),
+                        qubitcoin_script::Script::from(commitment_script),
+                    ));
+
+                    // Coinbase witness: single 32-byte zero nonce
+                    coinbase_witness.stack.push(witness_nonce.to_vec());
+                }
+
+                let coinbase_tx = Transaction::new(
+                    2,
+                    vec![TxIn { prevout: OutPoint::null(), script_sig: sig_script, sequence: SEQUENCE_FINAL, witness: coinbase_witness }],
+                    coinbase_outputs,
+                    0,
+                );
+                let coinbase_ref: TransactionRef = Arc::new(coinbase_tx);
+                let mut all_txs = vec![coinbase_ref];
+                all_txs.extend(user_txs);
+
+                // Compute merkle root.
+                let mut mutated = false;
+                let merkle_root = block_merkle_root(&all_txs, &mut mutated);
+
+                // Build header.
+                let prev_hash = match cs.tip() {
+                    Some(t) => cs.block_index().get(t).block_hash,
+                    None => {
+                        // Genesis block hash for regtest
+                        BlockHash::from_hex("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206").unwrap()
+                    }
+                };
+                last_time += 1;
+                let time = last_time;
+                let bits = {
+                    let arith = uint256_to_arith(&params_gen.consensus.pow_limit);
+                    arith.get_compact(false)
+                };
+
+                let mut header = BlockHeader { version: 4, prev_blockhash: prev_hash, merkle_root, time, bits, nonce: 0 };
+
+                // Solve PoW (trivial on regtest).
+                let mut target = ArithUint256::zero();
+                target.set_compact(header.bits);
+                loop {
+                    let hash = header.block_hash();
+                    let hash_arith = uint256_to_arith(&hash.into_uint256());
+                    if hash_arith <= target { break; }
+                    header.nonce = header.nonce.wrapping_add(1);
+                }
+
+                let block = Block { header: header.clone(), vtx: all_txs };
+                let block_hash = block.header.block_hash();
+
+                // Serialize and process through chainstate.
+                let block_bytes = match serialize(&block) {
+                    Ok(b) => b,
+                    Err(e) => return RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, format!("serialize: {}", e)),
+                };
+
+                // Write to block files.
+                let pos = match bf_gen.write_block(&block, magic_gen) {
+                    Ok(p) => p,
+                    Err(e) => return RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, format!("write: {}", e)),
+                };
+
+                // Update block index with file position.
+                if let Some(arena_idx) = cs.lookup_block_index(&block_hash) {
+                    let idx = cs.block_index_mut().get_mut(arena_idx);
+                    idx.file = pos.file;
+                    idx.data_pos = pos.pos;
+                    cs.mark_dirty(arena_idx);
+                }
+
+                // Process through chainstate (validates + connects).
+                tracing::info!(height = height, time = time, prev_hash = %prev_hash.to_hex(), "mining block");
+                match cs.process_new_block(&block) {
+                    Ok((true, undo)) => {
+                        // Write undo data.
+                        if let Some(undo_data) = undo {
+                            if let Ok(undo_pos) = bf_gen.write_undo(pos.file, &undo_data) {
+                                cs.set_undo_pos(&block_hash, undo_pos.pos);
+                            }
+                        }
+                        // Flush coins.
+                        cs.flush_coins(cdb_gen.as_ref());
+                        // Update RPC state.
+                        *ns_gen.chain_height.write() = height;
+                        *ns_gen.best_block_hash.write() = block_hash.to_hex();
+                        // Remove included txs from mempool.
+                        if !mempool_txids.is_empty() {
+                            mp_gen.remove_for_block(&mempool_txids);
+                        }
+                    }
+                    Ok((false, _)) => {
+                        return RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, "block not accepted".into());
+                    }
+                    Err(e) => {
+                        tracing::error!(height = height, time = time, error = %format!("{:?}", e), "mining failed");
+                        return RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, format!("process: {:?}", e));
+                    }
+                }
+                drop(cs);
+
+                // Notify secondary indexers.
+                if let Some(ref im) = im_gen {
+                    im.on_block_connected(height as u32, &block_bytes);
+                }
+
+                hashes.push(block_hash.to_hex());
+            }
+
+            RpcResponse::success(req.id.clone(), serde_json::json!(hashes))
+        });
+        tracing::info!("real generatetoaddress registered for regtest");
+    }
+
+    tracing::info!(
+        method_count = registry.method_count(),
+        has_metashrew_height = registry.has_method("metashrew_height"),
+        has_metashrew_view = registry.has_method("metashrew_view"),
+        has_generatetoaddress = registry.has_method("generatetoaddress"),
+        "RPC registry final state"
+    );
     let rpc_bind_addr = rpc_config.bind_addr;
     let rpc_server = RpcServer::new(rpc_config, registry);
 
@@ -1250,13 +1504,33 @@ fn register_live_rpcs(
 
         let txid = tx.txid().clone();
         let vsize = tx.get_virtual_size() as u32;
-        let tx_ref = std::sync::Arc::new(tx);
-        let height = cs2.lock().height();
+        let tx_ref = std::sync::Arc::new(tx.clone());
+
+        // Compute the fee: sum(input values) - sum(output values)
+        // Check both confirmed UTXO set AND mempool for unconfirmed outputs
+        // (needed for commit/reveal flows where reveal spends the commit output).
+        let cs_guard = cs2.lock();
+        let height = cs_guard.height();
+        let mut total_in: i64 = 0;
+        for input in &tx.vin {
+            if input.prevout.is_null() { continue; } // coinbase
+            if let Some(coin) = cs_guard.coins_tip().get_coin(&input.prevout) {
+                total_in += coin.tx_out.value.to_sat();
+            } else if let Some(parent_tx) = mp.get(&input.prevout.hash) {
+                // Check mempool for unconfirmed parent output
+                if let Some(output) = parent_tx.vout.get(input.prevout.n as usize) {
+                    total_in += output.value.to_sat();
+                }
+            }
+        }
+        drop(cs_guard);
+        let total_out: i64 = tx.vout.iter().map(|o| o.value.to_sat()).sum();
+        let fee = qubitcoin_primitives::Amount::from_sat(std::cmp::max(0, total_in - total_out));
 
         match mempool::accept_to_mempool(
             &mp,
             &tx_ref,
-            qubitcoin_primitives::Amount::from_sat(0),
+            fee,
             vsize,
             height,
         ) {

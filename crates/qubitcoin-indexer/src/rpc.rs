@@ -17,6 +17,58 @@ pub fn register_indexer_rpcs<F>(register: &mut F, manager: Arc<IndexerManager>)
 where
     F: FnMut(&str, Box<dyn Fn(&serde_json::Value) -> serde_json::Value + Send + Sync>),
 {
+    // metashrew_height [] — alias for alkanes-jsonrpc compatibility
+    {
+        let mgr = manager.clone();
+        register(
+            "metashrew_height",
+            Box::new(move |_params: &serde_json::Value| {
+                match mgr.get_indexer("alkanes") {
+                    Some(inst) => {
+                        let h = inst.tip_height.load(std::sync::atomic::Ordering::Relaxed);
+                        serde_json::json!(h.to_string())
+                    }
+                    None => serde_json::json!({
+                        "error": "alkanes indexer not found"
+                    }),
+                }
+            }),
+        );
+    }
+
+    // metashrew_view [view_fn, input_hex] — alias for alkanes-jsonrpc compatibility
+    {
+        let mgr = manager.clone();
+        register(
+            "metashrew_view",
+            Box::new(move |params: &serde_json::Value| {
+                let view_fn = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
+                let input_hex = params.get(1).and_then(|v| v.as_str()).unwrap_or("");
+                let input_bytes = if input_hex.is_empty() || input_hex == "0x" {
+                    Vec::new()
+                } else {
+                    let hex = input_hex.strip_prefix("0x").unwrap_or(input_hex);
+                    match hex_decode(hex) {
+                        Ok(b) => b,
+                        Err(e) => return serde_json::json!({"error": format!("bad hex: {}", e)}),
+                    }
+                };
+                let result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        mgr.call_view_async("alkanes", view_fn, input_bytes),
+                    )
+                });
+                match result {
+                    Ok(data) => {
+                        let hex: String = data.iter().map(|b| format!("{:02x}", b)).collect();
+                        serde_json::json!(format!("0x{}", hex))
+                    }
+                    Err(e) => serde_json::json!({"error": e}),
+                }
+            }),
+        );
+    }
+
     // secondaryheight ["label"]
     {
         let mgr = manager.clone();

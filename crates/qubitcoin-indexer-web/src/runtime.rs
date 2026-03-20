@@ -8,7 +8,7 @@ use js_sys::{Function, Object, Reflect, Uint8Array, WebAssembly};
 use prost::Message;
 use qubitcoin_indexer_core::proto::KeyValueFlush;
 use qubitcoin_indexer_core::traits::IndexerStorageReader;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
@@ -122,6 +122,10 @@ impl WebIndexerRuntime {
         state: &Rc<RefCell<HostState>>,
     ) -> Result<Object, JsValue> {
         let env = Object::new();
+        let get_count = Rc::new(Cell::new(0u32));
+        let get_hit_count = Rc::new(Cell::new(0u32));
+        let get_miss_count = Rc::new(Cell::new(0u32));
+        web_sys::console::warn_1(&"[QBIT-TRACE] build_imports called — tracing active v2".into());
 
         // __host_len() -> i32
         {
@@ -149,6 +153,9 @@ impl WebIndexerRuntime {
         // __get_len(key_ptr: i32) -> i32
         {
             let s = state.clone();
+            let gc = get_count.clone();
+            let ghc = get_hit_count.clone();
+            let gmc = get_miss_count.clone();
             let closure = Closure::wrap(Box::new(move |key_ptr: i32| -> i32 {
                 let st = s.borrow();
                 let memory = match st.memory.as_ref() {
@@ -164,11 +171,23 @@ impl WebIndexerRuntime {
                     Some(v) => v.len() as i32,
                     None => 0,
                 };
-                // Log ALL non-zero reads for protorune keys
-                if result > 0 && key.starts_with(b"/runes/proto/") {
-                    web_sys::console::log_1(&format!(
-                        "[__get_len] HIT proto key_len={} val_len={}", key.len(), result
-                    ).into());
+                gc.set(gc.get() + 1);
+                if result > 0 {
+                    ghc.set(ghc.get() + 1);
+                } else {
+                    let mc = gmc.get() + 1;
+                    gmc.set(mc);
+                    // Log first 200 misses
+                    if mc <= 200 {
+                        let key_preview = if key.len() > 80 {
+                            format!("{}...({}b)", String::from_utf8_lossy(&key[..80]), key.len())
+                        } else {
+                            String::from_utf8_lossy(&key).to_string()
+                        };
+                        web_sys::console::log_1(&format!(
+                            "[__get_len] MISS #{}: key={}", mc, key_preview
+                        ).into());
+                    }
                 }
                 result
             }) as Box<dyn Fn(i32) -> i32>);
@@ -202,6 +221,9 @@ impl WebIndexerRuntime {
         // __flush(data_ptr: i32)
         {
             let s = state.clone();
+            let gc = get_count.clone();
+            let ghc = get_hit_count.clone();
+            let gmc = get_miss_count.clone();
             let closure = Closure::wrap(Box::new(move |data_ptr: i32| {
                 let mut st = s.borrow_mut();
                 let memory = match st.memory.as_ref() {
@@ -232,6 +254,10 @@ impl WebIndexerRuntime {
                     pairs.push((list[i].to_vec(), list[i + 1].to_vec()));
                     i += 2;
                 }
+                web_sys::console::log_1(&format!(
+                    "[__flush] get_count={} hits={} misses={} flush_pairs={}",
+                    gc.get(), ghc.get(), gmc.get(), pairs.len()
+                ).into());
                 st.pending_flush = Some(pairs);
                 st.completed = true;
             }) as Box<dyn Fn(i32)>);
@@ -284,6 +310,7 @@ struct HostState {
     completed: bool,
     /// Set after instantiation, before calling _start or view fn.
     memory: Option<WebAssembly::Memory>,
+    // (counters moved to separate Rc<Cell> for non-mutable access)
 }
 
 /// Write bytes into WASM linear memory at the given offset.

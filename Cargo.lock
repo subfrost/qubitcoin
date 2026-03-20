@@ -3638,9 +3638,11 @@ dependencies = [
 name = "qubitcoind"
 version = "0.1.0"
 dependencies = [
+ "bech32 0.11.1",
  "parking_lot",
  "qubitcoin-common",
  "qubitcoin-consensus",
+ "qubitcoin-crypto",
  "qubitcoin-indexer",
  "qubitcoin-net",
  "qubitcoin-node",
