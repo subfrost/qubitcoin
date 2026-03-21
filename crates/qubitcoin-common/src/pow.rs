@@ -23,6 +23,10 @@ use qubitcoin_primitives::arith_uint256::{uint256_to_arith, ArithUint256};
 ///   i.e. the block at height `last_height - (interval - 1)`.
 /// - `block_time`: timestamp of the *new* block being validated (used for
 ///   the testnet min-difficulty exception only).
+/// - `last_non_special_bits`: on testnet, the `nBits` of the most recent
+///   block that did NOT use the min-difficulty exception (i.e. walk back
+///   past min-difficulty blocks). The caller resolves this from the block
+///   index. On mainnet this is unused and can be set to `last_bits`.
 /// - `params`: consensus parameters.
 ///
 /// Algorithm:
@@ -30,6 +34,8 @@ use qubitcoin_primitives::arith_uint256::{uint256_to_arith, ArithUint256};
 ///    - On networks that allow minimum difficulty (`pow_allow_min_difficulty_blocks`):
 ///      if the new block's timestamp exceeds `last_time + 2 * target_spacing`,
 ///      return the PoW limit (easiest difficulty).
+///      Otherwise, return `last_non_special_bits` — the difficulty of the
+///      last block that wasn't mined under the min-difficulty exception.
 ///    - Otherwise return `last_bits` unchanged.
 /// 2. If `pow_no_retargeting` is set (regtest), return `last_bits` unchanged.
 /// 3. At a retarget boundary, compute a new target via
@@ -40,6 +46,7 @@ pub fn get_next_work_required(
     last_time: u32,
     first_time: u32,
     block_time: u32,
+    last_non_special_bits: u32,
     params: &ConsensusParams,
 ) -> u32 {
     let pow_limit = uint256_to_arith(&params.pow_limit);
@@ -56,12 +63,10 @@ pub fn get_next_work_required(
             if block_time as i64 > last_time as i64 + params.pow_target_spacing * 2 {
                 return n_proof_of_work_limit;
             }
-            // Otherwise, return last_bits.
-            // (In Bitcoin Core the "return last non-special-min-difficulty block"
-            // walk is performed by the caller over the block index; here we
-            // simply return last_bits and expect the caller to have resolved
-            // that already.)
-            return last_bits;
+            // Return the difficulty of the last block that wasn't mined
+            // under the min-difficulty exception. This is Bitcoin Core's
+            // GetLastBlockIndex() walk resolved by the caller.
+            return last_non_special_bits;
         }
         return last_bits;
     }
@@ -248,6 +253,7 @@ mod tests {
             last_time,
             first_time,
             block_time,
+            last_bits,
             &params,
         );
         assert_eq!(result, last_bits);
@@ -258,7 +264,7 @@ mod tests {
         let params = mainnet_params();
         // height 5000 => next block 5001, not multiple of 2016.
         let last_bits = 0x1c0fffff;
-        let result = get_next_work_required(5000, last_bits, 1_000_000, 0, 1_000_600, &params);
+        let result = get_next_work_required(5000, last_bits, 1_000_000, 0, 1_000_600, last_bits, &params);
         assert_eq!(result, last_bits);
     }
 
@@ -423,7 +429,7 @@ mod tests {
         let block_time = last_time + (params.pow_target_spacing as u32) * 2 + 1;
 
         let result =
-            get_next_work_required(last_height, last_bits, last_time, 0, block_time, &params);
+            get_next_work_required(last_height, last_bits, last_time, 0, block_time, last_bits, &params);
         assert_eq!(result, pow_limit_bits);
     }
 
@@ -439,7 +445,7 @@ mod tests {
         let block_time = last_time + (params.pow_target_spacing as u32) * 2 - 1;
 
         let result =
-            get_next_work_required(last_height, last_bits, last_time, 0, block_time, &params);
+            get_next_work_required(last_height, last_bits, last_time, 0, block_time, last_bits, &params);
         assert_eq!(result, last_bits);
     }
 
@@ -545,6 +551,7 @@ mod tests {
             last_time,
             first_time,
             block_time,
+            last_bits,
             &params,
         );
         // Exact timespan => no change.

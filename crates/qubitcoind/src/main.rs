@@ -393,8 +393,7 @@ async fn main() {
     let mut args = ArgsManager::new();
     args.set_default("server", "1");
     args.set_default("listen", "1");
-    args.set_default("rpcport", "8332");
-    args.set_default("port", "8333");
+    // Note: rpcport and port defaults are set per-network below (after network selection)
     args.set_default("maxconnections", "125");
     args.set_default("loglevel", "info");
     args.set_default("datadir", "~/.qubitcoin");
@@ -1200,16 +1199,8 @@ async fn main() {
     }
 
     // If no explicit -connect peers, resolve DNS seeds for peer discovery.
-    if connect_targets.is_empty() && network == Network::Mainnet {
-        let seeds = &[
-            "seed.bitcoin.sipa.be",
-            "dnsseed.bluematt.me",
-            "dnsseed.bitcoin.dashjr-list-of-hierarchical-deterministic-not-combos.org",
-            "seed.bitcoinstats.com",
-            "seed.bitcoin.jonasschnelli.ch",
-            "seed.btc.petertodd.net",
-            "seed.bitcoin.sprovoost.nl",
-        ];
+    if connect_targets.is_empty() && !params.dns_seeds.is_empty() {
+        let seeds = &params.dns_seeds;
 
         let mut connected = 0usize;
         let max_seed_connections = 16usize;
@@ -1218,7 +1209,7 @@ async fn main() {
             if connected >= max_seed_connections {
                 break;
             }
-            tracing::info!(seed = *seed, "resolving DNS seed");
+            tracing::info!(seed = seed.as_str(), "resolving DNS seed");
             match tokio::net::lookup_host(format!("{}:{}", seed, default_port)).await {
                 Ok(addrs) => {
                     for addr in addrs {

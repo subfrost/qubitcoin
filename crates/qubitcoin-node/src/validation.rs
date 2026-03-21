@@ -799,12 +799,42 @@ pub fn contextual_check_block_header_with_arena(
         0u32 // unused for non-retarget boundaries
     };
 
+    // On testnet (pow_allow_min_difficulty_blocks), we must resolve the
+    // "last non-special-min-difficulty" block's nBits by walking back past
+    // blocks that used the min-difficulty exception. This mirrors Bitcoin
+    // Core's GetLastBlockIndex() walk inside GetNextWorkRequired().
+    let last_non_special_bits = if params.pow_allow_min_difficulty_blocks {
+        if let (Some(a), Some(idx)) = (arena, prev_arena_idx) {
+            let pow_limit = qubitcoin_primitives::arith_uint256::uint256_to_arith(&params.pow_limit);
+            let pow_limit_bits = pow_limit.get_compact(false);
+            let interval = params.difficulty_adjustment_interval() as i32;
+            let mut walk = idx;
+            loop {
+                let blk = &a[walk];
+                // Stop if: at a retarget boundary, or bits != pow_limit, or no parent
+                if blk.height % interval == 0 || blk.bits != pow_limit_bits {
+                    break blk.bits;
+                }
+                if let Some(prev) = blk.prev {
+                    walk = prev;
+                } else {
+                    break blk.bits;
+                }
+            }
+        } else {
+            prev_index.bits
+        }
+    } else {
+        prev_index.bits
+    };
+
     let expected_bits = get_next_work_required(
         prev_index.height,
         prev_index.bits,
         prev_index.time,
         first_time,
         header.time,
+        last_non_special_bits,
         params,
     );
 

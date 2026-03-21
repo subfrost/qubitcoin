@@ -46,6 +46,7 @@ impl WebIndexerRuntime {
         let state = Rc::new(RefCell::new(HostState {
             input_data,
             pending_flush: None,
+            write_cache: std::collections::HashMap::new(),
             storage_ref: storage as *const WebIndexerStorage,
             had_failure: false,
             completed: false,
@@ -94,6 +95,7 @@ impl WebIndexerRuntime {
         let state = Rc::new(RefCell::new(HostState {
             input_data,
             pending_flush: None,
+            write_cache: std::collections::HashMap::new(),
             storage_ref: storage as *const WebIndexerStorage,
             had_failure: false,
             completed: false,
@@ -166,10 +168,15 @@ impl WebIndexerRuntime {
                     Ok(k) => k,
                     Err(_) => return 0,
                 };
-                let storage = unsafe { &*st.storage_ref };
-                let result = match storage.get(&key) {
-                    Some(v) => v.len() as i32,
-                    None => 0,
+                // Check write_cache first (intra-block flush visibility)
+                let result = if let Some(v) = st.write_cache.get(&key) {
+                    v.len() as i32
+                } else {
+                    let storage = unsafe { &*st.storage_ref };
+                    match storage.get(&key) {
+                        Some(v) => v.len() as i32,
+                        None => 0,
+                    }
                 };
                 gc.set(gc.get() + 1);
                 if result > 0 {
@@ -208,10 +215,14 @@ impl WebIndexerRuntime {
                     Ok(k) => k,
                     Err(_) => return,
                 };
-                let storage = unsafe { &*st.storage_ref };
-                // Use raw get — matches raw put in index_block
-                if let Some(value) = storage.get(&key) {
-                    write_to_memory(memory, value_ptr as u32, &value);
+                // Check write_cache first (intra-block flush visibility)
+                if let Some(value) = st.write_cache.get(&key) {
+                    write_to_memory(memory, value_ptr as u32, value);
+                } else {
+                    let storage = unsafe { &*st.storage_ref };
+                    if let Some(value) = storage.get(&key) {
+                        write_to_memory(memory, value_ptr as u32, &value);
+                    }
                 }
             }) as Box<dyn Fn(i32, i32)>);
             Reflect::set(&env, &"__get".into(), closure.as_ref())?;
@@ -247,18 +258,30 @@ impl WebIndexerRuntime {
                         return;
                     }
                 };
-                let mut pairs = Vec::new();
+                let mut new_pairs = Vec::new();
                 let list = &flush_msg.list;
                 let mut i = 0;
                 while i + 1 < list.len() {
-                    pairs.push((list[i].to_vec(), list[i + 1].to_vec()));
+                    new_pairs.push((list[i].to_vec(), list[i + 1].to_vec()));
                     i += 2;
                 }
                 web_sys::console::log_1(&format!(
                     "[__flush] get_count={} hits={} misses={} flush_pairs={}",
-                    gc.get(), ghc.get(), gmc.get(), pairs.len()
+                    gc.get(), ghc.get(), gmc.get(), new_pairs.len()
                 ).into());
-                st.pending_flush = Some(pairs);
+                // Stage flush writes in write_cache so subsequent __get calls
+                // within the same _start() can read them back. The actual
+                // storage is not modified (the caller applies pending_flush).
+                for (k, v) in &new_pairs {
+                    st.write_cache.insert(k.clone(), v.clone());
+                }
+
+                // Accumulate for the return value
+                if let Some(ref mut existing) = st.pending_flush {
+                    existing.extend(new_pairs);
+                } else {
+                    st.pending_flush = Some(new_pairs);
+                }
                 st.completed = true;
             }) as Box<dyn Fn(i32)>);
             Reflect::set(&env, &"__flush".into(), closure.as_ref())?;
@@ -337,6 +360,11 @@ impl WebIndexerRuntime {
 struct HostState {
     input_data: Vec<u8>,
     pending_flush: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+    /// Write-through cache: flush writes are staged here so subsequent
+    /// __get calls within the same _start() can read them back.
+    /// This is critical for indexers that flush multiple times per block
+    /// (e.g. opshrew: deploy stores bytecode, then interaction reads it).
+    write_cache: std::collections::HashMap<Vec<u8>, Vec<u8>>,
     storage_ref: *const WebIndexerStorage,
     had_failure: bool,
     completed: bool,

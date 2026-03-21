@@ -229,7 +229,7 @@ export class DevnetTestHarness {
       // Only intercept POST requests to matching URLs
       const method = init?.method?.toUpperCase() ?? 'GET';
       if (method === 'POST' && self.interceptUrls.some(u => url.startsWith(u))) {
-        return self.handleFetchRequest(init);
+        return self.handleFetchRequest(url, init);
       }
 
       // Pass through to original fetch
@@ -422,7 +422,7 @@ export class DevnetTestHarness {
     return null;
   }
 
-  private async handleFetchRequest(init?: RequestInit): Promise<Response> {
+  private async handleFetchRequest(url: string, init?: RequestInit): Promise<Response> {
     let bodyText: string;
 
     if (typeof init?.body === 'string') {
@@ -438,29 +438,59 @@ export class DevnetTestHarness {
     }
 
     try {
-      // Check if this is a Lua method — handle via wasmoon
-      let parsed: { method?: string; params?: unknown[]; id?: unknown } | undefined;
+      let parsed: { method?: string; params?: unknown[]; id?: unknown; jsonrpc?: string } | undefined;
       try {
         parsed = JSON.parse(bodyText);
       } catch {
         // Not valid JSON — pass through to Rust
       }
 
-      if (parsed?.method && LUA_METHODS.has(parsed.method)) {
-        const luaResponse = await this.handleLuaRpc(
-          parsed.method,
-          Array.isArray(parsed.params) ? parsed.params : [],
-          parsed.id,
-        );
-        if (luaResponse) {
-          return new Response(luaResponse, {
-            status: 200,
-            headers: { 'Content-Type': 'application/json' },
-          });
+      // If this is a JSON-RPC request (has "method" field), dispatch normally
+      if (parsed?.method) {
+        // Check for Lua methods first
+        if (LUA_METHODS.has(parsed.method)) {
+          const luaResponse = await this.handleLuaRpc(
+            parsed.method,
+            Array.isArray(parsed.params) ? parsed.params : [],
+            parsed.id,
+          );
+          if (luaResponse) {
+            return new Response(luaResponse, {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
         }
-        // Lua runtime unavailable or script not found — fall through to Rust shims
+
+        const responseJson = this.server.handleRpc(bodyText);
+        return new Response(responseJson, {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
       }
 
+      // REST-style request (no "method" field) — route by URL path.
+      // The SDK's data API makes REST POSTs like:
+      //   POST http://localhost:18888/get-all-pools-details
+      //   {"factoryId": {"block": "4", "tx": "65498"}}
+      //
+      // We translate these to JSON-RPC calls to the dispatcher.
+      const restMethod = this.resolveRestMethod(url, parsed);
+      if (restMethod) {
+        const rpcRequest = JSON.stringify({
+          jsonrpc: '2.0',
+          method: restMethod.method,
+          params: restMethod.params,
+          id: 1,
+        });
+        const responseJson = this.server.handleRpc(rpcRequest);
+        return new Response(responseJson, {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      // Fallback: pass raw body to Rust dispatcher
       const responseJson = this.server.handleRpc(bodyText);
       return new Response(responseJson, {
         status: 200,
@@ -478,5 +508,58 @@ export class DevnetTestHarness {
         headers: { 'Content-Type': 'application/json' },
       });
     }
+  }
+
+  /**
+   * Resolve a REST-style URL + body into a JSON-RPC method + params.
+   *
+   * Maps espo data API REST endpoints to the RPC dispatcher's namespace:
+   *   /get-all-pools-details    → ammdata.get_pools
+   *   /get-all-token-pairs      → ammdata.get_pools
+   *   /get-alkanes-by-address   → essentials.get_address_balances
+   *   /get-bitcoin-price        → (handled inline)
+   *   /get-all-amm-tx-history   → ammdata.get_activity
+   */
+  private resolveRestMethod(
+    url: string,
+    body: any,
+  ): { method: string; params: unknown[] } | null {
+    // Extract the path from the URL
+    try {
+      const urlObj = new URL(url);
+      const path = urlObj.pathname;
+
+      // Match known REST endpoints
+      if (path.endsWith('/get-all-pools-details') || path.endsWith('/get-all-token-pairs')) {
+        return {
+          method: 'essentials.get_address_outpoints',
+          params: [body || {}],
+        };
+      }
+
+      if (path.endsWith('/get-alkanes-by-address') || path.endsWith('/get-address-balances')) {
+        const address = body?.address || '';
+        return {
+          method: 'essentials.get_address_outpoints',
+          params: [{ address }],
+        };
+      }
+
+      if (path.endsWith('/get-bitcoin-price')) {
+        // Return mock price for devnet
+        return null; // Handled by catch-all below
+      }
+
+      if (path.endsWith('/get-all-amm-tx-history') || path.endsWith('/get-all-address-amm-tx-history')) {
+        return {
+          method: 'essentials.get_address_outpoints',
+          params: [body || {}],
+        };
+      }
+    } catch {
+      // URL parse failed — try path matching on raw string
+    }
+
+    return null;
   }
 }
