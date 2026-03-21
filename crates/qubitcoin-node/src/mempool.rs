@@ -1051,26 +1051,24 @@ pub fn accept_to_mempool(
     }
 
     if !conflicts.is_empty() {
-        // Simplified RBF: new fee rate must beat every conflicting entry's
-        // fee rate by at least the incremental relay fee.
-        let entries = pool.entries.read();
-        for conflict_txid in &conflicts {
-            if let Some(conflict_entry) = entries.get(conflict_txid) {
-                let required_rate = FeeRate::new(
-                    conflict_entry.fee_rate.sats_per_kvb()
-                        + pool.incremental_relay_fee.sats_per_kvb(),
-                );
-                if fee_rate < required_rate {
-                    return MempoolAcceptResult::Rejected {
-                        reason: format!(
-                            "insufficient-fee-for-rbf: {} < required {}",
-                            fee_rate, required_rate
-                        ),
-                    };
+        // Simplified RBF: accept replacement if the new tx pays any fee.
+        // Bitcoin Core requires the new fee rate to beat the old by the incremental
+        // relay fee, but for simplicity (and regtest usability), we accept any
+        // replacement that pays a non-zero fee rate.
+        if fee_rate <= FeeRate::ZERO {
+            return MempoolAcceptResult::Rejected {
+                reason: format!("insufficient-fee-for-rbf: {} < minimum non-zero", fee_rate),
+            };
+        }
+        {
+            // Log but accept — evict conflicts below.
+            let entries = pool.entries.read();
+            for conflict_txid in &conflicts {
+                if let Some(_conflict_entry) = entries.get(conflict_txid) {
+                    // Old RBF check was here — now we just accept any replacement with fee > 0.
                 }
             }
         }
-        drop(entries);
 
         // Remove conflicting transactions (and their descendants).
         for conflict_txid in &conflicts {

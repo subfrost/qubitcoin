@@ -33,4 +33,5 @@
 export { QubitcoinNode } from './node.js';
 export { IndexerRuntime } from './indexer.js';
 export { DevnetTestHarness } from './devnet-server.js';
+export { LuaRuntime, preloadLuaScripts, saveScript, getScript } from './lua-runtime.js';
 //# sourceMappingURL=index.js.map

@@ -422,7 +422,9 @@ impl DevnetEsploraBackend {
             let mut hasher = Sha256::new();
             hasher.update(&script);
             let script_hash: [u8; 32] = hasher.finalize().into();
-            let sh_hex = hex::encode(script_hash);
+            // esplorashrew expects reversed (display order) hex for script hashes
+            let reversed: Vec<u8> = script_hash.iter().rev().cloned().collect();
+            let sh_hex = hex::encode(reversed);
 
             let esplora_height = storage.tip_height().saturating_sub(1);
             if let Ok(result) = runtime.call_view(

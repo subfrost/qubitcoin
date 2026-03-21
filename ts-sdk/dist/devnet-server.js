@@ -3,6 +3,7 @@
  *
  * Wraps the qubitcoin-web-sys DevnetServer WASM export and provides:
  * - Full alkanes RPC protocol (btc_*, alkanes_*, esplora_*, etc.)
+ * - Lua script execution via wasmoon (lua_evalscript, lua_evalsaved, etc.)
  * - Auto-indexing through loaded WASM indexer modules
  * - Fetch interceptor for seamless WebProvider integration
  *
@@ -27,6 +28,7 @@
  * harness.dispose();
  * ```
  */
+import { LuaRuntime, preloadLuaScripts, saveScript } from './lua-runtime.js';
 /** Default secret key (32 bytes of 0x01 — deterministic for testing). */
 const DEFAULT_SECRET_KEY = new Uint8Array(32).fill(0x01);
 /** Intercepted URL patterns — any POST to these routes to the devnet. */
@@ -35,10 +37,21 @@ const DEFAULT_INTERCEPT_URLS = [
     'http://127.0.0.1:18888',
     'http://localhost:8080',
 ];
+/** Methods that are handled by the Lua runtime instead of Rust dispatcher. */
+const LUA_METHODS = new Set([
+    'lua_evalscript',
+    'lua_evalsaved',
+    'lua_savescript',
+    'sandshrew_evalscript',
+    'sandshrew_evalsaved',
+    'sandshrew_savescript',
+]);
 export class DevnetTestHarness {
     server;
     originalFetch = null;
     interceptUrls;
+    luaRuntime = null;
+    luaInitPromise = null;
     constructor(server, interceptUrls) {
         this.server = server;
         this.interceptUrls = interceptUrls;
@@ -47,6 +60,7 @@ export class DevnetTestHarness {
      * Create a new devnet test harness.
      *
      * Loads the WASM modules and creates the in-process chain + indexers.
+     * Optionally initializes the Lua runtime for script execution.
      */
     static async create(opts) {
         // Dynamic import and initialize the WASM module
@@ -79,7 +93,10 @@ export class DevnetTestHarness {
             ? new Uint8Array(opts.esploraWasm)
             : undefined;
         const server = new wasm.DevnetServer(secretKey, opts.alkanesWasm, esploraArr);
-        return new DevnetTestHarness(server, opts.interceptUrls ?? DEFAULT_INTERCEPT_URLS);
+        const harness = new DevnetTestHarness(server, opts.interceptUrls ?? DEFAULT_INTERCEPT_URLS);
+        // Initialize Lua runtime (non-blocking — will be ready by first use)
+        harness.luaInitPromise = harness.initLuaRuntime(opts.luaScriptsDir);
+        return harness;
     }
     /** Current chain height. */
     get height() {
@@ -100,10 +117,24 @@ export class DevnetTestHarness {
     /**
      * Process a JSON-RPC request and return the response.
      *
-     * This is the low-level entry point — use the fetch interceptor for
-     * seamless integration with WebProvider.
+     * Lua methods (lua_evalscript, lua_evalsaved, etc.) are handled by the
+     * wasmoon runtime. All other methods are dispatched to the Rust WASM backend.
      */
     handleRpc(requestJson) {
+        // Parse to check if this is a Lua method
+        let parsed;
+        try {
+            parsed = JSON.parse(requestJson);
+        }
+        catch {
+            return this.server.handleRpc(requestJson);
+        }
+        if (parsed.method && LUA_METHODS.has(parsed.method)) {
+            // Lua methods need async execution — we can't do that synchronously.
+            // Instead, return a marker that handleFetchRequest will resolve.
+            // For direct handleRpc() callers, fall through to Rust shims.
+            return this.server.handleRpc(requestJson);
+        }
         return this.server.handleRpc(requestJson);
     }
     /**
@@ -152,9 +183,156 @@ export class DevnetTestHarness {
     /** Clean up: restore fetch and free WASM resources. */
     dispose() {
         this.restoreFetch();
+        this.luaRuntime = null;
         // DevnetServer is freed when GC collects it (wasm-bindgen destructor)
     }
     // -- Private ---------------------------------------------------------------
+    /**
+     * Initialize the Lua runtime and pre-load known scripts.
+     */
+    async initLuaRuntime(luaScriptsDir) {
+        try {
+            // Create Lua runtime with RPC handler that routes back to this harness
+            const rpcHandler = (requestJson) => {
+                return this.server.handleRpc(requestJson);
+            };
+            this.luaRuntime = await LuaRuntime.create(rpcHandler);
+            // Pre-load Lua scripts from disk
+            if (luaScriptsDir) {
+                preloadLuaScripts(luaScriptsDir);
+            }
+            else {
+                // Try common paths
+                const { existsSync } = await import('fs');
+                const { resolve } = await import('path');
+                const home = process.env.HOME || '/home/ubuntu';
+                const candidates = [
+                    resolve(home, 'alkanes-rs/lua'),
+                    resolve(home, 'Documents/GitHub/alkanes-rs/lua'),
+                    resolve(process.cwd(), 'node_modules/@alkanes/ts-sdk/lua'),
+                ];
+                for (const dir of candidates) {
+                    if (existsSync(dir)) {
+                        preloadLuaScripts(dir);
+                        break;
+                    }
+                }
+            }
+        }
+        catch (err) {
+            console.warn('[DevnetTestHarness] Lua runtime init failed, falling back to Rust shims:', err);
+            this.luaRuntime = null;
+        }
+    }
+    /**
+     * Ensure the Lua runtime is initialized before use.
+     */
+    async ensureLuaRuntime() {
+        if (this.luaInitPromise) {
+            await this.luaInitPromise;
+            this.luaInitPromise = null;
+        }
+        return this.luaRuntime;
+    }
+    /**
+     * Handle a Lua RPC method (evalscript, evalsaved, savescript).
+     *
+     * Returns JSON-RPC response string, or null if Lua runtime unavailable
+     * (caller should fall through to Rust shims).
+     */
+    async handleLuaRpc(method, params, id) {
+        const lua = await this.ensureLuaRuntime();
+        if (!lua)
+            return null;
+        const normalizedMethod = method.replace(/^(lua|sandshrew)_/, '');
+        if (normalizedMethod === 'savescript') {
+            const scriptContent = params[0];
+            if (typeof scriptContent !== 'string') {
+                return JSON.stringify({
+                    jsonrpc: '2.0',
+                    error: { code: -32602, message: 'savescript requires script content as first param' },
+                    id,
+                });
+            }
+            const hash = saveScript(scriptContent);
+            return JSON.stringify({
+                jsonrpc: '2.0',
+                result: { hash },
+                id,
+            });
+        }
+        if (normalizedMethod === 'evalscript') {
+            const scriptContent = params[0];
+            if (typeof scriptContent !== 'string') {
+                return JSON.stringify({
+                    jsonrpc: '2.0',
+                    error: { code: -32602, message: 'evalscript requires script content as first param' },
+                    id,
+                });
+            }
+            const args = params.slice(1);
+            const result = await lua.executeScript(scriptContent, args);
+            if (result.error) {
+                return JSON.stringify({
+                    jsonrpc: '2.0',
+                    result: {
+                        calls: result.calls,
+                        returns: null,
+                        runtime: result.runtime,
+                        error: { code: -1, message: result.error },
+                    },
+                    id,
+                });
+            }
+            return JSON.stringify({
+                jsonrpc: '2.0',
+                result: {
+                    calls: result.calls,
+                    returns: result.returns,
+                    runtime: result.runtime,
+                },
+                id,
+            });
+        }
+        if (normalizedMethod === 'evalsaved') {
+            const hash = params[0];
+            if (typeof hash !== 'string') {
+                return JSON.stringify({
+                    jsonrpc: '2.0',
+                    error: { code: -32602, message: 'evalsaved requires script hash as first param' },
+                    id,
+                });
+            }
+            const args = params.slice(1);
+            const result = await lua.executeSaved(hash, args);
+            if (result.error) {
+                // If script not found, fall through to Rust shims
+                if (result.error.includes('Script not found')) {
+                    return null;
+                }
+                return JSON.stringify({
+                    jsonrpc: '2.0',
+                    result: {
+                        calls: result.calls,
+                        returns: null,
+                        runtime: result.runtime,
+                        error: { code: -1, message: result.error },
+                    },
+                    id,
+                });
+            }
+            return JSON.stringify({
+                jsonrpc: '2.0',
+                result: {
+                    calls: result.calls,
+                    returns: result.returns,
+                    runtime: result.runtime,
+                },
+                id,
+            });
+        }
+        return null;
+    }
     async handleFetchRequest(init) {
         let bodyText;
         if (typeof init?.body === 'string') {
@@ -172,6 +350,24 @@ export class DevnetTestHarness {
             bodyText = await resp.text();
         }
         try {
+            // Check if this is a Lua method — handle via wasmoon
+            let parsed;
+            try {
+                parsed = JSON.parse(bodyText);
+            }
+            catch {
+                // Not valid JSON — pass through to Rust
+            }
+            if (parsed?.method && LUA_METHODS.has(parsed.method)) {
+                const luaResponse = await this.handleLuaRpc(parsed.method, Array.isArray(parsed.params) ? parsed.params : [], parsed.id);
+                if (luaResponse) {
+                    return new Response(luaResponse, {
+                        status: 200,
+                        headers: { 'Content-Type': 'application/json' },
+                    });
+                }
+                // Lua runtime unavailable or script not found — fall through to Rust shims
+            }
             const responseJson = this.server.handleRpc(bodyText);
             return new Response(responseJson, {
                 status: 200,

@@ -2049,6 +2049,59 @@ mod tests {
         assert_eq!(coin.unwrap().tx_out.value.to_sat(), 9_999_000_000);
     }
 
+    /// Test that a block with intra-block spend chains works correctly.
+    /// tx_a creates an output; tx_b spends it within the same block.
+    /// This is the commit/reveal pattern used for alkanes envelope deployments.
+    #[test]
+    fn test_connect_block_intra_block_spend_chain() {
+        let params = ConsensusParams::regtest();
+        let cache = make_empty_cache();
+
+        // Pre-populate a confirmed coin.
+        let funding_txid = Txid::from_bytes([0x20; 32]);
+        let funding_outpoint = OutPoint::new(funding_txid.clone(), 0);
+        add_test_coin(&cache, &funding_outpoint, Amount::from_sat(10_000_000_000), 1, false);
+
+        // tx_a (commit): spends the funding UTXO, creates output_a
+        let tx_a = make_spending_tx(&funding_txid, 0, Amount::from_sat(9_999_000_000));
+        let tx_a_txid = tx_a.txid().clone();
+
+        // tx_b (reveal): spends output_a (created by tx_a in the SAME block)
+        let tx_b = make_spending_tx(&tx_a_txid, 0, Amount::from_sat(9_998_000_000));
+        let tx_b_txid = tx_b.txid().clone();
+
+        // Total fees: 10B - 9.999B + 9.999B - 9.998B = 0.002B = 2_000_000 sats
+        let coinbase = make_coinbase(Amount::from_sat(2_502_000_000)); // 25 BTC + 0.02 BTC fee
+
+        let vtx = vec![Arc::new(coinbase), Arc::new(tx_a), Arc::new(tx_b)];
+        let mut mutated = false;
+        let merkle = block_merkle_root(&vtx, &mut mutated);
+
+        let header = BlockHeader {
+            version: 1,
+            prev_blockhash: qubitcoin_primitives::BlockHash::ZERO,
+            merkle_root: merkle,
+            time: 1700000000,
+            bits: 0x207fffff,
+            nonce: 0,
+        };
+
+        let block = Block { header, vtx };
+
+        let result = connect_block(&block, 200, &cache, &params, None, false);
+        assert!(result.is_ok(), "Intra-block spend chain should be valid: {:?}", result.err());
+
+        // tx_a's output should be spent (consumed by tx_b).
+        let tx_a_outpoint = OutPoint::new(tx_a_txid, 0);
+        assert!(cache.fetch_coin(&tx_a_outpoint).is_none(), "tx_a output should be spent by tx_b");
+
+        // tx_b's output should exist in the UTXO set.
+        let tx_b_outpoint = OutPoint::new(tx_b_txid, 0);
+        let coin = cache.fetch_coin(&tx_b_outpoint);
+        assert!(coin.is_some(), "tx_b output should be in UTXO set");
+        assert_eq!(coin.unwrap().tx_out.value.to_sat(), 9_998_000_000);
+    }
+
     #[test]
     fn test_connect_block_overpaying_coinbase() {
         let params = ConsensusParams::regtest();

@@ -3,6 +3,7 @@
  *
  * Wraps the qubitcoin-web-sys DevnetServer WASM export and provides:
  * - Full alkanes RPC protocol (btc_*, alkanes_*, esplora_*, etc.)
+ * - Lua script execution via wasmoon (lua_evalscript, lua_evalsaved, etc.)
  * - Auto-indexing through loaded WASM indexer modules
  * - Fetch interceptor for seamless WebProvider integration
  *
@@ -36,16 +37,25 @@ export interface DevnetTestHarnessOptions {
     secretKey?: Uint8Array;
     /** URL patterns to intercept. Defaults to localhost:18888. */
     interceptUrls?: string[];
+    /**
+     * Path to directory containing Lua scripts (e.g. ~/alkanes-rs/lua/).
+     * If provided, scripts are pre-loaded for lua_evalsaved calls.
+     * If omitted, tries common paths automatically.
+     */
+    luaScriptsDir?: string;
 }
 export declare class DevnetTestHarness {
     private server;
     private originalFetch;
     private interceptUrls;
+    private luaRuntime;
+    private luaInitPromise;
     private constructor();
     /**
      * Create a new devnet test harness.
      *
      * Loads the WASM modules and creates the in-process chain + indexers.
+     * Optionally initializes the Lua runtime for script execution.
      */
     static create(opts: DevnetTestHarnessOptions): Promise<DevnetTestHarness>;
     /** Current chain height. */
@@ -59,8 +69,8 @@ export declare class DevnetTestHarness {
     /**
      * Process a JSON-RPC request and return the response.
      *
-     * This is the low-level entry point — use the fetch interceptor for
-     * seamless integration with WebProvider.
+     * Lua methods (lua_evalscript, lua_evalsaved, etc.) are handled by the
+     * wasmoon runtime. All other methods are dispatched to the Rust WASM backend.
      */
     handleRpc(requestJson: string): string;
     /**
@@ -75,6 +85,21 @@ export declare class DevnetTestHarness {
     restoreFetch(): void;
     /** Clean up: restore fetch and free WASM resources. */
     dispose(): void;
+    /**
+     * Initialize the Lua runtime and pre-load known scripts.
+     */
+    private initLuaRuntime;
+    /**
+     * Ensure the Lua runtime is initialized before use.
+     */
+    private ensureLuaRuntime;
+    /**
+     * Handle a Lua RPC method (evalscript, evalsaved, savescript).
+     *
+     * Returns JSON-RPC response string, or null if Lua runtime unavailable
+     * (caller should fall through to Rust shims).
+     */
+    private handleLuaRpc;
     private handleFetchRequest;
 }
 //# sourceMappingURL=devnet-server.d.ts.map

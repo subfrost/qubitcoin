@@ -866,19 +866,48 @@ async fn main() {
                 let height = cs.height() + 1;
                 let subsidy = get_block_subsidy(height, &params_gen.consensus);
 
-                // Collect mempool transactions.
+                // Collect mempool transactions in topological order (parents before children).
+                // This ensures intra-block spend chains (commit→reveal) are valid.
                 let mempool_txids = mp_gen.get_txids();
-                let mut user_txs: Vec<TransactionRef> = Vec::new();
-                let mut has_witness = false;
+                let mut all_mempool: Vec<TransactionRef> = Vec::new();
                 for txid in &mempool_txids {
                     if let Some(tx) = mp_gen.get(txid) {
-                        // Check if any tx has witness data
-                        for input in &tx.vin {
-                            if !input.witness.is_empty() {
-                                has_witness = true;
-                            }
+                        all_mempool.push(tx);
+                    }
+                }
+                // Topological sort: a tx goes after any tx whose output it spends.
+                let mempool_txid_set: std::collections::HashSet<Txid> = all_mempool.iter().map(|tx| *tx.txid()).collect();
+                let mut user_txs: Vec<TransactionRef> = Vec::new();
+                let mut placed: std::collections::HashSet<Txid> = std::collections::HashSet::new();
+                let mut remaining = all_mempool.clone();
+                let max_iters = remaining.len() * 2 + 1;
+                for _ in 0..max_iters {
+                    if remaining.is_empty() { break; }
+                    let mut next_remaining = Vec::new();
+                    for tx in &remaining {
+                        let deps_met = tx.vin.iter().all(|input| {
+                            !mempool_txid_set.contains(&input.prevout.hash) || placed.contains(&input.prevout.hash)
+                        });
+                        if deps_met {
+                            placed.insert(*tx.txid());
+                            user_txs.push(tx.clone());
+                        } else {
+                            next_remaining.push(tx.clone());
                         }
-                        user_txs.push(tx);
+                    }
+                    if next_remaining.len() == remaining.len() {
+                        // Circular dependency or unresolvable — add remaining as-is
+                        user_txs.extend(next_remaining);
+                        break;
+                    }
+                    remaining = next_remaining;
+                }
+                let mut has_witness = false;
+                for tx in &user_txs {
+                    for input in &tx.vin {
+                        if !input.witness.is_empty() {
+                            has_witness = true;
+                        }
                     }
                 }
 
