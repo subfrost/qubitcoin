@@ -113,5 +113,16 @@ export declare class DevnetTestHarness {
      */
     private handleLuaRpc;
     private handleFetchRequest;
+    /**
+     * Resolve a REST-style URL + body into a JSON-RPC method + params.
+     *
+     * Maps espo data API REST endpoints to the RPC dispatcher's namespace:
+     *   /get-all-pools-details    → ammdata.get_pools
+     *   /get-all-token-pairs      → ammdata.get_pools
+     *   /get-alkanes-by-address   → essentials.get_address_balances
+     *   /get-bitcoin-price        → (handled inline)
+     *   /get-all-amm-tx-history   → ammdata.get_activity
+     */
+    private resolveRestMethod;
 }
 //# sourceMappingURL=devnet-server.d.ts.map

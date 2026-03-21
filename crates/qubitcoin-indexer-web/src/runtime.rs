@@ -297,6 +297,38 @@ impl WebIndexerRuntime {
 
         let imports = Object::new();
         Reflect::set(&imports, &"env".into(), &env)?;
+
+        // Provide stub imports for wasm-bindgen modules that some indexers
+        // (e.g. opshrew/opnet) pull in via getrandom's wasm-bindgen feature.
+        // These functions should never be called at runtime — if they are,
+        // the indexer will trap, which is the correct behavior.
+        {
+            let placeholder = Object::new();
+            // __wbindgen_describe: called at compile-time by wasm-bindgen, never at runtime
+            let noop = Closure::wrap(Box::new(|| {}) as Box<dyn Fn()>);
+            Reflect::set(&placeholder, &"__wbindgen_describe".into(), noop.as_ref())?;
+            noop.forget();
+            // __wbg___wbindgen_throw_*: throw an error (trap)
+            let throw_fn = Closure::wrap(Box::new(|_a: i32, _b: i32| {
+                web_sys::console::error_1(&"wbindgen_throw called in indexer — trapping".into());
+            }) as Box<dyn Fn(i32, i32)>);
+            Reflect::set(&placeholder, &"__wbg___wbindgen_throw_be289d5034ed271b".into(), throw_fn.as_ref())?;
+            throw_fn.forget();
+            Reflect::set(&imports, &"__wbindgen_placeholder__".into(), &placeholder)?;
+        }
+        {
+            let xform = Object::new();
+            // __wbindgen_externref_table_grow(delta) -> i32
+            let grow_fn = Closure::wrap(Box::new(|_delta: i32| -> i32 { 0 }) as Box<dyn Fn(i32) -> i32>);
+            Reflect::set(&xform, &"__wbindgen_externref_table_grow".into(), grow_fn.as_ref())?;
+            grow_fn.forget();
+            // __wbindgen_externref_table_set_null(idx)
+            let set_null = Closure::wrap(Box::new(|_idx: i32| {}) as Box<dyn Fn(i32)>);
+            Reflect::set(&xform, &"__wbindgen_externref_table_set_null".into(), set_null.as_ref())?;
+            set_null.forget();
+            Reflect::set(&imports, &"__wbindgen_externref_xform__".into(), &xform)?;
+        }
+
         Ok(imports)
     }
 }
