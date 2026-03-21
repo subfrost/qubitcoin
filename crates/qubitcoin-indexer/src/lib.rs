@@ -44,6 +44,12 @@ pub struct IndexerInstance {
     pub tip_height: AtomicU32,
     /// Whether SMT state roots are computed.
     pub smt_enabled: bool,
+    /// Block height at which this indexer starts processing.
+    pub start_height: u32,
+    /// Indexer layer (secondary or tertiary).
+    pub layer: config::IndexerLayer,
+    /// Labels of indexers this one depends on (tertiary only).
+    pub depends_on: Vec<String>,
 }
 
 /// Manages all loaded indexer instances.
@@ -125,6 +131,9 @@ impl IndexerManager {
                 wasm_hash,
                 tip_height: AtomicU32::new(tip_height),
                 smt_enabled: config.smt_enabled,
+                start_height: config.start_height,
+                layer: config.layer,
+                depends_on: config.depends_on.clone(),
             });
 
             indexers.insert(config.label, instance);
@@ -157,6 +166,12 @@ impl IndexerManager {
     ///
     /// `block_data` is the raw serialized block.
     /// In synchronous mode, blocks until all indexers finish.
+    ///
+    /// Indexers are processed in two phases:
+    /// 1. Secondary indexers (no dependencies) run in parallel.
+    /// 2. Tertiary indexers run after their dependencies have completed.
+    ///
+    /// An indexer is skipped if `height < start_height`.
     pub fn on_block_connected(&self, height: u32, block_data: &[u8]) {
         if self.indexers.is_empty() {
             return;
@@ -168,34 +183,67 @@ impl IndexerManager {
         input.extend_from_slice(block_data);
         let input = Arc::new(input);
 
-        match self.mode {
-            IndexerMode::Synchronous => {
-                // Run all indexers in parallel using rayon.
-                let instances: Vec<&Arc<IndexerInstance>> = self.indexers.values().collect();
-                rayon::scope(|s| {
-                    for inst in &instances {
-                        let inst = Arc::clone(inst);
-                        let input = Arc::clone(&input);
-                        s.spawn(move |_| {
-                            run_indexer_block(&inst, height, &input);
-                        });
+        // Phase 1: Run secondary indexers (and tertiary with no deps) in parallel.
+        let (phase1, phase2): (Vec<_>, Vec<_>) = self
+            .indexers
+            .values()
+            .partition(|inst| inst.depends_on.is_empty());
+
+        let run_phase = |instances: &[&Arc<IndexerInstance>]| {
+            rayon::scope(|s| {
+                for inst in instances {
+                    if height < inst.start_height {
+                        continue;
                     }
-                });
-            }
-            IndexerMode::Async => {
-                // In async mode, still run synchronously for now (can add channel later).
-                let instances: Vec<&Arc<IndexerInstance>> = self.indexers.values().collect();
-                rayon::scope(|s| {
-                    for inst in &instances {
-                        let inst = Arc::clone(inst);
-                        let input = Arc::clone(&input);
-                        s.spawn(move |_| {
-                            run_indexer_block(&inst, height, &input);
-                        });
+                    let inst = Arc::clone(inst);
+                    let input = Arc::clone(&input);
+                    s.spawn(move |_| {
+                        run_indexer_block(&inst, height, &input);
+                    });
+                }
+            });
+        };
+
+        run_phase(&phase1);
+
+        // Phase 2: Run tertiary indexers whose dependencies have all reached
+        // this height (i.e., phase 1 completed for them).
+        if !phase2.is_empty() {
+            let ready: Vec<&Arc<IndexerInstance>> = phase2
+                .into_iter()
+                .filter(|inst| {
+                    if height < inst.start_height {
+                        return false;
                     }
-                });
+                    self.dependencies_satisfied(inst, height)
+                })
+                .collect();
+
+            run_phase(&ready);
+        }
+    }
+
+    /// Check if all dependencies for a tertiary indexer have reached the
+    /// given height.
+    fn dependencies_satisfied(&self, inst: &IndexerInstance, height: u32) -> bool {
+        for dep_label in &inst.depends_on {
+            match self.indexers.get(dep_label) {
+                Some(dep) => {
+                    if dep.tip_height.load(Ordering::Relaxed) < height {
+                        return false;
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        indexer = %inst.label,
+                        dependency = %dep_label,
+                        "dependency not found, skipping"
+                    );
+                    return false;
+                }
             }
         }
+        true
     }
 
     /// Notify all indexers of a chain reorganization.
@@ -272,34 +320,71 @@ impl IndexerManager {
     ///
     /// `read_block` is a callback that reads a block at a given height,
     /// returning the raw serialized block data.
+    ///
+    /// Respects `start_height`: indexers won't replay blocks below their
+    /// configured start height. Tertiary indexers replay after their
+    /// dependencies have caught up.
     pub fn catch_up<F>(&self, chain_height: u32, read_block: F)
     where
         F: Fn(u32) -> Option<Vec<u8>>,
     {
+        // Phase 1: catch up secondary indexers (no dependencies).
         for (label, inst) in &self.indexers {
-            let indexer_height = inst.tip_height.load(Ordering::Relaxed);
-            if indexer_height < chain_height {
-                tracing::info!(
+            if !inst.depends_on.is_empty() {
+                continue; // tertiary — handle in phase 2
+            }
+            self.catch_up_single(inst, label, chain_height, &read_block);
+        }
+
+        // Phase 2: catch up tertiary indexers (dependencies should now be current).
+        for (label, inst) in &self.indexers {
+            if inst.depends_on.is_empty() {
+                continue; // already handled
+            }
+            if !self.dependencies_satisfied(inst, chain_height) {
+                tracing::warn!(
                     indexer = %label,
-                    from = indexer_height + 1,
-                    to = chain_height,
-                    "replaying blocks for indexer catch-up"
+                    "skipping tertiary catch-up: dependencies not satisfied"
                 );
-                for h in (indexer_height + 1)..=chain_height {
-                    if let Some(block_data) = read_block(h) {
-                        let mut input = Vec::with_capacity(4 + block_data.len());
-                        input.extend_from_slice(&h.to_le_bytes());
-                        input.extend_from_slice(&block_data);
-                        run_indexer_block(inst, h, &input);
-                    } else {
-                        tracing::warn!(
-                            indexer = %label,
-                            height = h,
-                            "block not available for catch-up, stopping"
-                        );
-                        break;
-                    }
-                }
+                continue;
+            }
+            self.catch_up_single(inst, label, chain_height, &read_block);
+        }
+    }
+
+    fn catch_up_single<F>(
+        &self,
+        inst: &IndexerInstance,
+        label: &str,
+        chain_height: u32,
+        read_block: &F,
+    ) where
+        F: Fn(u32) -> Option<Vec<u8>>,
+    {
+        let indexer_height = inst.tip_height.load(Ordering::Relaxed);
+        let effective_start = std::cmp::max(indexer_height + 1, inst.start_height);
+        if effective_start > chain_height {
+            return;
+        }
+        tracing::info!(
+            indexer = %label,
+            from = effective_start,
+            to = chain_height,
+            "replaying blocks for indexer catch-up"
+        );
+        for h in effective_start..=chain_height {
+            if let Some(block_data) = read_block(h) {
+                let mut input = Vec::with_capacity(4 + block_data.len());
+                input.extend_from_slice(&h.to_le_bytes());
+                input.extend_from_slice(&block_data);
+                run_indexer_block(inst, h, &input);
+            } else {
+                tracing::warn!(
+                    indexer = %label,
+                    height = h,
+                    "block not available for catch-up, stopping"
+                );
+                break;
             }
         }
     }
@@ -396,16 +481,23 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn make_config(label: &str, wasm_path: PathBuf) -> config::IndexerConfig {
+        config::IndexerConfig {
+            label: label.to_string(),
+            wasm_path,
+            smt_enabled: false,
+            start_height: 0,
+            layer: config::IndexerLayer::Secondary,
+            depends_on: vec![],
+        }
+    }
+
     fn setup_indexer_manager(mode: IndexerMode) -> (IndexerManager, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let wasm_path = dir.path().join("test.wasm");
         std::fs::write(&wasm_path, build_test_wasm()).unwrap();
 
-        let configs = vec![config::IndexerConfig {
-            label: "test".to_string(),
-            wasm_path,
-            smt_enabled: false,
-        }];
+        let configs = vec![make_config("test", wasm_path)];
 
         let datadir = PathBuf::from(dir.path());
         let mgr = IndexerManager::new(configs, &datadir, mode).unwrap();
@@ -528,15 +620,11 @@ mod tests {
         std::fs::write(&wasm_path, build_test_wasm()).unwrap();
 
         let configs = vec![
-            config::IndexerConfig {
-                label: "idx_a".to_string(),
-                wasm_path: wasm_path.clone(),
-                smt_enabled: false,
-            },
-            config::IndexerConfig {
-                label: "idx_b".to_string(),
-                wasm_path,
-                smt_enabled: true,
+            make_config("idx_a", wasm_path.clone()),
+            {
+                let mut c = make_config("idx_b", wasm_path);
+                c.smt_enabled = true;
+                c
             },
         ];
 
@@ -559,10 +647,10 @@ mod tests {
         let wasm_path = dir.path().join("test.wasm");
         std::fs::write(&wasm_path, build_test_wasm()).unwrap();
 
-        let configs = vec![config::IndexerConfig {
-            label: "smt_test".to_string(),
-            wasm_path,
-            smt_enabled: true,
+        let configs = vec![{
+            let mut c = make_config("smt_test", wasm_path);
+            c.smt_enabled = true;
+            c
         }];
 
         let datadir = PathBuf::from(dir.path());
@@ -582,13 +670,135 @@ mod tests {
     #[test]
     fn test_invalid_wasm_path() {
         let dir = tempfile::tempdir().unwrap();
-        let configs = vec![config::IndexerConfig {
-            label: "bad".to_string(),
-            wasm_path: PathBuf::from("/nonexistent/path.wasm"),
-            smt_enabled: false,
-        }];
+        let configs = vec![make_config("bad", PathBuf::from("/nonexistent/path.wasm"))];
         let datadir = PathBuf::from(dir.path());
         let result = IndexerManager::new(configs, &datadir, IndexerMode::Synchronous);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_start_height_skips_early_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm_path = dir.path().join("test.wasm");
+        std::fs::write(&wasm_path, build_test_wasm()).unwrap();
+
+        let mut cfg = make_config("late_start", wasm_path);
+        cfg.start_height = 5;
+
+        let datadir = PathBuf::from(dir.path());
+        let mgr = IndexerManager::new(vec![cfg], &datadir, IndexerMode::Synchronous).unwrap();
+
+        // Blocks 1-4 should be skipped.
+        mgr.on_block_connected(1, b"block1");
+        mgr.on_block_connected(2, b"block2");
+        mgr.on_block_connected(3, b"block3");
+        mgr.on_block_connected(4, b"block4");
+        assert_eq!(mgr.indexer_height("late_start"), Some(0)); // still at 0
+
+        // Block 5 should be processed.
+        mgr.on_block_connected(5, b"block5");
+        assert_eq!(mgr.indexer_height("late_start"), Some(5));
+
+        // Block 6 onwards is normal.
+        mgr.on_block_connected(6, b"block6");
+        assert_eq!(mgr.indexer_height("late_start"), Some(6));
+    }
+
+    #[test]
+    fn test_tertiary_depends_on_secondary() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm_path = dir.path().join("test.wasm");
+        std::fs::write(&wasm_path, build_test_wasm()).unwrap();
+
+        let secondary = make_config("primary_idx", wasm_path.clone());
+        let mut tertiary = make_config("derived_idx", wasm_path);
+        tertiary.layer = config::IndexerLayer::Tertiary;
+        tertiary.depends_on = vec!["primary_idx".to_string()];
+
+        let datadir = PathBuf::from(dir.path());
+        let mgr = IndexerManager::new(
+            vec![secondary, tertiary],
+            &datadir,
+            IndexerMode::Synchronous,
+        )
+        .unwrap();
+
+        // Block 1: secondary processes first, then tertiary.
+        mgr.on_block_connected(1, b"block1");
+        assert_eq!(mgr.indexer_height("primary_idx"), Some(1));
+        assert_eq!(mgr.indexer_height("derived_idx"), Some(1));
+
+        // Block 2: same.
+        mgr.on_block_connected(2, b"block2");
+        assert_eq!(mgr.indexer_height("primary_idx"), Some(2));
+        assert_eq!(mgr.indexer_height("derived_idx"), Some(2));
+    }
+
+    #[test]
+    fn test_tertiary_with_start_height_and_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm_path = dir.path().join("test.wasm");
+        std::fs::write(&wasm_path, build_test_wasm()).unwrap();
+
+        let secondary = make_config("base", wasm_path.clone());
+        let mut tertiary = make_config("overlay", wasm_path);
+        tertiary.layer = config::IndexerLayer::Tertiary;
+        tertiary.depends_on = vec!["base".to_string()];
+        tertiary.start_height = 3;
+
+        let datadir = PathBuf::from(dir.path());
+        let mgr = IndexerManager::new(
+            vec![secondary, tertiary],
+            &datadir,
+            IndexerMode::Synchronous,
+        )
+        .unwrap();
+
+        // Blocks 1-2: secondary runs, tertiary skipped (start_height=3).
+        mgr.on_block_connected(1, b"b1");
+        mgr.on_block_connected(2, b"b2");
+        assert_eq!(mgr.indexer_height("base"), Some(2));
+        assert_eq!(mgr.indexer_height("overlay"), Some(0));
+
+        // Block 3: both run.
+        mgr.on_block_connected(3, b"b3");
+        assert_eq!(mgr.indexer_height("base"), Some(3));
+        assert_eq!(mgr.indexer_height("overlay"), Some(3));
+    }
+
+    #[test]
+    fn test_catch_up_respects_start_height() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm_path = dir.path().join("test.wasm");
+        std::fs::write(&wasm_path, build_test_wasm()).unwrap();
+
+        let mut cfg = make_config("late", wasm_path);
+        cfg.start_height = 3;
+
+        let datadir = PathBuf::from(dir.path());
+        let mgr = IndexerManager::new(vec![cfg], &datadir, IndexerMode::Synchronous).unwrap();
+
+        // Catch up to height 5 — should only process blocks 3, 4, 5.
+        mgr.catch_up(5, |h| Some(format!("block_{}", h).into_bytes()));
+        assert_eq!(mgr.indexer_height("late"), Some(5));
+    }
+
+    #[test]
+    fn test_missing_dependency_skips_tertiary() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm_path = dir.path().join("test.wasm");
+        std::fs::write(&wasm_path, build_test_wasm()).unwrap();
+
+        // Tertiary depends on "missing_dep" which doesn't exist.
+        let mut tertiary = make_config("orphan", wasm_path);
+        tertiary.layer = config::IndexerLayer::Tertiary;
+        tertiary.depends_on = vec!["missing_dep".to_string()];
+
+        let datadir = PathBuf::from(dir.path());
+        let mgr = IndexerManager::new(vec![tertiary], &datadir, IndexerMode::Synchronous).unwrap();
+
+        // Block should be skipped because dependency doesn't exist.
+        mgr.on_block_connected(1, b"block1");
+        assert_eq!(mgr.indexer_height("orphan"), Some(0));
     }
 }

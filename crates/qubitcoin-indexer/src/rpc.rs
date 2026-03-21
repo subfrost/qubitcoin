@@ -257,6 +257,9 @@ mod tests {
             label: "testrpc".to_string(),
             wasm_path,
             smt_enabled: false,
+            start_height: 0,
+            layer: config::IndexerLayer::Secondary,
+            depends_on: vec![],
         }];
 
         let datadir = PathBuf::from(dir.path());
