@@ -325,6 +325,49 @@ impl Script {
         true
     }
 
+    /// Remove all occurrences of `pattern` from this script, walking one
+    /// opcode at a time (matching only at opcode boundaries).
+    ///
+    /// Port of Bitcoin Core's `FindAndDelete()` from `interpreter.cpp`.
+    /// Returns the number of occurrences removed.
+    pub fn find_and_delete(&mut self, pattern: &[u8]) -> usize {
+        if pattern.is_empty() {
+            return 0;
+        }
+
+        let mut n_found = 0;
+        let mut result = Vec::new();
+        let mut pos = 0;
+        let mut copy_start = 0;
+
+        while let Some((_opcode, _data, new_pos)) = self.get_op(pos) {
+            // Copy bytes from copy_start to pos (the region before this opcode).
+            result.extend_from_slice(&self.data[copy_start..pos]);
+
+            // At this opcode boundary, check if pattern starts here.
+            while self.data.len() - pos >= pattern.len()
+                && self.data[pos..pos + pattern.len()] == *pattern
+            {
+                pos += pattern.len();
+                n_found += 1;
+            }
+            copy_start = pos;
+
+            // Advance past this opcode (if we didn't skip over it via pattern match).
+            if pos < new_pos {
+                pos = new_pos;
+            }
+        }
+
+        if n_found > 0 {
+            // Copy any remaining bytes.
+            result.extend_from_slice(&self.data[copy_start..]);
+            self.data = result;
+        }
+
+        n_found
+    }
+
     /// Counts the number of signature operations (sigops) in this script.
     ///
     /// When `accurate` is `true`, `OP_CHECKMULTISIG` is counted using the

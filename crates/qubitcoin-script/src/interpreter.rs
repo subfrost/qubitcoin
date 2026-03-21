@@ -14,6 +14,26 @@ use crate::script_num::{ScriptNum, DEFAULT_MAX_NUM_SIZE};
 use crate::verify_flags::ScriptVerifyFlags;
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Write a Bitcoin compact-size integer to a `Vec<u8>`.
+fn write_compact_size_to_vec(buf: &mut Vec<u8>, n: u64) {
+    if n < 253 {
+        buf.push(n as u8);
+    } else if n <= 0xffff {
+        buf.push(253);
+        buf.extend_from_slice(&(n as u16).to_le_bytes());
+    } else if n <= 0xffff_ffff {
+        buf.push(254);
+        buf.extend_from_slice(&(n as u32).to_le_bytes());
+    } else {
+        buf.push(255);
+        buf.extend_from_slice(&n.to_le_bytes());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
@@ -1359,7 +1379,21 @@ pub fn eval_script(
                     // EvalChecksig logic (pre-tapscript path)
                     if sigversion == SigVersion::Base || sigversion == SigVersion::WitnessV0 {
                         // Build script code from pbegincodehash to end
-                        let script_code = Script::from_slice(&script_bytes[*pbegincodehash..]);
+                        let mut script_code = Script::from_slice(&script_bytes[*pbegincodehash..]);
+
+                        // Drop the signature in pre-segwit scripts but not segwit scripts
+                        // (Bitcoin Core's FindAndDelete)
+                        if sigversion == SigVersion::Base {
+                            let mut sig_script = Script::new();
+                            sig_script.push_data(&vch_sig);
+                            let found = script_code.find_and_delete(sig_script.as_bytes());
+                            if found > 0
+                                && flags.contains(ScriptVerifyFlags::CONST_SCRIPTCODE)
+                            {
+                                *error = ScriptError::SigFindAndDelete;
+                                return false;
+                            }
+                        }
 
                         if !check_signature_encoding(&vch_sig, flags, error) {
                             return false;
@@ -1559,7 +1593,24 @@ pub fn eval_script(
                     }
 
                     // Build script code
-                    let script_code = Script::from_slice(&script_bytes[*pbegincodehash..]);
+                    let mut script_code = Script::from_slice(&script_bytes[*pbegincodehash..]);
+
+                    // Drop the signatures in pre-segwit scripts but not segwit scripts
+                    // (Bitcoin Core's FindAndDelete for CHECKMULTISIG)
+                    if sigversion == SigVersion::Base {
+                        for k in 0..n_sigs_count {
+                            let vch_sig = stack.top(-(isig as isize + k as isize)).unwrap().clone();
+                            let mut sig_script = Script::new();
+                            sig_script.push_data(&vch_sig);
+                            let found = script_code.find_and_delete(sig_script.as_bytes());
+                            if found > 0
+                                && flags.contains(ScriptVerifyFlags::CONST_SCRIPTCODE)
+                            {
+                                *error = ScriptError::SigFindAndDelete;
+                                return false;
+                            }
+                        }
+                    }
 
                     let mut f_success = true;
                     let mut ikey_cur = ikey;
@@ -1985,7 +2036,13 @@ fn verify_witness_program(
             && stack_items.last().unwrap()[0] == ANNEX_TAG
         {
             let annex = stack_items.pop().unwrap();
-            exec_data.annex_hash = qubitcoin_crypto::hash::sha256_hash(&annex);
+            // Bitcoin Core serializes the annex as a vector (compact-size length
+            // prefix + data) before hashing:
+            //   execdata.m_annex_hash = (HashWriter{} << annex).GetSHA256();
+            let mut serialized = Vec::with_capacity(9 + annex.len());
+            write_compact_size_to_vec(&mut serialized, annex.len() as u64);
+            serialized.extend_from_slice(&annex);
+            exec_data.annex_hash = qubitcoin_crypto::hash::sha256_hash(&serialized);
             exec_data.annex_present = true;
         } else {
             exec_data.annex_present = false;
@@ -2237,6 +2294,13 @@ fn execute_witness_script(
             *error = ScriptError::PushSize;
             return false;
         }
+    }
+
+    // Tapscript: check initial witness stack doesn't exceed MAX_STACK_SIZE.
+    // Bitcoin Core checks this in ExecuteWitnessScript for SigVersion::TAPSCRIPT.
+    if sigversion == SigVersion::Tapscript && stack.size() > MAX_STACK_SIZE {
+        *error = ScriptError::StackSize;
+        return false;
     }
 
     if !eval_script(

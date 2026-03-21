@@ -1154,4 +1154,88 @@ mod tests {
         }
         result
     }
+
+    /// Regression test for testnet3 block 204,625 tx_index=3 input_index=1.
+    ///
+    /// This is a non-standard transaction where the scriptPubKey contains a
+    /// dummy DER signature + OP_DROP followed by a 2-of-2 bare CHECKMULTISIG.
+    /// The scriptSig provides OP_0 + two real signatures.
+    ///
+    /// Block hash: 00000000a0dff26bb4a33874a8ddcbb06b4ab8fce787e6bd7319e05ede36ab55
+    /// Spending txid: 2c63aa814701cef5dbd4bbaddab3fea9117028f2434dddcdab8339141e9b14d1
+    /// Prev txid: 19aa42fee0fa57c45d3b16488198b27caaacc4ff5794510d0c17f173f05587ff (vout 0)
+    #[test]
+    fn test_testnet3_block_204625_nonstandard_multisig() {
+        // Raw spending transaction (the one that was rejected)
+        let raw_tx_hex = "01000000022f196cf1e5bd426a04f07b882c893b5b5edebad67da6eb50f066c372ed736d5f000000006a47304402201f81ac31b52cb4b1ceb83f97d18476f7339b74f4eecd1a32c251d4c3cccfffa402203c9143c18810ce072969e4132fdab91408816c96b423b2be38eec8a3582ade36012102aa5a2b334bd8f135f11bc5c477bf6307ff98ed52d3ed10f857d5c89adf5b02beffffffffff8755f073f1170c0d519457ffc4acaa7cb2988148163b5dc457fae0fe42aa19000000009200483045022015bd0139bcccf990a6af6ec5c1c52ed8222e03a0d51c334df139968525d2fcd20221009f9efe325476eb64c3958e4713e9eefe49bf1d820ed58d2112721b134e2a1a530347304402206da827fb26e569eb740641f9c1a7121ee59141703cbe0f903a22cc7d9a7ec7ac02204729f989b5348b3669ab020b8c4af01acc4deaba7c0d9f8fa9e06b2106cbbfeb01ffffffff010000000000000000016a00000000";
+        let raw_tx = hex_to_bytes_test(raw_tx_hex);
+
+        // scriptPubKey of the previous output being spent (input index 1)
+        // This is a non-standard script:
+        //   PUSH<72> <dummy_sig> OP_DROP OP_2 PUSH<33> <pk> PUSH<33> <pk> OP_2 OP_CHECKMULTISIG
+        let script_pubkey_hex = "483045022015bd0139bcccf990a6af6ec5c1c52ed8222e03a0d51c334df139968525d2fcd20221009f9efe325476eb64c3958e4713e9eefe49bf1d820ed58d2112721b134e2a1a53037552210378d430274f8c5ec1321338151e9f27f4c676a008bdf8638d07c0b6be9ab35c71210378d430274f8c5ec1321338151e9f27f4c676a008bdf8638d07c0b6be9ab35c7152ae";
+        let script_pubkey = hex_to_bytes_test(script_pubkey_hex);
+
+        // scriptSig for input 1:
+        //   OP_0 PUSH<72> <sig1> PUSH<71> <sig2>
+        let script_sig_hex = "00483045022015bd0139bcccf990a6af6ec5c1c52ed8222e03a0d51c334df139968525d2fcd20221009f9efe325476eb64c3958e4713e9eefe49bf1d820ed58d2112721b134e2a1a530347304402206da827fb26e569eb740641f9c1a7121ee59141703cbe0f903a22cc7d9a7ec7ac02204729f989b5348b3669ab020b8c4af01acc4deaba7c0d9f8fa9e06b2106cbbfeb01";
+        let script_sig = hex_to_bytes_test(script_sig_hex);
+
+        let amount: i64 = 100_000; // 100,000 satoshis
+
+        // Deserialize the transaction
+        let tx = qubitcoin_consensus::transaction::deserialize_transaction(
+            &mut std::io::Cursor::new(&raw_tx),
+            true,
+        )
+        .expect("failed to deserialize transaction");
+        let tx_ref: TransactionRef = Arc::new(tx);
+
+        // Build the spent output for precomputed sighash.
+        // Input 0's prev output (P2PKH, not relevant for this test but needed for precompute):
+        let spent_out_0 = qubitcoin_consensus::transaction::TxOut {
+            value: qubitcoin_primitives::Amount::from_sat(0),
+            script_pubkey: Script::from_bytes(vec![]),
+        };
+        // Input 1's prev output:
+        let spent_out_1 = qubitcoin_consensus::transaction::TxOut {
+            value: qubitcoin_primitives::Amount::from_sat(amount),
+            script_pubkey: Script::from_bytes(script_pubkey.clone()),
+        };
+        let spent_outputs = vec![spent_out_0, spent_out_1];
+        let precomputed = PrecomputedTransactionData::new(&tx_ref, &spent_outputs);
+
+        // Flags at height 204,625 on testnet3:
+        // P2SH + WITNESS + TAPROOT (always on), no DERSIG/CLTV/CSV/NULLDUMMY yet
+        let flags = ScriptVerifyFlags::P2SH
+            | ScriptVerifyFlags::WITNESS
+            | ScriptVerifyFlags::TAPROOT;
+
+        let checker = TransactionSignatureChecker::new(
+            Arc::clone(&tx_ref),
+            1, // input_index
+            amount,
+            precomputed,
+        );
+
+        let script_pub = Script::from_bytes(script_pubkey);
+        let script_s = Script::from_bytes(script_sig);
+        let witness = ScriptWitness { stack: vec![] };
+        let mut error = ScriptError::Ok;
+
+        let result = verify_script(
+            &script_s,
+            &script_pub,
+            &witness,
+            &flags,
+            &checker,
+            &mut error,
+        );
+
+        assert!(
+            result,
+            "testnet3 block 204625 tx3 input1 should pass script verification, got error: {:?}",
+            error
+        );
+    }
 }
