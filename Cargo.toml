@@ -19,6 +19,8 @@ members = [
     "crates/qubitcoin-indexer-core",
     "crates/qubitcoin-indexer-web",
     "crates/qubitcoin-web-sys",
+    "crates/qubitcoin-tertiary-web",
+    "crates/qubitcoin-tertiary-support",
     "crates/qubitcoin-sys",
     "crates/qubitcoind",
 ]
@@ -46,6 +48,8 @@ qubitcoin-wallet = { path = "crates/qubitcoin-wallet" }
 qubitcoin-indexer = { path = "crates/qubitcoin-indexer" }
 qubitcoin-indexer-core = { path = "crates/qubitcoin-indexer-core" }
 qubitcoin-indexer-web = { path = "crates/qubitcoin-indexer-web" }
+qubitcoin-tertiary-web = { path = "crates/qubitcoin-tertiary-web" }
+qubitcoin-tertiary-support = { path = "crates/qubitcoin-tertiary-support" }
 qubitcoin-web-sys = { path = "crates/qubitcoin-web-sys" }
 qubitcoin-sys = { path = "crates/qubitcoin-sys" }
 

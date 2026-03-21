@@ -93,6 +93,12 @@ export class DevnetTestHarness {
             ? new Uint8Array(opts.esploraWasm)
             : undefined;
         const server = new wasm.DevnetServer(secretKey, opts.alkanesWasm, esploraArr);
+        // Load tertiary indexers (run after secondary indexers)
+        if (opts.tertiaryIndexers) {
+            for (const ti of opts.tertiaryIndexers) {
+                server.addTertiary(ti.label, ti.wasm);
+            }
+        }
         const harness = new DevnetTestHarness(server, opts.interceptUrls ?? DEFAULT_INTERCEPT_URLS);
         // Initialize Lua runtime (non-blocking — will be ready by first use)
         harness.luaInitPromise = harness.initLuaRuntime(opts.luaScriptsDir);

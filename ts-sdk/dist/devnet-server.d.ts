@@ -28,11 +28,23 @@
  * harness.dispose();
  * ```
  */
+/** A tertiary indexer WASM to load into the devnet. */
+export interface TertiaryIndexerConfig {
+    /** Unique label for this tertiary indexer (e.g., "quspo", "qusprey"). */
+    label: string;
+    /** Compiled tertiary indexer WASM module bytes. */
+    wasm: Uint8Array;
+}
 export interface DevnetTestHarnessOptions {
     /** Compiled alkanes indexer WASM module bytes. */
     alkanesWasm: Uint8Array;
     /** Optional compiled esplora indexer WASM module bytes. */
     esploraWasm?: Uint8Array;
+    /**
+     * Optional tertiary indexer WASMs. Tertiary indexers run after secondary
+     * indexers and can read their state via __secondary_get host functions.
+     */
+    tertiaryIndexers?: TertiaryIndexerConfig[];
     /** 32-byte secret key for coinbase. Defaults to 0x0101...01. */
     secretKey?: Uint8Array;
     /** URL patterns to intercept. Defaults to localhost:18888. */

@@ -49,7 +49,7 @@ impl Key {
     }
 
     /// Generate a new random private key (compressed by default).
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(feature = "native")]
     pub fn generate() -> Self {
         let secp = secp256k1::Secp256k1::new();
         let (secret_key, _) = secp.generate_keypair(&mut rand::thread_rng());

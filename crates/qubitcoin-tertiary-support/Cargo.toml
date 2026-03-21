@@ -1,0 +1,13 @@
+[package]
+name = "qubitcoin-tertiary-support"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "MIT"
+description = "Client-side support library for authoring tertiary indexer WASMs"
+
+[dependencies]
+prost = "0.12"
+
+[build-dependencies]
+prost-build = "0.12"

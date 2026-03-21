@@ -1,0 +1,15 @@
+[package]
+name = "qubitcoin-tertiary-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Browser-compatible tertiary indexer runtime with read access to secondary indexer storage"
+
+[dependencies]
+qubitcoin-indexer-core = { workspace = true }
+qubitcoin-indexer-web = { workspace = true }
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }
+prost = "0.12"
+web-sys = { version = "0.3", features = ["console"] }

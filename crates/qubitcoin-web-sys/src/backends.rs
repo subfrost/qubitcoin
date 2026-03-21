@@ -18,8 +18,11 @@ use qubitcoin_consensus::transaction::TransactionRef;
 use qubitcoin_indexer_web::runtime::WebIndexerRuntime;
 use qubitcoin_indexer_web::storage::WebIndexerStorage;
 use qubitcoin_indexer_core::traits::{IndexerStorageReader, IndexerStorageWriter};
+use qubitcoin_tertiary_web::TertiaryRuntime;
 use qubitcoin_node::test_framework::TestChain;
 use qubitcoin_serialize::serialize;
+
+use std::collections::HashMap;
 
 use qubitcoin_primitives::Amount;
 
@@ -29,20 +32,80 @@ use crate::types;
 ///
 /// Returns `Some(script_bytes)` for valid segwit addresses (bc1/tb1/bcrt1).
 /// The scriptPubKey format is: `[witness_version_opcode] [push_len] [witness_program]`
+///
+/// Uses low-level bech32 decoding to support ALL HRPs including `bcrt` (regtest).
+/// `bech32::segwit::decode()` only recognizes `bc` and `tb` — not `bcrt`.
 fn address_to_script(address: &str) -> Option<Vec<u8>> {
-    // segwit_decode handles both bech32 (v0) and bech32m (v1+)
-    let (_, witness_version, program) = bech32::segwit::decode(address).ok()?;
+    // First try the standard segwit decode (handles bc1 and tb1)
+    if let Ok((_, witness_version, program)) = bech32::segwit::decode(address) {
+        let version_opcode = match witness_version.to_u8() {
+            0 => 0x00u8,
+            n => 0x50 + n,
+        };
+        let mut script = Vec::with_capacity(2 + program.len());
+        script.push(version_opcode);
+        script.push(program.len() as u8);
+        script.extend_from_slice(&program);
+        return Some(script);
+    }
+
+    // Fallback: manual decode for non-standard HRPs (e.g. bcrt for regtest).
+    // Split on '1' to find the data part, then decode the 5-bit groups.
+    let sep_pos = address.rfind('1')?;
+    let data_part = &address[sep_pos + 1..];
+    if data_part.len() < 7 { return None; } // minimum: version + 2-byte program + 6 checksum
+
+    // Decode base32 characters (bech32 alphabet)
+    let charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    let mut values: Vec<u8> = Vec::new();
+    for ch in data_part.chars() {
+        let idx = charset.find(ch)? as u8;
+        values.push(idx);
+    }
+
+    // Strip 6 checksum characters
+    if values.len() < 7 { return None; }
+    values.truncate(values.len() - 6);
+
+    // First value is the witness version
+    let witness_version = values[0];
+    if witness_version > 16 { return None; }
+
+    // Remaining values are 5-bit groups → convert to 8-bit bytes
+    let five_bit = &values[1..];
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut result = Vec::new();
+    for &v in five_bit {
+        acc = (acc << 5) | (v as u32);
+        bits += 5;
+        while bits >= 8 {
+            bits -= 8;
+            result.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    // Discard incomplete trailing bits (must be zero-padded)
+
+    if result.len() < 2 || result.len() > 40 { return None; }
 
     // Build scriptPubKey
-    let version_opcode = match witness_version.to_u8() {
-        0 => 0x00u8,  // OP_0
-        n => 0x50 + n, // OP_1..OP_16
+    let version_opcode = match witness_version {
+        0 => 0x00u8,
+        n => 0x50 + n,
     };
-    let mut script = Vec::with_capacity(2 + program.len());
+    let mut script = Vec::with_capacity(2 + result.len());
     script.push(version_opcode);
-    script.push(program.len() as u8);
-    script.extend_from_slice(&program);
+    script.push(result.len() as u8);
+    script.extend_from_slice(&result);
     Some(script)
+}
+
+/// A named tertiary indexer instance with its own runtime and storage.
+pub struct TertiaryIndexerInstance {
+    pub label: String,
+    pub runtime: TertiaryRuntime,
+    pub storage: WebIndexerStorage,
 }
 
 /// Shared devnet state accessible by all backends via Rc<RefCell<...>>.
@@ -52,6 +115,8 @@ pub struct DevnetState {
     pub alkanes_storage: WebIndexerStorage,
     pub esplora_runtime: Option<WebIndexerRuntime>,
     pub esplora_storage: Option<WebIndexerStorage>,
+    /// Tertiary indexers that run after secondary indexers.
+    pub tertiary_indexers: Vec<TertiaryIndexerInstance>,
 }
 
 impl DevnetState {
@@ -147,7 +212,55 @@ impl DevnetState {
                 .map_err(|e| anyhow::anyhow!("esplora set height: {}", e))?;
         }
 
+        // Index through tertiary indexers (run after all secondary indexers)
+        if !self.tertiary_indexers.is_empty() {
+            let secondary_storages = self.build_secondary_storage_map();
+            for tertiary in &mut self.tertiary_indexers {
+                let t_height = tertiary.storage.tip_height();
+                let pairs = tertiary.runtime.run_block(
+                    t_height, block_bytes.to_vec(),
+                    &tertiary.storage, &secondary_storages,
+                ).map_err(|e| anyhow::anyhow!("tertiary '{}' index: {:?}", tertiary.label, e))?;
+                for (key, value) in &pairs {
+                    tertiary.storage.put(key, value)
+                        .map_err(|e| anyhow::anyhow!("tertiary '{}' put: {}", tertiary.label, e))?;
+                }
+                tertiary.storage.set_tip_height(t_height + 1)
+                    .map_err(|e| anyhow::anyhow!("tertiary '{}' set height: {}", tertiary.label, e))?;
+            }
+        }
+
         Ok(())
+    }
+
+    /// Build a map of secondary indexer name → storage pointer for tertiary access.
+    fn build_secondary_storage_map(&self) -> HashMap<String, *const WebIndexerStorage> {
+        let mut map = HashMap::new();
+        map.insert("alkanes".to_string(), &self.alkanes_storage as *const WebIndexerStorage);
+        if let Some(ref storage) = self.esplora_storage {
+            map.insert("esplora".to_string(), storage as *const WebIndexerStorage);
+        }
+        map
+    }
+
+    /// Call a view function on a named tertiary indexer.
+    ///
+    /// Returns `None` if no tertiary indexer with that label exists.
+    pub fn call_tertiary_view(
+        &self,
+        label: &str,
+        fn_name: &str,
+        height: u32,
+        payload: Vec<u8>,
+    ) -> Option<Result<Vec<u8>, anyhow::Error>> {
+        let tertiary = self.tertiary_indexers.iter().find(|t| t.label == label)?;
+        let secondary_storages = self.build_secondary_storage_map();
+        Some(
+            tertiary.runtime.call_view(
+                fn_name, height, payload,
+                &tertiary.storage, &secondary_storages,
+            ).map_err(|e| anyhow::anyhow!("tertiary '{}' view '{}': {:?}", label, fn_name, e))
+        )
     }
 }
 
@@ -374,17 +487,42 @@ impl MetashrewBackend for DevnetMetashrewBackend {
                     block_tag.parse::<u32>().unwrap_or(0)
                 };
 
+                // Try alkanes (secondary) first
                 let result = state.alkanes_runtime.call_view(
                     view_method,
                     height,
-                    input_bytes,
+                    input_bytes.clone(),
                     &state.alkanes_storage,
-                ).map_err(|e| anyhow::anyhow!("view call failed: {:?}", e))?;
+                );
 
-                Ok(JsonRpcResponse::success(
-                    json!(format!("0x{}", hex::encode(&result))),
-                    request.id.clone(),
-                ))
+                match result {
+                    Ok(data) => {
+                        return Ok(JsonRpcResponse::success(
+                            json!(format!("0x{}", hex::encode(&data))),
+                            request.id.clone(),
+                        ));
+                    }
+                    Err(_) => {
+                        // If alkanes doesn't have the view, try tertiary indexers.
+                        // Convention: view_method is the exported fn name. Each
+                        // tertiary indexer is tried in order; first match wins.
+                        for tertiary in &state.tertiary_indexers {
+                            if let Some(Ok(data)) = state.call_tertiary_view(
+                                &tertiary.label, view_method, height, input_bytes.clone(),
+                            ) {
+                                return Ok(JsonRpcResponse::success(
+                                    json!(format!("0x{}", hex::encode(&data))),
+                                    request.id.clone(),
+                                ));
+                            }
+                        }
+                        // No indexer handled it
+                        return Err(anyhow::anyhow!(
+                            "view '{}' not found in alkanes or any tertiary indexer",
+                            view_method,
+                        ));
+                    }
+                }
             }
             _ => Ok(JsonRpcResponse::error(
                 METHOD_NOT_FOUND,
@@ -435,28 +573,77 @@ impl DevnetEsploraBackend {
             ) {
                 if let Ok(json_str) = String::from_utf8(result) {
                     if let Ok(parsed) = serde_json::from_str::<Value>(&json_str) {
-                        if parsed.is_array() {
-                            return parsed;
+                        // Only return if the array is non-empty.
+                        // An empty array means esplorashrew didn't find anything,
+                        // so we fall through to the block-scan fallback.
+                        if let Some(arr) = parsed.as_array() {
+                            if !arr.is_empty() {
+                                return parsed;
+                            }
                         }
                     }
                 }
             }
         }
 
-        // Fallback: scan chain UTXO set directly by scriptPubKey
-        let script_ref = qubitcoin_script::Script::from_bytes(script);
-        let utxos = state.chain.utxos_for_script(&script_ref);
-        let result: Vec<Value> = utxos.iter().map(|(outpoint, value, height)| {
-            json!({
-                "txid": outpoint.hash.to_hex(),
-                "vout": outpoint.n,
-                "value": value.to_sat(),
-                "status": {
-                    "confirmed": true,
-                    "block_height": height
+        // Fallback: full block scan with spend tracking.
+        //
+        // We bypass coins.have_coin() because the CoinsViewCache uses
+        // parking_lot::RwLock which may have issues in WASM contexts.
+        // Instead, we build a set of spent outpoints from all tx inputs,
+        // then return outputs matching the script that aren't in the spent set.
+        use std::collections::HashSet;
+
+        let target_script = script;
+        let chain_height = state.chain.height();
+
+        // First pass: collect all spent outpoints
+        let mut spent: HashSet<(String, u32)> = HashSet::new();
+        for h in 0..=chain_height {
+            if let Some(block) = state.chain.block_at(h) {
+                for (tx_idx, tx) in block.vtx.iter().enumerate() {
+                    if tx_idx == 0 { continue; } // skip coinbase inputs
+                    for input in &tx.vin {
+                        spent.insert((input.prevout.hash.to_hex(), input.prevout.n));
+                    }
                 }
-            })
-        }).collect();
+            }
+        }
+
+        // Second pass: collect unspent outputs matching the target script
+        let maturity = 100i32;
+        let mut result: Vec<Value> = Vec::new();
+        for h in 0..=chain_height {
+            if let Some(block) = state.chain.block_at(h) {
+                for (tx_idx, tx) in block.vtx.iter().enumerate() {
+                    for (vout, txout) in tx.vout.iter().enumerate() {
+                        if txout.script_pubkey.as_bytes() != target_script {
+                            continue;
+                        }
+                        let txid_hex = tx.txid().to_hex();
+                        if spent.contains(&(txid_hex.clone(), vout as u32)) {
+                            continue;
+                        }
+                        // Coinbase maturity check
+                        if tx_idx == 0 {
+                            let depth = chain_height - h;
+                            if depth < maturity {
+                                continue;
+                            }
+                        }
+                        result.push(json!({
+                            "txid": txid_hex,
+                            "vout": vout,
+                            "value": txout.value.to_sat(),
+                            "status": {
+                                "confirmed": true,
+                                "block_height": h
+                            }
+                        }));
+                    }
+                }
+            }
+        }
         json!(result)
     }
 }

@@ -185,6 +185,7 @@ impl LogCategory {
 ///
 /// This is the preferred initialization path. See also the deprecated
 /// `init_logging` for backward compatibility.
+#[cfg(feature = "native")]
 pub fn init_tracing(level: LogLevel) {
     use tracing_subscriber::EnvFilter;
 
@@ -199,6 +200,11 @@ pub fn init_tracing(level: LogLevel) {
             .with_timer(tracing_subscriber::fmt::time::SystemTime)
             .init();
     });
+}
+
+#[cfg(not(feature = "native"))]
+pub fn init_tracing(_level: LogLevel) {
+    // tracing_subscriber not available on wasm; no-op
 }
 
 /// Initialize logging with the given level.

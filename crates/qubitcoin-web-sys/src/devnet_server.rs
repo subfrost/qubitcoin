@@ -17,6 +17,7 @@ use qubitcoin_common::keys::Key;
 use qubitcoin_indexer_core::traits::IndexerStorageReader;
 use qubitcoin_indexer_web::runtime::WebIndexerRuntime;
 use qubitcoin_indexer_web::storage::WebIndexerStorage;
+use qubitcoin_tertiary_web::TertiaryRuntime;
 use qubitcoin_node::test_framework::TestChain;
 
 use crate::backends::*;
@@ -92,9 +93,30 @@ impl DevnetServer {
             alkanes_storage,
             esplora_runtime,
             esplora_storage,
+            tertiary_indexers: Vec::new(),
         }));
 
         Ok(DevnetServer { state })
+    }
+
+    /// Add a tertiary indexer WASM module.
+    ///
+    /// * `label` — unique name for this tertiary indexer (e.g., "quspo", "qusprey").
+    /// * `wasm_bytes` — compiled tertiary indexer WASM module bytes.
+    ///
+    /// Tertiary indexers run after all secondary indexers and can read their state.
+    #[wasm_bindgen(js_name = "addTertiary")]
+    pub fn add_tertiary(&self, label: &str, wasm_bytes: &[u8]) -> Result<(), JsValue> {
+        let runtime = TertiaryRuntime::new(wasm_bytes)?;
+        let storage = WebIndexerStorage::new();
+        self.state.borrow_mut().tertiary_indexers.push(
+            crate::backends::TertiaryIndexerInstance {
+                label: label.to_string(),
+                runtime,
+                storage,
+            },
+        );
+        Ok(())
     }
 
     /// Process a JSON-RPC request string and return the JSON-RPC response string.

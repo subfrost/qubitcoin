@@ -137,7 +137,7 @@ impl TestChain {
     /// Create a new `TestChain` with regtest parameters and a random key.
     ///
     /// Automatically mines the genesis block so the chain starts at height 0.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(feature = "native-deps")]
     pub fn new() -> Self {
         Self::new_with_key(Key::generate())
     }

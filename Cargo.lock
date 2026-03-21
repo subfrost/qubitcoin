@@ -3565,6 +3565,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "qubitcoin-tertiary-support"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-build",
+]
+
+[[package]]
+name = "qubitcoin-tertiary-web"
+version = "0.1.0"
+dependencies = [
+ "js-sys",
+ "prost",
+ "qubitcoin-indexer-core",
+ "qubitcoin-indexer-web",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
 name = "qubitcoin-tx"
 version = "0.1.0"
 dependencies = [
@@ -3627,11 +3647,13 @@ dependencies = [
  "qubitcoin-script",
  "qubitcoin-serialize",
  "qubitcoin-storage",
+ "qubitcoin-tertiary-web",
  "qubitcoin-util",
  "serde",
  "serde_json",
  "sha2",
  "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]
