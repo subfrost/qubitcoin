@@ -24,7 +24,10 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY patch/ patch/
 
-RUN cargo build --release -p qubitcoind -p qubitcoin-cli
+# Exclude browser-only crates that have host-path dependencies.
+# Remove them from workspace before building (they're not needed for qubitcoind).
+RUN sed -i '/"crates\/qubitcoin-web-sys"/d; /"crates\/qubitcoin-indexer-web"/d; /"crates\/qubitcoin-tertiary-web"/d; /"crates\/qubitcoin-tertiary-support"/d; /"crates\/qubitcoin-sys"/d' Cargo.toml \
+    && cargo build --release -p qubitcoind -p qubitcoin-cli
 
 # =============================================================================
 # Stage 2: Runtime
