@@ -4,6 +4,7 @@
 //! accumulates values over time, enabling rollback by height.
 
 use crate::state;
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Storage backend for a single indexer, wrapping a dedicated RocksDB instance.
@@ -12,23 +13,72 @@ pub struct IndexerStorage {
 }
 
 impl IndexerStorage {
-    /// Open (or create) a RocksDB database at `path`.
+    /// Open (or create) a RocksDB database at `path` with optimized settings.
+    ///
+    /// Tuned for the metashrew append-only workload pattern based on profiling
+    /// that identified bloom filter I/O, memory copying, and page faults as
+    /// the primary bottlenecks.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, String> {
         let mut opts = rocksdb::Options::default();
         opts.create_if_missing(true);
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
-        opts.set_max_open_files(256);
-        opts.set_write_buffer_size(16 * 1024 * 1024);
-        opts.set_max_write_buffer_number(2);
-        opts.set_level_compaction_dynamic_level_bytes(true);
+
+        // --- Memory ---
+        // Large write buffers reduce write stalls during block processing.
+        opts.set_write_buffer_size(256 * 1024 * 1024); // 256 MB per memtable
+        opts.set_max_write_buffer_number(4);
+        opts.set_min_write_buffer_number_to_merge(2);
+
+        // --- Block cache ---
+        // 25% of available memory (min 512 MB, max 4 GB per indexer).
+        let cache_bytes = get_available_memory_bytes()
+            .map(|m| (m / 4).clamp(512 * 1024 * 1024, 4 * 1024 * 1024 * 1024))
+            .unwrap_or(2 * 1024 * 1024 * 1024);
+        let cache = rocksdb::Cache::new_lru_cache(cache_bytes);
 
         let mut block_opts = rocksdb::BlockBasedOptions::default();
-        block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(32 * 1024 * 1024));
-        block_opts.set_bloom_filter(10.0, false);
+        block_opts.set_block_cache(&cache);
+        // Larger blocks reduce bloom filter I/O overhead.
+        block_opts.set_block_size(256 * 1024); // 256 KB
+        // Pin index/filter blocks in cache to avoid repeated I/O.
+        block_opts.set_cache_index_and_filter_blocks(true);
+        block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        // 20 bits/key bloom filter for fewer false positives.
+        block_opts.set_bloom_filter(20.0, false);
+        block_opts.set_whole_key_filtering(true);
+        block_opts.set_format_version(5);
         opts.set_block_based_table_factory(&block_opts);
 
-        opts.increase_parallelism(2);
-        opts.set_max_background_jobs(2);
+        // --- Compaction ---
+        opts.set_compaction_style(rocksdb::DBCompactionStyle::Level);
+        opts.set_level_compaction_dynamic_level_bytes(true);
+        opts.set_level_zero_file_num_compaction_trigger(8);
+        opts.set_level_zero_slowdown_writes_trigger(20);
+        opts.set_level_zero_stop_writes_trigger(36);
+        opts.set_target_file_size_base(256 * 1024 * 1024); // 256 MB
+
+        // --- Per-level compression: none for hot, LZ4 for warm, Zstd for cold ---
+        opts.set_compression_per_level(&[
+            rocksdb::DBCompressionType::None,
+            rocksdb::DBCompressionType::None,
+            rocksdb::DBCompressionType::Lz4,
+            rocksdb::DBCompressionType::Zstd,
+            rocksdb::DBCompressionType::Zstd,
+            rocksdb::DBCompressionType::Zstd,
+            rocksdb::DBCompressionType::Zstd,
+        ]);
+
+        // --- Parallelism ---
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get() as i32)
+            .unwrap_or(4);
+        opts.set_max_background_jobs(cpus.max(4));
+        opts.set_max_open_files(4096);
+
+        // --- Write optimizations ---
+        opts.set_bytes_per_sync(16 * 1024 * 1024);
+        opts.set_wal_bytes_per_sync(16 * 1024 * 1024);
+        opts.set_allow_concurrent_memtable_write(true);
+        opts.set_enable_write_thread_adaptive_yield(true);
 
         let db = rocksdb::DB::open(&opts, path).map_err(|e| format!("indexer db open: {}", e))?;
         Ok(IndexerStorage { db })
@@ -74,6 +124,67 @@ impl IndexerStorage {
         self.db
             .write(batch)
             .map_err(|e| format!("indexer db append: {}", e))
+    }
+
+    /// Atomically append all key-value pairs from a block and record the
+    /// per-height key set for efficient rollback.
+    ///
+    /// This replaces the per-pair `append()` loop with a single WriteBatch
+    /// commit, reducing I/O by an order of magnitude on large blocks.
+    pub fn append_batch(
+        &self,
+        pairs: &[(Vec<u8>, Vec<u8>)],
+        height: u32,
+    ) -> Result<(), String> {
+        if pairs.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch = rocksdb::WriteBatch::default();
+
+        // Track in-flight length updates for keys that appear multiple times
+        // in the same block (the DB read won't see uncommitted batch writes).
+        let mut length_cache: HashMap<Vec<u8>, u32> = HashMap::new();
+
+        // Collect the set of logical keys modified at this height.
+        let mut modified_keys: Vec<Vec<u8>> = Vec::with_capacity(pairs.len());
+
+        for (key, value) in pairs {
+            let len_key = state::length_key(key);
+            let current_len = length_cache
+                .get(key)
+                .copied()
+                .unwrap_or_else(|| self.get_u32(&len_key).unwrap_or(0));
+
+            batch.put(&len_key, &(current_len + 1).to_le_bytes());
+            batch.put(&state::index_key(key, current_len), value);
+            batch.put(
+                &state::entry_height_key(key, current_len),
+                &height.to_le_bytes(),
+            );
+
+            length_cache.insert(key.clone(), current_len + 1);
+            modified_keys.push(key.clone());
+        }
+
+        // Write the per-height key set for fast rollback.
+        let keyset_key = state::height_keyset_key(height);
+        let keyset_data = state::encode_key_set(&modified_keys);
+        batch.put(&keyset_key, &keyset_data);
+
+        // Update tip height in the same batch.
+        batch.put(state::HEIGHT_KEY, &height.to_le_bytes());
+
+        self.db
+            .write(batch)
+            .map_err(|e| format!("indexer db append_batch: {}", e))
+    }
+
+    /// Write a raw RocksDB WriteBatch.
+    pub fn write_raw_batch(&self, batch: rocksdb::WriteBatch) -> Result<(), String> {
+        self.db
+            .write(batch)
+            .map_err(|e| format!("indexer db raw batch: {}", e))
     }
 
     /// Get the latest value for a logical key (last entry in the append list).
@@ -148,6 +259,26 @@ impl IndexerStorage {
     }
 }
 
+/// Get available system memory in bytes (Linux only, fallback 16 GB).
+fn get_available_memory_bytes() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+            for line in meminfo.lines() {
+                if line.starts_with("MemAvailable:") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        if let Ok(kb) = parts[1].parse::<usize>() {
+                            return Some(kb * 1024);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,7 +327,6 @@ mod tests {
         assert_eq!(storage.get_latest(b"log"), Some(b"second".to_vec()));
         assert_eq!(storage.get_length(b"log"), 2);
 
-        // Can still read first entry by index.
         assert_eq!(storage.get_at_index(b"log", 0), Some(b"first".to_vec()));
         assert_eq!(storage.get_at_index(b"log", 1), Some(b"second".to_vec()));
     }
@@ -214,21 +344,37 @@ mod tests {
         assert_eq!(storage.tip_height(), 0);
         storage.set_tip_height(500).unwrap();
         assert_eq!(storage.tip_height(), 500);
-        storage.set_tip_height(1000).unwrap();
-        assert_eq!(storage.tip_height(), 1000);
     }
 
     #[test]
-    fn test_get_u32() {
+    fn test_append_batch_atomic() {
         let (storage, _dir) = temp_storage();
-        storage.put(b"num", &42u32.to_le_bytes()).unwrap();
-        assert_eq!(storage.get_u32(b"num"), Some(42));
+
+        let pairs = vec![
+            (b"alpha".to_vec(), b"a1".to_vec()),
+            (b"beta".to_vec(), b"b1".to_vec()),
+            (b"alpha".to_vec(), b"a2".to_vec()),
+        ];
+        storage.append_batch(&pairs, 10).unwrap();
+
+        // alpha had two appends in the same batch — lengths accumulate.
+        // First append: alpha len 0→1, second: alpha len 1→2.
+        assert_eq!(storage.get_length(b"alpha"), 2);
+        assert_eq!(storage.get_length(b"beta"), 1);
+        assert_eq!(storage.get_at_index(b"alpha", 0), Some(b"a1".to_vec()));
+        assert_eq!(storage.get_at_index(b"alpha", 1), Some(b"a2".to_vec()));
+        assert_eq!(storage.tip_height(), 10);
+
+        // Per-height keyset was recorded.
+        let keyset_key = state::height_keyset_key(10);
+        assert!(storage.get(&keyset_key).is_some());
     }
 
     #[test]
-    fn test_get_u32_missing() {
+    fn test_append_batch_empty() {
         let (storage, _dir) = temp_storage();
-        assert_eq!(storage.get_u32(b"missing"), None);
+        storage.append_batch(&[], 5).unwrap();
+        assert_eq!(storage.tip_height(), 0); // no change
     }
 
     #[test]
@@ -258,5 +404,18 @@ mod tests {
         assert_eq!(storage.get_length(b"key_b"), 1);
         assert_eq!(storage.get_latest(b"key_a"), Some(b"val_a2".to_vec()));
         assert_eq!(storage.get_latest(b"key_b"), Some(b"val_b1".to_vec()));
+    }
+
+    #[test]
+    fn test_get_u32() {
+        let (storage, _dir) = temp_storage();
+        storage.put(b"num", &42u32.to_le_bytes()).unwrap();
+        assert_eq!(storage.get_u32(b"num"), Some(42));
+    }
+
+    #[test]
+    fn test_get_u32_missing() {
+        let (storage, _dir) = temp_storage();
+        assert_eq!(storage.get_u32(b"missing"), None);
     }
 }

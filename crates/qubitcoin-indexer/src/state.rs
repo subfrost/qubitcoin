@@ -48,6 +48,54 @@ pub fn entry_height_key(key: &[u8], index: u32) -> Vec<u8> {
     k
 }
 
+/// Key for the set of logical keys modified at a given height.
+/// Format: `"__keyset__/" ++ height_le32`
+///
+/// Used by `append_batch` to record which keys changed at each height,
+/// enabling O(K) rollback (where K = keys modified) instead of full DB scan.
+pub fn height_keyset_key(height: u32) -> Vec<u8> {
+    let mut k = Vec::with_capacity(11 + 4);
+    k.extend_from_slice(b"__keyset__/");
+    k.extend_from_slice(&height.to_le_bytes());
+    k
+}
+
+/// Encode a list of keys as `[count_u32_le, len1_u32_le, key1, len2_u32_le, key2, ...]`.
+pub fn encode_key_set(keys: &[Vec<u8>]) -> Vec<u8> {
+    let total: usize = 4 + keys.iter().map(|k| 4 + k.len()).sum::<usize>();
+    let mut buf = Vec::with_capacity(total);
+    buf.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    for key in keys {
+        buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(key);
+    }
+    buf
+}
+
+/// Decode a key set produced by [`encode_key_set`].
+pub fn decode_key_set(data: &[u8]) -> Vec<Vec<u8>> {
+    if data.len() < 4 {
+        return vec![];
+    }
+    let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let mut keys = Vec::with_capacity(count);
+    let mut pos = 4;
+    for _ in 0..count {
+        if pos + 4 > data.len() {
+            break;
+        }
+        let len = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+            as usize;
+        pos += 4;
+        if pos + len > data.len() {
+            break;
+        }
+        keys.push(data[pos..pos + len].to_vec());
+        pos += len;
+    }
+    keys
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +160,34 @@ mod tests {
     fn test_constants() {
         assert_eq!(HEIGHT_KEY, b"__HEIGHT__");
         assert_eq!(WASM_HASH_KEY, b"__WASM_HASH__");
+    }
+
+    #[test]
+    fn test_height_keyset_key() {
+        let k = height_keyset_key(42);
+        assert!(k.starts_with(b"__keyset__/"));
+        assert_eq!(&k[11..], &42u32.to_le_bytes());
+    }
+
+    #[test]
+    fn test_encode_decode_key_set_roundtrip() {
+        let keys = vec![b"alpha".to_vec(), b"beta".to_vec(), b"gamma".to_vec()];
+        let encoded = encode_key_set(&keys);
+        let decoded = decode_key_set(&encoded);
+        assert_eq!(decoded, keys);
+    }
+
+    #[test]
+    fn test_encode_decode_empty() {
+        let keys: Vec<Vec<u8>> = vec![];
+        let encoded = encode_key_set(&keys);
+        let decoded = decode_key_set(&encoded);
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn test_decode_truncated() {
+        let decoded = decode_key_set(&[0, 0, 0]); // too short
+        assert!(decoded.is_empty());
     }
 }

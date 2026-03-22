@@ -20,6 +20,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use storage::IndexerStorage;
 
+// Note: WasmIndexerRuntime methods (run_block, call_view, call_view_async)
+// all take &self and create a fresh wasmtime::Store per invocation, so no
+// Mutex is needed. Engine and Module are Send+Sync in wasmtime.
+
 /// Indexer execution mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexerMode {
@@ -34,8 +38,10 @@ pub enum IndexerMode {
 pub struct IndexerInstance {
     /// Human-readable label.
     pub label: String,
-    /// Compiled WASM runtime.
-    pub runtime: parking_lot::Mutex<WasmIndexerRuntime>,
+    /// WASM runtime for block processing (serial, one block at a time).
+    pub block_runtime: WasmIndexerRuntime,
+    /// WASM runtime for view/RPC queries (concurrent reads allowed).
+    pub view_runtime: WasmIndexerRuntime,
     /// Dedicated RocksDB storage.
     pub storage: Arc<IndexerStorage>,
     /// SHA-256 hash of the WASM binary.
@@ -111,8 +117,10 @@ impl IndexerManager {
             }
             storage.put(state::WASM_HASH_KEY, &wasm_hash)?;
 
-            // Compile WASM module.
-            let runtime = WasmIndexerRuntime::new(&wasm_bytes)?;
+            // Compile WASM module — two runtimes: one for blocks, one for views.
+            // Each creates a fresh Store per call so no locking is needed.
+            let block_runtime = WasmIndexerRuntime::new(&wasm_bytes)?;
+            let view_runtime = WasmIndexerRuntime::new(&wasm_bytes)?;
 
             let tip_height = storage.tip_height();
 
@@ -126,7 +134,8 @@ impl IndexerManager {
 
             let instance = Arc::new(IndexerInstance {
                 label: config.label.clone(),
-                runtime: parking_lot::Mutex::new(runtime),
+                block_runtime,
+                view_runtime,
                 storage,
                 wasm_hash,
                 tip_height: AtomicU32::new(tip_height),
@@ -281,6 +290,10 @@ impl IndexerManager {
     }
 
     /// Call a view function on an indexer (async, with fuel-based yielding).
+    ///
+    /// Uses the dedicated `view_runtime` — no lock contention with block
+    /// processing. Multiple concurrent view calls are safe because each
+    /// creates a fresh wasmtime Store.
     pub async fn call_view_async(
         &self,
         label: &str,
@@ -290,8 +303,7 @@ impl IndexerManager {
         let inst = self
             .get_indexer(label)
             .ok_or_else(|| format!("indexer '{}' not found", label))?;
-        let runtime = inst.runtime.lock();
-        runtime
+        inst.view_runtime
             .call_view_async(fn_name, input, inst.storage.clone(), label)
             .await
     }
@@ -306,8 +318,8 @@ impl IndexerManager {
         let inst = self
             .get_indexer(label)
             .ok_or_else(|| format!("indexer '{}' not found", label))?;
-        let runtime = inst.runtime.lock();
-        runtime.call_view(fn_name, input, inst.storage.clone(), label)
+        inst.view_runtime
+            .call_view(fn_name, input, inst.storage.clone(), label)
     }
 
     /// Get the current tip height for an indexer.
@@ -415,24 +427,16 @@ fn build_test_wasm() -> Vec<u8> {
 }
 
 /// Run a single indexer on a block, writing results to storage.
+///
+/// Uses `block_runtime` (no lock) and `append_batch` (single WriteBatch)
+/// for maximum throughput.
 fn run_indexer_block(inst: &IndexerInstance, height: u32, input: &[u8]) {
-    let runtime = inst.runtime.lock();
-    match runtime.run_block(input.to_vec(), inst.storage.clone(), &inst.label) {
+    match inst
+        .block_runtime
+        .run_block(input.to_vec(), inst.storage.clone(), &inst.label)
+    {
         Ok(pairs) => {
-            // Write all key-value pairs using append-only model.
-            for (key, value) in &pairs {
-                if let Err(e) = inst.storage.append(key, value, height) {
-                    tracing::error!(
-                        indexer = %inst.label,
-                        height = height,
-                        error = %e,
-                        "failed to append indexer state"
-                    );
-                    return;
-                }
-            }
-
-            // Compute SMT root if enabled.
+            // Compute SMT root before writing (needs the pairs).
             if inst.smt_enabled && !pairs.is_empty() {
                 let root = smt::compute_state_root(&pairs);
                 let root_key = smt::smt_root_key(height);
@@ -446,13 +450,14 @@ fn run_indexer_block(inst: &IndexerInstance, height: u32, input: &[u8]) {
                 }
             }
 
-            // Update tip height.
-            if let Err(e) = inst.storage.set_tip_height(height) {
+            // Write all key-value pairs + tip height + per-height keyset
+            // in a single atomic WriteBatch.
+            if let Err(e) = inst.storage.append_batch(&pairs, height) {
                 tracing::error!(
                     indexer = %inst.label,
                     height = height,
                     error = %e,
-                    "failed to update indexer tip height"
+                    "failed to write indexer batch"
                 );
                 return;
             }
