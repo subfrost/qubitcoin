@@ -133,6 +133,46 @@ impl DevnetState {
         Ok(block_bytes_vec)
     }
 
+    /// Mine a block with extra coinbase outputs.
+    ///
+    /// `raw_outputs`: pairs of (value_u64_le, script_hex) encoded as:
+    ///   [8-byte LE value][2-byte LE script_len][script_bytes] repeated
+    pub fn mine_with_coinbase_outputs_raw_and_index(
+        &mut self,
+        raw_outputs: &[u8],
+    ) -> Result<Vec<u8>> {
+        use qubitcoin_consensus::transaction::TxOut;
+        use qubitcoin_script::Script;
+        use qubitcoin_primitives::Amount;
+
+        let mut outputs = Vec::new();
+        let mut pos = 0;
+        while pos + 10 <= raw_outputs.len() {
+            // 8-byte LE value
+            let value = i64::from_le_bytes(raw_outputs[pos..pos+8].try_into()
+                .map_err(|_| anyhow::anyhow!("invalid value at {}", pos))?);
+            pos += 8;
+            // 2-byte LE script length
+            let script_len = u16::from_le_bytes(raw_outputs[pos..pos+2].try_into()
+                .map_err(|_| anyhow::anyhow!("invalid script_len at {}", pos))?) as usize;
+            pos += 2;
+            // script bytes
+            if pos + script_len > raw_outputs.len() {
+                return Err(anyhow::anyhow!("script overflows at {}", pos));
+            }
+            let script = Script::from_bytes(raw_outputs[pos..pos+script_len].to_vec());
+            pos += script_len;
+
+            outputs.push(TxOut::new(Amount::from_sat(value), script));
+        }
+
+        let block = self.chain.mine_block_with_coinbase_outputs(vec![], outputs);
+        let block_bytes = types::block_to_bytes(&block)
+            .map_err(|e| anyhow::anyhow!("block serialize: {:?}", e))?;
+        self.index_block(&block_bytes)?;
+        Ok(block_bytes)
+    }
+
     /// Mine a block with transactions and auto-index.
     pub fn mine_with_txs_and_index(&mut self, txs: Vec<TransactionRef>) -> Result<Vec<u8>> {
         let block = self.chain.mine_block(txs);

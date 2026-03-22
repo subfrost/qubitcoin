@@ -18,6 +18,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::closure::WasmClosure;
 
 /// A compiled tertiary indexer runtime.
 ///
@@ -63,7 +64,7 @@ impl TertiaryRuntime {
             memory: None,
         }));
 
-        let import_object = self.build_imports(&state)?;
+        let (import_object, _closures) = self.build_imports(&state)?;
         let instance = WebAssembly::Instance::new(&self.module, &import_object)?;
 
         let exports = instance.exports();
@@ -73,6 +74,11 @@ impl TertiaryRuntime {
 
         let start_fn: Function = Reflect::get(&exports, &"_start".into())?.dyn_into()?;
         start_fn.call0(&JsValue::NULL)?;
+
+        // Drop instance + closures before extracting results.
+        // This allows the JS GC to reclaim the WebAssembly::Memory.
+        drop(instance);
+        drop(_closures);
 
         let state = state.borrow();
         if state.had_failure {
@@ -111,7 +117,7 @@ impl TertiaryRuntime {
             memory: None,
         }));
 
-        let import_object = self.build_imports(&state)?;
+        let (import_object, _closures) = self.build_imports(&state)?;
         let instance = WebAssembly::Instance::new(&self.module, &import_object)?;
 
         let exports = instance.exports();
@@ -123,19 +129,31 @@ impl TertiaryRuntime {
         let result_ptr = view_fn.call0(&JsValue::NULL)?;
         let ptr = result_ptr.as_f64().ok_or("view fn did not return i32")? as i32;
 
-        read_arraybuffer(&memory, ptr)
+        let result = read_arraybuffer(&memory, ptr);
+
+        // Drop instance + closures to allow GC of WebAssembly::Memory.
+        drop(instance);
+        drop(_closures);
+
+        result
     }
 
     /// Build the JS import object with host functions.
     ///
-    /// Provides all standard metashrew ABI functions plus two tertiary-specific ones:
-    /// - `__secondary_get_len(name_ptr, key_ptr) -> i32`
-    /// - `__secondary_get(name_ptr, key_ptr, value_ptr)`
+    /// Returns `(imports_object, closures)`. The caller MUST hold `closures`
+    /// alive for the duration of the WASM execution. When `closures` is dropped,
+    /// the JS closures are freed, allowing GC of the associated
+    /// `WebAssembly::Instance` and its linear memory.
+    ///
+    /// JOURNAL: 2026-03-22 — Previously used `Closure::forget()` which leaked
+    /// closures per call. Each leaked closure prevented GC of the
+    /// `WebAssembly::Memory`, causing OOM after many blocks.
     fn build_imports(
         &self,
         state: &Rc<RefCell<TertiaryHostState>>,
-    ) -> Result<Object, JsValue> {
+    ) -> Result<(Object, TertiaryImportClosures), JsValue> {
         let env = Object::new();
+        let mut closures: Vec<TertiaryClosureHandle> = Vec::new();
 
         // __host_len() -> i32
         {
@@ -144,7 +162,7 @@ impl TertiaryRuntime {
                 s.borrow().input_data.len() as i32
             }) as Box<dyn Fn() -> i32>);
             Reflect::set(&env, &"__host_len".into(), closure.as_ref())?;
-            closure.forget();
+            closures.push(TertiaryClosureHandle::from_closure(closure));
         }
 
         // __load_input(ptr: i32)
@@ -156,7 +174,7 @@ impl TertiaryRuntime {
                 write_to_memory(memory, ptr as u32, &st.input_data);
             }) as Box<dyn Fn(i32)>);
             Reflect::set(&env, &"__load_input".into(), closure.as_ref())?;
-            closure.forget();
+            closures.push(TertiaryClosureHandle::from_closure(closure));
         }
 
         // __get_len(key_ptr: i32) -> i32  (reads from OWN storage)
@@ -179,7 +197,7 @@ impl TertiaryRuntime {
                 }
             }) as Box<dyn Fn(i32) -> i32>);
             Reflect::set(&env, &"__get_len".into(), closure.as_ref())?;
-            closure.forget();
+            closures.push(TertiaryClosureHandle::from_closure(closure));
         }
 
         // __get(key_ptr: i32, value_ptr: i32)  (reads from OWN storage)
@@ -201,7 +219,7 @@ impl TertiaryRuntime {
                 }
             }) as Box<dyn Fn(i32, i32)>);
             Reflect::set(&env, &"__get".into(), closure.as_ref())?;
-            closure.forget();
+            closures.push(TertiaryClosureHandle::from_closure(closure));
         }
 
         // __secondary_get_len(name_ptr: i32, key_ptr: i32) -> i32
@@ -241,7 +259,7 @@ impl TertiaryRuntime {
                 }
             }) as Box<dyn Fn(i32, i32) -> i32>);
             Reflect::set(&env, &"__secondary_get_len".into(), closure.as_ref())?;
-            closure.forget();
+            closures.push(TertiaryClosureHandle::from_closure(closure));
         }
 
         // __secondary_get(name_ptr: i32, key_ptr: i32, value_ptr: i32)
@@ -279,7 +297,7 @@ impl TertiaryRuntime {
                 }
             }) as Box<dyn Fn(i32, i32, i32)>);
             Reflect::set(&env, &"__secondary_get".into(), closure.as_ref())?;
-            closure.forget();
+            closures.push(TertiaryClosureHandle::from_closure(closure));
         }
 
         // __flush(data_ptr: i32)
@@ -319,7 +337,7 @@ impl TertiaryRuntime {
                 st.completed = true;
             }) as Box<dyn Fn(i32)>);
             Reflect::set(&env, &"__flush".into(), closure.as_ref())?;
-            closure.forget();
+            closures.push(TertiaryClosureHandle::from_closure(closure));
         }
 
         // __log(ptr: i32)
@@ -338,7 +356,7 @@ impl TertiaryRuntime {
                 }
             }) as Box<dyn Fn(i32)>);
             Reflect::set(&env, &"__log".into(), closure.as_ref())?;
-            closure.forget();
+            closures.push(TertiaryClosureHandle::from_closure(closure));
         }
 
         // abort(msg_ptr, file_ptr, line, col)
@@ -348,12 +366,12 @@ impl TertiaryRuntime {
                 s.borrow_mut().had_failure = true;
             }) as Box<dyn Fn(i32, i32, i32, i32)>);
             Reflect::set(&env, &"abort".into(), closure.as_ref())?;
-            closure.forget();
+            closures.push(TertiaryClosureHandle::from_closure(closure));
         }
 
         let imports = Object::new();
         Reflect::set(&imports, &"env".into(), &env)?;
-        Ok(imports)
+        Ok((imports, TertiaryImportClosures { _closures: closures }))
     }
 }
 
@@ -368,6 +386,31 @@ struct TertiaryHostState {
     had_failure: bool,
     completed: bool,
     memory: Option<WebAssembly::Memory>,
+}
+
+/// Holds closures created for WASM host imports.
+///
+/// CRITICAL: Without this, each `run_block` / `call_view` call leaks closures
+/// via `Closure::forget()`. Those leaked closures prevent GC of the
+/// `WebAssembly::Memory` they captured, causing OOM after many blocks.
+/// By storing closures here and dropping them when execution completes,
+/// the JS GC can reclaim both the closures and the `WebAssembly::Instance` +
+/// `Memory` they reference.
+struct TertiaryImportClosures {
+    _closures: Vec<TertiaryClosureHandle>,
+}
+
+/// Type-erased closure handle that drops the closure when dropped.
+/// Type-erased closure handle — see `ClosureHandle` in qubitcoin-indexer-web
+/// for detailed documentation.
+struct TertiaryClosureHandle {
+    _ref: JsValue,
+}
+
+impl TertiaryClosureHandle {
+    fn from_closure<T: ?Sized + WasmClosure>(closure: Closure<T>) -> Self {
+        TertiaryClosureHandle { _ref: closure.into_js_value() }
+    }
 }
 
 /// Write bytes into WASM linear memory at the given offset.

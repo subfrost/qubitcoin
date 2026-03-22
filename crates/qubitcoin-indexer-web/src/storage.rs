@@ -61,6 +61,53 @@ impl WebIndexerStorage {
         }
         result
     }
+
+    /// Export all key-value pairs as a flat binary blob.
+    /// Format: u32 entry_count, then for each: u32 key_len, key_bytes, u32 value_len, value_bytes
+    pub fn export_bytes(&self) -> Vec<u8> {
+        let map = self.kv.borrow();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(map.len() as u32).to_le_bytes());
+        for (k, v) in map.iter() {
+            buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            buf.extend_from_slice(k);
+            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            buf.extend_from_slice(v);
+        }
+        buf
+    }
+
+    /// Import key-value pairs from a flat binary blob, replacing all existing data.
+    pub fn import_bytes(&self, data: &[u8]) -> Result<usize, String> {
+        let mut map = self.kv.borrow_mut();
+        map.clear();
+        *self.insert_count.borrow_mut() = 0;
+
+        if data.len() < 4 { return Ok(0); }
+        let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let mut pos = 4;
+
+        for _ in 0..count {
+            if pos + 4 > data.len() { return Err("truncated key length".into()); }
+            let key_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+            pos += 4;
+            if pos + key_len > data.len() { return Err("truncated key data".into()); }
+            let key = data[pos..pos+key_len].to_vec();
+            pos += key_len;
+
+            if pos + 4 > data.len() { return Err("truncated value length".into()); }
+            let val_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+            pos += 4;
+            if pos + val_len > data.len() { return Err("truncated value data".into()); }
+            let value = data[pos..pos+val_len].to_vec();
+            pos += val_len;
+
+            map.insert(key, value);
+        }
+
+        *self.insert_count.borrow_mut() = count;
+        Ok(count)
+    }
 }
 
 impl Default for WebIndexerStorage {

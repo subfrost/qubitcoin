@@ -153,6 +153,24 @@ impl DevnetServer {
         Ok(())
     }
 
+    /// Mine a block with extra outputs in the coinbase transaction.
+    ///
+    /// `extra_outputs_hex`: hex-encoded concatenated Bitcoin TxOut entries.
+    /// Each TxOut is serialized as: [8-byte LE value] + [varint script_len] + [script bytes]
+    ///
+    /// This is metaprotocol-agnostic — the caller constructs the raw outputs.
+    #[wasm_bindgen(js_name = "mineBlockWithCoinbaseOutputs")]
+    pub fn mine_block_with_coinbase_outputs(&self, extra_outputs_hex: &str) -> Result<(), JsValue> {
+        let hex_str = extra_outputs_hex.strip_prefix("0x").unwrap_or(extra_outputs_hex);
+        let bytes = hex::decode(hex_str)
+            .map_err(|e| JsValue::from_str(&format!("invalid hex: {}", e)))?;
+
+        let mut state = self.state.borrow_mut();
+        state.mine_with_coinbase_outputs_raw_and_index(&bytes)
+            .map_err(|e| JsValue::from_str(&format!("mine error: {}", e)))?;
+        Ok(())
+    }
+
     /// Current chain height.
     #[wasm_bindgen(getter)]
     pub fn height(&self) -> i32 {
@@ -169,5 +187,202 @@ impl DevnetServer {
     #[wasm_bindgen(getter, js_name = "tipHashHex")]
     pub fn tip_hash_hex(&self) -> String {
         self.state.borrow().chain.tip_hash().to_hex()
+    }
+
+    /// Export all indexer state as a single binary blob for persistence.
+    ///
+    /// Format:
+    /// - [4-byte magic "DNET"]
+    /// - [u32 version = 1]
+    /// - [u32 chain_height]
+    /// - [u32 num_blocks] then for each block: [u32 block_len] [block_bytes]
+    /// - [u32 alkanes_blob_len] [alkanes_storage_blob]
+    /// - [u32 esplora_blob_len] [esplora_storage_blob] (0 if no esplora)
+    /// - [u32 num_tertiary] [for each: u32 label_len, label_utf8, u32 blob_len, blob]
+    #[wasm_bindgen(js_name = "exportState")]
+    pub fn export_state(&self) -> Result<Vec<u8>, JsValue> {
+        let state = self.state.borrow();
+        let mut buf = Vec::new();
+
+        // Magic + version
+        buf.extend_from_slice(b"DNET");
+        buf.extend_from_slice(&1u32.to_le_bytes());
+
+        // Chain height
+        let chain_height = state.chain.height();
+        buf.extend_from_slice(&(chain_height as u32).to_le_bytes());
+
+        // Serialize all blocks so the chain can be fully reconstructed on import.
+        // For devnet the chain is small (typically 100-200 blocks), so this is
+        // reasonable. Each block is stored as [u32 len][block_bytes].
+        let num_blocks = if chain_height >= 0 { (chain_height + 1) as u32 } else { 0 };
+        buf.extend_from_slice(&num_blocks.to_le_bytes());
+        for h in 0..num_blocks as i32 {
+            if let Some(block) = state.chain.block_at(h) {
+                let block_bytes = crate::types::block_to_bytes(block)
+                    .map_err(|e| JsValue::from_str(&format!("export block {}: {:?}", h, e)))?;
+                buf.extend_from_slice(&(block_bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&block_bytes);
+            } else {
+                return Err(JsValue::from_str(&format!("missing block at height {}", h)));
+            }
+        }
+
+        // Alkanes storage blob
+        let alkanes_blob = state.alkanes_storage.export_bytes();
+        buf.extend_from_slice(&(alkanes_blob.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&alkanes_blob);
+
+        // Esplora storage blob (0-length if not present)
+        match &state.esplora_storage {
+            Some(storage) => {
+                let esplora_blob = storage.export_bytes();
+                buf.extend_from_slice(&(esplora_blob.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&esplora_blob);
+            }
+            None => {
+                buf.extend_from_slice(&0u32.to_le_bytes());
+            }
+        }
+
+        // Tertiary indexers
+        let num_tertiary = state.tertiary_indexers.len() as u32;
+        buf.extend_from_slice(&num_tertiary.to_le_bytes());
+        for tertiary in &state.tertiary_indexers {
+            let label_bytes = tertiary.label.as_bytes();
+            buf.extend_from_slice(&(label_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(label_bytes);
+            let blob = tertiary.storage.export_bytes();
+            buf.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&blob);
+        }
+
+        Ok(buf)
+    }
+
+    /// Import state from a previously exported blob, restoring all indexer
+    /// storage and replaying blocks into the chain.
+    #[wasm_bindgen(js_name = "importState")]
+    pub fn import_state(&self, data: &[u8]) -> Result<(), JsValue> {
+        let parse_err = |msg: &str| JsValue::from_str(&format!("importState: {}", msg));
+
+        if data.len() < 16 {
+            return Err(parse_err("blob too small"));
+        }
+
+        // Verify magic
+        if &data[0..4] != b"DNET" {
+            return Err(parse_err("invalid magic (expected DNET)"));
+        }
+
+        // Verify version
+        let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        if version != 1 {
+            return Err(parse_err(&format!("unsupported version: {}", version)));
+        }
+
+        let chain_height = u32::from_le_bytes(data[8..12].try_into().unwrap());
+        let mut pos = 12;
+
+        // Read blocks
+        if pos + 4 > data.len() { return Err(parse_err("truncated num_blocks")); }
+        let num_blocks = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
+        pos += 4;
+
+        // Skip over block data (we reconstruct the chain by mining empty blocks)
+        for i in 0..num_blocks {
+            if pos + 4 > data.len() { return Err(parse_err(&format!("truncated block {} length", i))); }
+            let block_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+            pos += 4;
+            if pos + block_len > data.len() { return Err(parse_err(&format!("truncated block {} data", i))); }
+            pos += block_len;
+        }
+
+        // Alkanes storage blob
+        if pos + 4 > data.len() { return Err(parse_err("truncated alkanes blob length")); }
+        let alkanes_blob_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+        pos += 4;
+        if pos + alkanes_blob_len > data.len() { return Err(parse_err("truncated alkanes blob")); }
+        let alkanes_blob = &data[pos..pos+alkanes_blob_len];
+        pos += alkanes_blob_len;
+
+        // Esplora storage blob
+        if pos + 4 > data.len() { return Err(parse_err("truncated esplora blob length")); }
+        let esplora_blob_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+        pos += 4;
+        let esplora_blob = if esplora_blob_len > 0 {
+            if pos + esplora_blob_len > data.len() { return Err(parse_err("truncated esplora blob")); }
+            let blob = &data[pos..pos+esplora_blob_len];
+            pos += esplora_blob_len;
+            Some(blob)
+        } else {
+            None
+        };
+
+        // Tertiary indexers
+        if pos + 4 > data.len() { return Err(parse_err("truncated num_tertiary")); }
+        let num_tertiary = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+        pos += 4;
+
+        let mut tertiary_data: Vec<(String, Vec<u8>)> = Vec::with_capacity(num_tertiary);
+        for i in 0..num_tertiary {
+            if pos + 4 > data.len() { return Err(parse_err(&format!("truncated tertiary {} label length", i))); }
+            let label_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+            pos += 4;
+            if pos + label_len > data.len() { return Err(parse_err(&format!("truncated tertiary {} label", i))); }
+            let label = String::from_utf8(data[pos..pos+label_len].to_vec())
+                .map_err(|_| parse_err(&format!("invalid utf8 in tertiary {} label", i)))?;
+            pos += label_len;
+
+            if pos + 4 > data.len() { return Err(parse_err(&format!("truncated tertiary {} blob length", i))); }
+            let blob_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+            pos += 4;
+            if pos + blob_len > data.len() { return Err(parse_err(&format!("truncated tertiary {} blob", i))); }
+            tertiary_data.push((label, data[pos..pos+blob_len].to_vec()));
+            pos += blob_len;
+        }
+
+        // All parsing succeeded — now apply the state.
+        let mut state = self.state.borrow_mut();
+
+        // Advance the chain to the exported height by mining empty blocks.
+        // We don't replay the original blocks (which may have had transactions)
+        // because the indexer state is authoritative — it comes from the imported
+        // blobs. The chain is needed for:
+        // 1. Correct height() / tip_hash() responses
+        // 2. Coinbase UTXO set (same key → same outputs)
+        // 3. Future mine_block() calls that need prev_blockhash
+        //
+        // Transaction UTXOs from the original chain won't exist, but the esplora
+        // indexer has the correct UTXO data in its imported storage.
+        let current_height = state.chain.height();
+        let target_height = chain_height as i32;
+        if target_height > current_height {
+            let blocks_to_mine = (target_height - current_height) as u32;
+            for _ in 0..blocks_to_mine {
+                state.chain.mine_block(vec![]);
+            }
+        }
+
+        // Import indexer storage
+        state.alkanes_storage.import_bytes(alkanes_blob)
+            .map_err(|e| parse_err(&format!("alkanes import: {}", e)))?;
+
+        if let (Some(ref esplora_storage), Some(esplora_blob)) = (&state.esplora_storage, esplora_blob) {
+            esplora_storage.import_bytes(esplora_blob)
+                .map_err(|e| parse_err(&format!("esplora import: {}", e)))?;
+        }
+
+        // Import tertiary indexer storage (match by label)
+        for (label, blob) in &tertiary_data {
+            if let Some(tertiary) = state.tertiary_indexers.iter().find(|t| &t.label == label) {
+                tertiary.storage.import_bytes(blob)
+                    .map_err(|e| parse_err(&format!("tertiary '{}' import: {}", label, e)))?;
+            }
+            // If no matching tertiary indexer exists, silently skip — it may
+            // have been added after the snapshot was taken.
+        }
+
+        Ok(())
     }
 }

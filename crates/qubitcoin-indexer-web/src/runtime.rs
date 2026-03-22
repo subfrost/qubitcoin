@@ -11,6 +11,7 @@ use qubitcoin_indexer_core::traits::IndexerStorageReader;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::closure::WasmClosure;
 
 /// A compiled web indexer runtime.
 pub struct WebIndexerRuntime {
@@ -53,7 +54,7 @@ impl WebIndexerRuntime {
             memory: None,
         }));
 
-        let import_object = self.build_imports(&state)?;
+        let (import_object, _closures) = self.build_imports(&state)?;
         let instance = WebAssembly::Instance::new(&self.module, &import_object)?;
 
         // Extract memory and store it in HostState before calling _start.
@@ -64,6 +65,11 @@ impl WebIndexerRuntime {
 
         let start_fn: Function = Reflect::get(&exports, &"_start".into())?.dyn_into()?;
         start_fn.call0(&JsValue::NULL)?;
+
+        // Drop instance + closures before extracting results.
+        // This allows the JS GC to reclaim the WebAssembly::Memory.
+        drop(instance);
+        drop(_closures);
 
         let state = state.borrow();
         if state.had_failure {
@@ -102,7 +108,7 @@ impl WebIndexerRuntime {
             memory: None,
         }));
 
-        let import_object = self.build_imports(&state)?;
+        let (import_object, _closures) = self.build_imports(&state)?;
         let instance = WebAssembly::Instance::new(&self.module, &import_object)?;
 
         // Extract memory and store it in HostState before calling the view fn.
@@ -115,19 +121,34 @@ impl WebIndexerRuntime {
         let result_ptr = view_fn.call0(&JsValue::NULL)?;
         let ptr = result_ptr.as_f64().ok_or("view fn did not return i32")? as i32;
 
-        read_arraybuffer(&memory, ptr)
+        let result = read_arraybuffer(&memory, ptr);
+
+        // Drop instance + closures to allow GC of WebAssembly::Memory.
+        drop(instance);
+        drop(_closures);
+
+        result
     }
 
     /// Build the JS import object with host functions.
+    ///
+    /// Returns `(imports_object, closures)`. The caller MUST hold `closures`
+    /// alive for the duration of the WASM execution. When `closures` is dropped,
+    /// the JS closures are freed, allowing GC of the associated
+    /// `WebAssembly::Instance` and its linear memory.
+    ///
+    /// JOURNAL: 2026-03-22 — Previously used `Closure::forget()` which leaked
+    /// ~8 closures per `run_block` call. Each leaked closure prevented GC of the
+    /// `WebAssembly::Memory` (~6.6 MB), causing OOM after ~50-80 blocks.
     fn build_imports(
         &self,
         state: &Rc<RefCell<HostState>>,
-    ) -> Result<Object, JsValue> {
+    ) -> Result<(Object, ImportClosures), JsValue> {
         let env = Object::new();
         let get_count = Rc::new(Cell::new(0u32));
         let get_hit_count = Rc::new(Cell::new(0u32));
         let get_miss_count = Rc::new(Cell::new(0u32));
-        web_sys::console::warn_1(&"[QBIT-TRACE] build_imports called — tracing active v2".into());
+        let mut closures: Vec<ClosureHandle> = Vec::new();
 
         // __host_len() -> i32
         {
@@ -136,7 +157,7 @@ impl WebIndexerRuntime {
                 s.borrow().input_data.len() as i32
             }) as Box<dyn Fn() -> i32>);
             Reflect::set(&env, &"__host_len".into(), closure.as_ref())?;
-            closure.forget();
+            closures.push(ClosureHandle::from_closure(closure));
         }
 
         // __load_input(ptr: i32)
@@ -149,7 +170,7 @@ impl WebIndexerRuntime {
                 write_to_memory(memory, ptr as u32, data);
             }) as Box<dyn Fn(i32)>);
             Reflect::set(&env, &"__load_input".into(), closure.as_ref())?;
-            closure.forget();
+            closures.push(ClosureHandle::from_closure(closure));
         }
 
         // __get_len(key_ptr: i32) -> i32
@@ -199,7 +220,7 @@ impl WebIndexerRuntime {
                 result
             }) as Box<dyn Fn(i32) -> i32>);
             Reflect::set(&env, &"__get_len".into(), closure.as_ref())?;
-            closure.forget();
+            closures.push(ClosureHandle::from_closure(closure));
         }
 
         // __get(key_ptr: i32, value_ptr: i32)
@@ -226,7 +247,7 @@ impl WebIndexerRuntime {
                 }
             }) as Box<dyn Fn(i32, i32)>);
             Reflect::set(&env, &"__get".into(), closure.as_ref())?;
-            closure.forget();
+            closures.push(ClosureHandle::from_closure(closure));
         }
 
         // __flush(data_ptr: i32)
@@ -285,7 +306,7 @@ impl WebIndexerRuntime {
                 st.completed = true;
             }) as Box<dyn Fn(i32)>);
             Reflect::set(&env, &"__flush".into(), closure.as_ref())?;
-            closure.forget();
+            closures.push(ClosureHandle::from_closure(closure));
         }
 
         // __log(ptr: i32)
@@ -305,7 +326,7 @@ impl WebIndexerRuntime {
                 }
             }) as Box<dyn Fn(i32)>);
             Reflect::set(&env, &"__log".into(), closure.as_ref())?;
-            closure.forget();
+            closures.push(ClosureHandle::from_closure(closure));
         }
 
         // abort(msg_ptr, file_ptr, line, col)
@@ -315,7 +336,7 @@ impl WebIndexerRuntime {
                 s.borrow_mut().had_failure = true;
             }) as Box<dyn Fn(i32, i32, i32, i32)>);
             Reflect::set(&env, &"abort".into(), closure.as_ref())?;
-            closure.forget();
+            closures.push(ClosureHandle::from_closure(closure));
         }
 
         let imports = Object::new();
@@ -330,13 +351,13 @@ impl WebIndexerRuntime {
             // __wbindgen_describe: called at compile-time by wasm-bindgen, never at runtime
             let noop = Closure::wrap(Box::new(|| {}) as Box<dyn Fn()>);
             Reflect::set(&placeholder, &"__wbindgen_describe".into(), noop.as_ref())?;
-            noop.forget();
+            closures.push(ClosureHandle::from_closure(noop));
             // __wbg___wbindgen_throw_*: throw an error (trap)
             let throw_fn = Closure::wrap(Box::new(|_a: i32, _b: i32| {
                 web_sys::console::error_1(&"wbindgen_throw called in indexer — trapping".into());
             }) as Box<dyn Fn(i32, i32)>);
             Reflect::set(&placeholder, &"__wbg___wbindgen_throw_be289d5034ed271b".into(), throw_fn.as_ref())?;
-            throw_fn.forget();
+            closures.push(ClosureHandle::from_closure(throw_fn));
             Reflect::set(&imports, &"__wbindgen_placeholder__".into(), &placeholder)?;
         }
         {
@@ -344,15 +365,15 @@ impl WebIndexerRuntime {
             // __wbindgen_externref_table_grow(delta) -> i32
             let grow_fn = Closure::wrap(Box::new(|_delta: i32| -> i32 { 0 }) as Box<dyn Fn(i32) -> i32>);
             Reflect::set(&xform, &"__wbindgen_externref_table_grow".into(), grow_fn.as_ref())?;
-            grow_fn.forget();
+            closures.push(ClosureHandle::from_closure(grow_fn));
             // __wbindgen_externref_table_set_null(idx)
             let set_null = Closure::wrap(Box::new(|_idx: i32| {}) as Box<dyn Fn(i32)>);
             Reflect::set(&xform, &"__wbindgen_externref_table_set_null".into(), set_null.as_ref())?;
-            set_null.forget();
+            closures.push(ClosureHandle::from_closure(set_null));
             Reflect::set(&imports, &"__wbindgen_externref_xform__".into(), &xform)?;
         }
 
-        Ok(imports)
+        Ok((imports, ImportClosures { _closures: closures }))
     }
 }
 
@@ -371,6 +392,39 @@ struct HostState {
     /// Set after instantiation, before calling _start or view fn.
     memory: Option<WebAssembly::Memory>,
     // (counters moved to separate Rc<Cell> for non-mutable access)
+}
+
+/// Holds closures created for WASM host imports.
+///
+/// CRITICAL: Without this, each `run_block` / `call_view` call leaks ~8 closures
+/// via `Closure::forget()`. Those leaked closures prevent GC of the
+/// `WebAssembly::Memory` they captured, causing OOM after ~50-80 blocks
+/// (each instance allocates ~6.6 MB of linear memory).
+///
+/// By storing closures here and dropping them when execution completes,
+/// the JS GC can reclaim both the closures and the `WebAssembly::Instance` +
+/// `Memory` they reference.
+struct ImportClosures {
+    _closures: Vec<ClosureHandle>,
+}
+
+/// Type-erased closure handle that drops the closure when dropped.
+///
+/// We store the `JsValue` from the closure, which prevents the closure
+/// from being invalidated. When this handle is dropped, the JsValue ref
+/// is released, allowing the JS GC to collect the closure function.
+struct ClosureHandle {
+    _ref: JsValue,
+}
+
+impl ClosureHandle {
+    /// Take ownership of a `Closure` and convert it to a handle.
+    /// The closure's destructor would normally invalidate the JS function,
+    /// but by extracting the `JsValue` via `into_js_value()`, we prevent
+    /// premature invalidation while still allowing cleanup on drop.
+    fn from_closure<T: ?Sized + WasmClosure>(closure: Closure<T>) -> Self {
+        ClosureHandle { _ref: closure.into_js_value() }
+    }
 }
 
 /// Write bytes into WASM linear memory at the given offset.

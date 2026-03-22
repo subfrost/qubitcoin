@@ -276,6 +276,75 @@ impl TestChain {
     /// Mine `count` empty blocks (no user transactions).
     ///
     /// Returns the list of mined blocks.
+    /// Mine a block with extra outputs in the coinbase transaction.
+    ///
+    /// This allows testing metaprotocol features that depend on coinbase outputs
+    /// (e.g., ftrBTC creation from coinbase frBTC mints) without making
+    /// qubitcoin aware of any specific metaprotocol.
+    ///
+    /// `coinbase_extra_outputs`: additional TxOut entries appended to the
+    /// coinbase after the standard miner reward output.
+    pub fn mine_block_with_coinbase_outputs(
+        &mut self,
+        txs: Vec<TransactionRef>,
+        coinbase_extra_outputs: Vec<TxOut>,
+    ) -> Block {
+        let height = self.height + 1;
+        let subsidy = get_block_subsidy(height, &self.params.consensus);
+
+        let coinbase_tx = self.create_coinbase_with_extras(height, subsidy, coinbase_extra_outputs);
+        let coinbase_ref: TransactionRef = Arc::new(coinbase_tx);
+
+        let mut all_txs = vec![coinbase_ref.clone()];
+        all_txs.extend(txs);
+
+        let mut mutated = false;
+        let merkle_root = block_merkle_root(&all_txs, &mut mutated);
+
+        let prev_hash = self.tip_hash;
+        let time = if self.height >= 0 {
+            self.headers[self.height as usize].time + 1
+        } else {
+            1_296_688_602
+        };
+
+        let bits = self.pow_limit_compact();
+
+        let mut header = BlockHeader {
+            version: 4,
+            prev_blockhash: prev_hash,
+            merkle_root,
+            time,
+            bits,
+            nonce: 0,
+        };
+
+        self.solve_header(&mut header);
+
+        let block = Block {
+            header: header.clone(),
+            vtx: all_txs.clone(),
+        };
+
+        for (tx_idx, tx) in all_txs.iter().enumerate() {
+            let is_coinbase = tx_idx == 0;
+            add_coins(&self.coins, tx, height as u32, is_coinbase);
+            if !is_coinbase {
+                for input in &tx.vin {
+                    self.coins.spend_coin(&input.prevout);
+                }
+            }
+        }
+
+        self.height = height;
+        self.tip_hash = block.header.block_hash();
+        self.blocks.push(block.clone());
+        self.headers.push(header);
+        self.coinbase_txns.push(coinbase_ref);
+
+        block
+    }
+
     pub fn mine_empty_blocks(&mut self, count: usize) -> Vec<Block> {
         (0..count).map(|_| self.mine_block(vec![])).collect()
     }
@@ -429,6 +498,22 @@ impl TestChain {
 
     /// Build a coinbase transaction for the given `height` and `subsidy`.
     fn create_coinbase(&self, height: i32, subsidy: Amount) -> Transaction {
+        self.create_coinbase_with_extras(height, subsidy, vec![])
+    }
+
+    /// Create a coinbase transaction with optional extra outputs.
+    ///
+    /// Extra outputs are appended after the standard miner reward output.
+    /// This is metaprotocol-agnostic — callers can include any outputs
+    /// (e.g., OP_RETURN with protostones, P2TR outputs for token creation).
+    /// The subsidy goes to the first output (miner), extras get 0 value
+    /// unless they already have a value set.
+    fn create_coinbase_with_extras(
+        &self,
+        height: i32,
+        subsidy: Amount,
+        extra_outputs: Vec<TxOut>,
+    ) -> Transaction {
         // BIP34: encode the block height in the coinbase scriptSig.
         let mut sig_script = Script::new();
         sig_script.push_int(height as i64);
@@ -444,9 +529,10 @@ impl TestChain {
             witness: Witness::new(),
         };
 
-        let tx_out = TxOut::new(subsidy, self.coinbase_script.clone());
+        let mut outputs = vec![TxOut::new(subsidy, self.coinbase_script.clone())];
+        outputs.extend(extra_outputs);
 
-        Transaction::new(2, vec![tx_in], vec![tx_out], 0)
+        Transaction::new(2, vec![tx_in], outputs, 0)
     }
 
     /// Get the compact (nBits) representation of the regtest PoW limit.

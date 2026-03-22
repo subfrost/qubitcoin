@@ -121,6 +121,22 @@ export class DevnetTestHarness {
         this.server.mineBlocks(count);
     }
     /**
+     * Mine a block with extra outputs in the coinbase transaction.
+     *
+     * This is metaprotocol-agnostic — pass raw TxOut data as hex.
+     * Format: repeated [8-byte LE value][2-byte LE script_len][script_bytes]
+     *
+     * Example: to add a 546-sat P2TR output to coinbase:
+     *   const value = Buffer.alloc(8); value.writeBigInt64LE(546n);
+     *   const script = bitcoin.address.toOutputScript(addr, network);
+     *   const scriptLen = Buffer.alloc(2); scriptLen.writeUInt16LE(script.length);
+     *   const hex = Buffer.concat([value, scriptLen, script]).toString('hex');
+     *   harness.mineBlockWithCoinbaseOutputs(hex);
+     */
+    mineBlockWithCoinbaseOutputs(extraOutputsHex) {
+        this.server.mineBlockWithCoinbaseOutputs(extraOutputsHex);
+    }
+    /**
      * Process a JSON-RPC request and return the response.
      *
      * Lua methods (lua_evalscript, lua_evalsaved, etc.) are handled by the
