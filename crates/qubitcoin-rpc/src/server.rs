@@ -550,4 +550,138 @@ mod tests {
         assert_eq!(deserialized.result, Some(json!({"key": "value"})));
         assert_eq!(deserialized.id, json!(1));
     }
+
+    // -- Auth tier tests ---------------------------------------------------
+
+    #[test]
+    fn test_register_public_sets_public_tier() {
+        let mut reg = RpcRegistry::new();
+        reg.register_public("getblockcount", |req: &RpcRequest| {
+            RpcResponse::success(req.id.clone(), json!(42))
+        });
+        assert_eq!(reg.auth_tier_for("getblockcount"), Some(AuthTier::Public));
+    }
+
+    #[test]
+    fn test_register_admin_sets_admin_tier() {
+        let mut reg = RpcRegistry::new();
+        reg.register_admin("stop", |req: &RpcRequest| {
+            RpcResponse::success(req.id.clone(), json!("stopping"))
+        });
+        assert_eq!(reg.auth_tier_for("stop"), Some(AuthTier::Admin));
+    }
+
+    #[test]
+    fn test_auth_tier_for_unregistered() {
+        let reg = RpcRegistry::new();
+        assert_eq!(reg.auth_tier_for("nonexistent"), None);
+    }
+
+    #[test]
+    fn test_register_defaults_to_public() {
+        let mut reg = RpcRegistry::new();
+        reg.register("help", |req: &RpcRequest| {
+            RpcResponse::success(req.id.clone(), json!("help text"))
+        });
+        assert_eq!(reg.auth_tier_for("help"), Some(AuthTier::Public));
+    }
+
+    #[test]
+    fn test_mixed_public_and_admin() {
+        let mut reg = RpcRegistry::new();
+        reg.register_public("getblockcount", |req: &RpcRequest| {
+            RpcResponse::success(req.id.clone(), json!(100))
+        });
+        reg.register_admin("stop", |req: &RpcRequest| {
+            RpcResponse::success(req.id.clone(), json!("ok"))
+        });
+        assert_eq!(reg.auth_tier_for("getblockcount"), Some(AuthTier::Public));
+        assert_eq!(reg.auth_tier_for("stop"), Some(AuthTier::Admin));
+        assert_eq!(reg.method_count(), 2);
+    }
+
+    #[test]
+    fn test_dispatch_works_regardless_of_tier() {
+        let mut reg = RpcRegistry::new();
+        reg.register_admin("admin_method", |req: &RpcRequest| {
+            RpcResponse::success(req.id.clone(), json!("admin_result"))
+        });
+        let req = RpcRequest {
+            jsonrpc: Some("2.0".into()),
+            method: "admin_method".into(),
+            params: None,
+            id: json!(1),
+        };
+        let resp = reg.dispatch(&req);
+        assert_eq!(resp.result, Some(json!("admin_result")));
+    }
+
+    // -- rpcwhitelist tests ------------------------------------------------
+
+    #[test]
+    fn test_user_allowed_no_whitelist() {
+        let reg = RpcRegistry::new();
+        assert!(reg.user_allowed("anyone", "anything"));
+    }
+
+    #[test]
+    fn test_user_allowed_user_not_in_whitelist() {
+        let mut reg = RpcRegistry::new();
+        let mut wl = HashMap::new();
+        wl.insert(
+            "restricted_user".to_string(),
+            HashSet::from(["getblockcount".to_string()]),
+        );
+        reg.rpcwhitelist = Some(wl);
+        // User "other" is not in the whitelist → unrestricted.
+        assert!(reg.user_allowed("other", "stop"));
+    }
+
+    #[test]
+    fn test_user_allowed_method_in_whitelist() {
+        let mut reg = RpcRegistry::new();
+        let mut wl = HashMap::new();
+        wl.insert(
+            "viewer".to_string(),
+            HashSet::from(["getblockcount".to_string(), "help".to_string()]),
+        );
+        reg.rpcwhitelist = Some(wl);
+        assert!(reg.user_allowed("viewer", "getblockcount"));
+        assert!(reg.user_allowed("viewer", "help"));
+    }
+
+    #[test]
+    fn test_user_allowed_method_not_in_whitelist() {
+        let mut reg = RpcRegistry::new();
+        let mut wl = HashMap::new();
+        wl.insert(
+            "viewer".to_string(),
+            HashSet::from(["getblockcount".to_string()]),
+        );
+        reg.rpcwhitelist = Some(wl);
+        assert!(!reg.user_allowed("viewer", "stop"));
+        assert!(!reg.user_allowed("viewer", "indexerpause"));
+    }
+
+    // -- parse_rpc_request tests -------------------------------------------
+
+    #[test]
+    fn test_parse_rpc_request_valid() {
+        let raw = r#"{"method":"ping","id":1}"#;
+        let req = parse_rpc_request(raw).unwrap();
+        assert_eq!(req.method, "ping");
+        assert_eq!(req.id, json!(1));
+    }
+
+    #[test]
+    fn test_parse_rpc_request_invalid_json() {
+        let result = parse_rpc_request("not json");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_rpc_request_empty_method() {
+        let result = parse_rpc_request(r#"{"method":"","id":1}"#);
+        assert!(result.is_err());
+    }
 }

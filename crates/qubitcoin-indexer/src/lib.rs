@@ -973,4 +973,137 @@ mod tests {
         mgr.on_block_connected(1, b"block1");
         assert_eq!(mgr.indexer_height("orphan"), Some(0));
     }
+
+    // -- Lifecycle tests: pause, resume, rollback, load, unload, status ----
+
+    #[test]
+    fn test_pause_sets_flag_and_returns_info() {
+        let (mgr, _dir) = setup_indexer_manager(IndexerMode::Synchronous);
+        mgr.on_block_connected(1, b"block1");
+
+        let info = mgr.pause("test").unwrap();
+        assert_eq!(info.label, "test");
+        assert_eq!(info.tip_height, 1);
+        assert!(!info.db_path.as_os_str().is_empty());
+
+        // Verify the paused flag is set.
+        let inst = mgr.get_indexer("test").unwrap();
+        assert!(inst.paused.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_pause_nonexistent_returns_error() {
+        let (mgr, _dir) = setup_indexer_manager(IndexerMode::Synchronous);
+        assert!(mgr.pause("nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_resume_clears_flag() {
+        let (mgr, _dir) = setup_indexer_manager(IndexerMode::Synchronous);
+        mgr.pause("test").unwrap();
+        mgr.resume("test").unwrap();
+
+        let inst = mgr.get_indexer("test").unwrap();
+        assert!(!inst.paused.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_paused_indexer_skips_blocks() {
+        let (mgr, _dir) = setup_indexer_manager(IndexerMode::Synchronous);
+        mgr.on_block_connected(1, b"block1");
+        assert_eq!(mgr.indexer_height("test"), Some(1));
+
+        mgr.pause("test").unwrap();
+        mgr.on_block_connected(2, b"block2");
+        // Should still be at height 1 (paused, block 2 skipped).
+        assert_eq!(mgr.indexer_height("test"), Some(1));
+
+        mgr.resume("test").unwrap();
+        mgr.on_block_connected(3, b"block3");
+        // Should advance to 3 after resume.
+        assert_eq!(mgr.indexer_height("test"), Some(3));
+    }
+
+    #[test]
+    fn test_rollback_indexer_requires_paused() {
+        let (mgr, _dir) = setup_indexer_manager(IndexerMode::Synchronous);
+        mgr.on_block_connected(1, b"b1");
+        mgr.on_block_connected(2, b"b2");
+
+        // Should fail when not paused.
+        assert!(mgr.rollback_indexer("test", 1).is_err());
+
+        // Should succeed when paused.
+        mgr.pause("test").unwrap();
+        let _deleted = mgr.rollback_indexer("test", 0).unwrap();
+        // deleted may be 0 since test WASM produces no state, but height resets.
+        assert_eq!(mgr.indexer_height("test"), Some(0));
+    }
+
+    #[test]
+    fn test_load_new_indexer() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm_path = dir.path().join("test.wasm");
+        std::fs::write(&wasm_path, build_test_wasm()).unwrap();
+
+        let datadir = PathBuf::from(dir.path());
+        let mut mgr = IndexerManager::new(vec![], &datadir, IndexerMode::Synchronous).unwrap();
+        assert!(mgr.is_empty());
+
+        let cfg = make_config("dynamic", wasm_path.clone());
+        let hash = mgr.load("dynamic", &wasm_path, cfg).unwrap();
+        assert!(!hash.is_empty());
+        assert!(!mgr.is_empty());
+        assert!(mgr.get_indexer("dynamic").is_some());
+
+        // Loaded indexer should process blocks.
+        mgr.on_block_connected(1, b"block1");
+        assert_eq!(mgr.indexer_height("dynamic"), Some(1));
+    }
+
+    #[test]
+    fn test_unload_removes_indexer() {
+        let dir = tempfile::tempdir().unwrap();
+        let wasm_path = dir.path().join("test.wasm");
+        std::fs::write(&wasm_path, build_test_wasm()).unwrap();
+
+        let datadir = PathBuf::from(dir.path());
+        let mut mgr =
+            IndexerManager::new(vec![make_config("removeme", wasm_path)], &datadir, IndexerMode::Synchronous)
+                .unwrap();
+        assert!(mgr.get_indexer("removeme").is_some());
+
+        mgr.unload("removeme").unwrap();
+        assert!(mgr.get_indexer("removeme").is_none());
+        assert!(mgr.is_empty());
+    }
+
+    #[test]
+    fn test_unload_nonexistent_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = PathBuf::from(dir.path());
+        let mut mgr = IndexerManager::new(vec![], &datadir, IndexerMode::Synchronous).unwrap();
+        assert!(mgr.unload("ghost").is_err());
+    }
+
+    #[test]
+    fn test_status_returns_all_indexers() {
+        let (mgr, _dir) = setup_indexer_manager(IndexerMode::Synchronous);
+        mgr.on_block_connected(1, b"b1");
+
+        let statuses = mgr.status();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].label, "test");
+        assert_eq!(statuses[0].height, 1);
+        assert!(!statuses[0].paused);
+        assert!(!statuses[0].wasm_hash.is_empty());
+    }
+
+    #[test]
+    fn test_status_reflects_paused() {
+        let (mgr, _dir) = setup_indexer_manager(IndexerMode::Synchronous);
+        mgr.pause("test").unwrap();
+        let statuses = mgr.status();
+        assert!(statuses[0].paused);
+    }
 }

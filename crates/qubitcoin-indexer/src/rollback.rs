@@ -46,12 +46,11 @@ pub fn rollback_deferred(storage: &IndexerStorage, target_height: u32) -> Result
         .unwrap_or(reorg_h);
     batch.put(state::REORG_HEIGHT_KEY, &effective.to_le_bytes());
 
-    // Delete metadata for heights above target.
+    // Delete metadata for heights above target (but keep keysets for prune_orphaned).
     for h in (target_height + 1)..=current_tip {
-        // Delete canonical hash mapping.
+        // Delete canonical hash mapping (will be re-written on new chain).
         batch.delete(state::height_to_hash_key(h));
-        // Delete keyset.
-        batch.delete(state::height_keyset_key(h));
+        // NOTE: keysets are intentionally kept for prune_orphaned() to use.
         deleted += 1;
     }
 
@@ -128,6 +127,8 @@ pub fn prune_orphaned(storage: &IndexerStorage) -> Result<u32, String> {
                     }
                 }
             }
+            // Clean up the keyset after processing.
+            batch.delete(&keyset_key);
         }
     }
 
@@ -503,5 +504,85 @@ mod tests {
             storage.get_latest_canonical(b"counter"),
             Some(b"val_10".to_vec())
         );
+    }
+
+    // -- prune_orphaned tests ----------------------------------------------
+
+    #[test]
+    fn test_prune_orphaned_no_reorg_pending() {
+        let (storage, _dir) = temp_storage();
+        storage.append(b"key", b"val", 10).unwrap();
+        let pruned = prune_orphaned(&storage).unwrap();
+        assert_eq!(pruned, 0);
+    }
+
+    #[test]
+    fn test_prune_orphaned_clears_reorg_marker() {
+        let (storage, _dir) = temp_storage();
+
+        storage
+            .append_batch_with_hash(&[(b"k".to_vec(), b"v1".to_vec())], 10, Some(b"AAAAAAAA"))
+            .unwrap();
+        storage
+            .append_batch_with_hash(&[(b"k".to_vec(), b"v2".to_vec())], 20, Some(b"BBBBBBBB"))
+            .unwrap();
+
+        // Deferred rollback to 15.
+        rollback_deferred(&storage, 15).unwrap();
+        assert!(storage.reorg_height().is_some());
+
+        // Set canonical hash for height 20 to a DIFFERENT hash.
+        storage.set_canonical_hash(20, b"CCCCCCCC").unwrap();
+
+        // Prune should delete the non-canonical entry and clear the marker.
+        let pruned = prune_orphaned(&storage).unwrap();
+        assert!(pruned > 0);
+        assert!(storage.reorg_height().is_none());
+    }
+
+    #[test]
+    fn test_deferred_rollback_empty_db() {
+        let (storage, _dir) = temp_storage();
+        let deleted = rollback_deferred(&storage, 100).unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn test_full_workflow_deferred_rollback_reindex_prune() {
+        let (storage, _dir) = temp_storage();
+
+        // Index blocks 10, 20, 30.
+        storage
+            .append_batch_with_hash(&[(b"x".to_vec(), b"a".to_vec())], 10, Some(b"11111111"))
+            .unwrap();
+        storage
+            .append_batch_with_hash(&[(b"x".to_vec(), b"b".to_vec())], 20, Some(b"22222222"))
+            .unwrap();
+        storage
+            .append_batch_with_hash(&[(b"x".to_vec(), b"c".to_vec())], 30, Some(b"33333333"))
+            .unwrap();
+
+        assert_eq!(storage.get_length(b"x"), 3);
+
+        // Deferred rollback to 15 — data stays, marker set.
+        rollback_deferred(&storage, 15).unwrap();
+        assert_eq!(storage.reorg_height(), Some(16));
+        assert_eq!(storage.tip_height(), 15);
+        // Physical data still present.
+        assert_eq!(storage.get_length(b"x"), 3);
+
+        // Reorg-aware read should return "a" (entries at 20, 30 are orphaned).
+        // Set canonical hashes to different values so they fail validation.
+        storage.set_canonical_hash(20, b"ZZZZZZZZ").unwrap();
+        storage.set_canonical_hash(30, b"YYYYYYYY").unwrap();
+        assert_eq!(
+            storage.get_latest_canonical(b"x"),
+            Some(b"a".to_vec())
+        );
+
+        // Background prune cleans up.
+        let pruned = prune_orphaned(&storage).unwrap();
+        assert!(pruned >= 1);
+        assert!(storage.reorg_height().is_none());
     }
 }

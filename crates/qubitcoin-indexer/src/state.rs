@@ -206,4 +206,36 @@ mod tests {
         let decoded = decode_key_set(&[0, 0, 0]); // too short
         assert!(decoded.is_empty());
     }
+
+    #[test]
+    fn test_reorg_height_key_constant() {
+        assert_eq!(REORG_HEIGHT_KEY, b"__REORG_HEIGHT__");
+    }
+
+    #[test]
+    fn test_height_to_hash_prefix_constant() {
+        assert_eq!(HEIGHT_TO_HASH_PREFIX, b"__H2H__/");
+    }
+
+    #[test]
+    fn test_height_to_hash_key_format() {
+        let k = height_to_hash_key(42);
+        assert!(k.starts_with(b"__H2H__/"));
+        assert_eq!(&k[8..], &42u32.to_le_bytes());
+    }
+
+    #[test]
+    fn test_height_to_hash_key_different_heights() {
+        let k1 = height_to_hash_key(100);
+        let k2 = height_to_hash_key(200);
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn test_height_to_hash_key_no_collision_with_length_key() {
+        // height_to_hash starts with "__H2H__/", length key ends with u32::MAX.
+        let h = height_to_hash_key(0);
+        let l = length_key(b"somekey");
+        assert_ne!(h, l);
+    }
 }

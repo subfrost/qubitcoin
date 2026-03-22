@@ -544,4 +544,139 @@ mod tests {
         let (storage, _dir) = temp_storage();
         assert_eq!(storage.get_u32(b"missing"), None);
     }
+
+    // -- Reorg / canonical hash tests --------------------------------------
+
+    #[test]
+    fn test_append_batch_with_hash_stores_hash() {
+        let (storage, _dir) = temp_storage();
+        let hash8 = b"ABCDEFGH";
+        storage
+            .append_batch_with_hash(&[(b"key".to_vec(), b"val".to_vec())], 10, Some(hash8))
+            .unwrap();
+        // Canonical hash should be stored.
+        let stored = storage.get_canonical_hash(10).unwrap();
+        assert_eq!(&stored[..8], hash8);
+        // Height record should include the hash (12 bytes: 4 height + 8 hash).
+        let h_key = state::entry_height_key(b"key", 0);
+        let h_data = storage.get(&h_key).unwrap();
+        assert_eq!(h_data.len(), 12);
+        assert_eq!(&h_data[4..12], hash8);
+    }
+
+    #[test]
+    fn test_append_batch_with_hash_none_no_hash() {
+        let (storage, _dir) = temp_storage();
+        storage
+            .append_batch_with_hash(&[(b"key".to_vec(), b"val".to_vec())], 10, None)
+            .unwrap();
+        // No canonical hash stored.
+        assert!(storage.get_canonical_hash(10).is_none());
+        // Height record should be 4 bytes only.
+        let h_key = state::entry_height_key(b"key", 0);
+        let h_data = storage.get(&h_key).unwrap();
+        assert_eq!(h_data.len(), 4);
+    }
+
+    #[test]
+    fn test_set_get_canonical_hash() {
+        let (storage, _dir) = temp_storage();
+        storage.set_canonical_hash(100, b"12345678").unwrap();
+        let hash = storage.get_canonical_hash(100).unwrap();
+        assert_eq!(&hash, b"12345678");
+    }
+
+    #[test]
+    fn test_get_canonical_hash_missing() {
+        let (storage, _dir) = temp_storage();
+        assert!(storage.get_canonical_hash(999).is_none());
+    }
+
+    #[test]
+    fn test_set_reorg_height_initial() {
+        let (storage, _dir) = temp_storage();
+        assert!(storage.reorg_height().is_none());
+        storage.set_reorg_height(50).unwrap();
+        assert_eq!(storage.reorg_height(), Some(50));
+    }
+
+    #[test]
+    fn test_set_reorg_height_uses_min() {
+        let (storage, _dir) = temp_storage();
+        storage.set_reorg_height(100).unwrap();
+        assert_eq!(storage.reorg_height(), Some(100));
+        // Setting a higher value should keep the existing min.
+        storage.set_reorg_height(200).unwrap();
+        assert_eq!(storage.reorg_height(), Some(100));
+        // Setting a lower value should update.
+        storage.set_reorg_height(50).unwrap();
+        assert_eq!(storage.reorg_height(), Some(50));
+    }
+
+    #[test]
+    fn test_clear_reorg_height() {
+        let (storage, _dir) = temp_storage();
+        storage.set_reorg_height(100).unwrap();
+        assert!(storage.reorg_height().is_some());
+        storage.clear_reorg_height().unwrap();
+        assert!(storage.reorg_height().is_none());
+    }
+
+    #[test]
+    fn test_get_latest_canonical_fast_path() {
+        let (storage, _dir) = temp_storage();
+        // No reorg — fast path returns latest.
+        storage.append(b"key", b"val1", 10).unwrap();
+        storage.append(b"key", b"val2", 20).unwrap();
+        assert_eq!(
+            storage.get_latest_canonical(b"key"),
+            Some(b"val2".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_get_latest_canonical_filters_orphaned() {
+        let (storage, _dir) = temp_storage();
+        let hash_a = b"AAAAAAAA";
+        let hash_b = b"BBBBBBBB";
+
+        // Block 10 with hash A.
+        storage
+            .append_batch_with_hash(&[(b"k".to_vec(), b"v10".to_vec())], 10, Some(hash_a))
+            .unwrap();
+        // Block 20 with hash B.
+        storage
+            .append_batch_with_hash(&[(b"k".to_vec(), b"v20".to_vec())], 20, Some(hash_b))
+            .unwrap();
+
+        // Set reorg at height 16.
+        storage.set_reorg_height(16).unwrap();
+        // Set canonical hash for height 20 to something different.
+        storage.set_canonical_hash(20, b"CCCCCCCC").unwrap();
+
+        // Should skip v20 (non-canonical) and return v10.
+        assert_eq!(
+            storage.get_latest_canonical(b"k"),
+            Some(b"v10".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_get_latest_canonical_old_format_always_canonical() {
+        let (storage, _dir) = temp_storage();
+        // Use plain append (no hash in height record — old format).
+        storage.append(b"key", b"old_val", 10).unwrap();
+        storage.set_reorg_height(5).unwrap();
+        // Old format entries are always treated as canonical.
+        assert_eq!(
+            storage.get_latest_canonical(b"key"),
+            Some(b"old_val".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_get_latest_canonical_empty_key() {
+        let (storage, _dir) = temp_storage();
+        assert!(storage.get_latest_canonical(b"empty").is_none());
+    }
 }
