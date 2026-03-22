@@ -227,6 +227,450 @@ where
 }
 
 /// Simple hex decoder.
+/// Register admin RPC methods for indexer lifecycle management.
+///
+/// All methods require authentication (Admin tier).
+pub fn register_indexer_admin_rpcs<F>(register: &mut F, manager: Arc<parking_lot::RwLock<IndexerManager>>)
+where
+    F: FnMut(&str, Box<dyn Fn(&serde_json::Value) -> serde_json::Value + Send + Sync>),
+{
+    // indexerpause [label]
+    {
+        let mgr = manager.clone();
+        register(
+            "indexerpause",
+            Box::new(move |params: &serde_json::Value| {
+                let label = match params.get(0).and_then(|v| v.as_str()) {
+                    Some(l) => l,
+                    None => return serde_json::json!({"error": "missing label parameter"}),
+                };
+                let mgr = mgr.read();
+                match mgr.pause(label) {
+                    Ok(info) => serde_json::json!({
+                        "label": info.label,
+                        "db_path": info.db_path.display().to_string(),
+                        "tip_height": info.tip_height,
+                    }),
+                    Err(e) => serde_json::json!({"error": e}),
+                }
+            }),
+        );
+    }
+
+    // indexerresume [label]
+    {
+        let mgr = manager.clone();
+        register(
+            "indexerresume",
+            Box::new(move |params: &serde_json::Value| {
+                let label = match params.get(0).and_then(|v| v.as_str()) {
+                    Some(l) => l,
+                    None => return serde_json::json!({"error": "missing label parameter"}),
+                };
+                let mgr = mgr.read();
+                match mgr.resume(label) {
+                    Ok(()) => serde_json::json!({"label": label, "resumed": true}),
+                    Err(e) => serde_json::json!({"error": e}),
+                }
+            }),
+        );
+    }
+
+    // indexerrollback [label, height]
+    {
+        let mgr = manager.clone();
+        register(
+            "indexerrollback",
+            Box::new(move |params: &serde_json::Value| {
+                let label = match params.get(0).and_then(|v| v.as_str()) {
+                    Some(l) => l,
+                    None => return serde_json::json!({"error": "missing label parameter"}),
+                };
+                let height = match params.get(1).and_then(|v| v.as_u64()) {
+                    Some(h) => h as u32,
+                    None => return serde_json::json!({"error": "missing height parameter"}),
+                };
+                let mgr = mgr.read();
+                match mgr.rollback_indexer(label, height) {
+                    Ok(deleted) => serde_json::json!({
+                        "label": label,
+                        "new_height": height,
+                        "deleted_entries": deleted,
+                    }),
+                    Err(e) => serde_json::json!({"error": e}),
+                }
+            }),
+        );
+    }
+
+    // indexerload [label, wasm_path, {options}]
+    {
+        let mgr = manager.clone();
+        register(
+            "indexerload",
+            Box::new(move |params: &serde_json::Value| {
+                let label = match params.get(0).and_then(|v| v.as_str()) {
+                    Some(l) => l,
+                    None => return serde_json::json!({"error": "missing label parameter"}),
+                };
+                let wasm_path = match params.get(1).and_then(|v| v.as_str()) {
+                    Some(p) => p,
+                    None => return serde_json::json!({"error": "missing wasm_path parameter"}),
+                };
+                let opts = params.get(2);
+                let cfg = crate::config::IndexerConfig {
+                    label: label.to_string(),
+                    wasm_path: std::path::PathBuf::from(wasm_path),
+                    smt_enabled: opts
+                        .and_then(|o| o.get("smt"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    start_height: opts
+                        .and_then(|o| o.get("start_height"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32,
+                    layer: match opts
+                        .and_then(|o| o.get("layer"))
+                        .and_then(|v| v.as_str())
+                    {
+                        Some("tertiary") => crate::config::IndexerLayer::Tertiary,
+                        _ => crate::config::IndexerLayer::Secondary,
+                    },
+                    depends_on: opts
+                        .and_then(|o| o.get("depends_on"))
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                };
+                let mut mgr = mgr.write();
+                match mgr.load(label, std::path::Path::new(wasm_path), cfg) {
+                    Ok(hash) => serde_json::json!({"label": label, "wasm_hash": hash, "loaded": true}),
+                    Err(e) => serde_json::json!({"error": e}),
+                }
+            }),
+        );
+    }
+
+    // indexerunload [label]
+    {
+        let mgr = manager.clone();
+        register(
+            "indexerunload",
+            Box::new(move |params: &serde_json::Value| {
+                let label = match params.get(0).and_then(|v| v.as_str()) {
+                    Some(l) => l,
+                    None => return serde_json::json!({"error": "missing label parameter"}),
+                };
+                let mut mgr = mgr.write();
+                match mgr.unload(label) {
+                    Ok(()) => serde_json::json!({"label": label, "unloaded": true}),
+                    Err(e) => serde_json::json!({"error": e}),
+                }
+            }),
+        );
+    }
+
+    // indexerstatus []
+    {
+        let mgr = manager.clone();
+        register(
+            "indexerstatus",
+            Box::new(move |_params: &serde_json::Value| {
+                let mgr = mgr.read();
+                let statuses: Vec<serde_json::Value> = mgr
+                    .status()
+                    .into_iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "label": s.label,
+                            "height": s.height,
+                            "paused": s.paused,
+                            "wasm_hash": s.wasm_hash,
+                            "layer": format!("{:?}", s.layer),
+                            "db_path": s.db_path.display().to_string(),
+                            "smt_enabled": s.smt_enabled,
+                            "start_height": s.start_height,
+                            "depends_on": s.depends_on,
+                        })
+                    })
+                    .collect();
+                serde_json::json!(statuses)
+            }),
+        );
+    }
+}
+
+/// Register KV access RPC methods for secondary/tertiary indexers.
+///
+/// Read methods are Public, write methods require Admin + paused state.
+pub fn register_indexer_kv_rpcs<F>(register: &mut F, manager: Arc<IndexerManager>)
+where
+    F: FnMut(&str, Box<dyn Fn(&serde_json::Value) -> serde_json::Value + Send + Sync>),
+{
+    // secondarykvget [label, hex_key] — raw KV read
+    {
+        let mgr = manager.clone();
+        register(
+            "secondarykvget",
+            Box::new(move |params: &serde_json::Value| {
+                let label = match params.get(0).and_then(|v| v.as_str()) {
+                    Some(l) => l,
+                    None => return serde_json::json!(null),
+                };
+                let hex_key = match params.get(1).and_then(|v| v.as_str()) {
+                    Some(k) => k,
+                    None => return serde_json::json!(null),
+                };
+                let key = match hex_decode(hex_key) {
+                    Ok(k) => k,
+                    Err(e) => return serde_json::json!({"error": e}),
+                };
+                match mgr.get_indexer(label) {
+                    Some(inst) => match inst.storage.get(&key) {
+                        Some(val) => serde_json::json!(hex_encode(&val)),
+                        None => serde_json::json!(null),
+                    },
+                    None => serde_json::json!({"error": format!("indexer '{}' not found", label)}),
+                }
+            }),
+        );
+    }
+
+    // secondarykvgetlatest [label, hex_key] — reorg-aware latest read
+    {
+        let mgr = manager.clone();
+        register(
+            "secondarykvgetlatest",
+            Box::new(move |params: &serde_json::Value| {
+                let label = match params.get(0).and_then(|v| v.as_str()) {
+                    Some(l) => l,
+                    None => return serde_json::json!(null),
+                };
+                let hex_key = match params.get(1).and_then(|v| v.as_str()) {
+                    Some(k) => k,
+                    None => return serde_json::json!(null),
+                };
+                let key = match hex_decode(hex_key) {
+                    Ok(k) => k,
+                    Err(e) => return serde_json::json!({"error": e}),
+                };
+                match mgr.get_indexer(label) {
+                    Some(inst) => match inst.storage.get_latest_canonical(&key) {
+                        Some(val) => serde_json::json!(hex_encode(&val)),
+                        None => serde_json::json!(null),
+                    },
+                    None => serde_json::json!({"error": format!("indexer '{}' not found", label)}),
+                }
+            }),
+        );
+    }
+
+    // secondarykvlen [label, hex_key] — length of append list
+    {
+        let mgr = manager.clone();
+        register(
+            "secondarykvlen",
+            Box::new(move |params: &serde_json::Value| {
+                let label = match params.get(0).and_then(|v| v.as_str()) {
+                    Some(l) => l,
+                    None => return serde_json::json!(null),
+                };
+                let hex_key = match params.get(1).and_then(|v| v.as_str()) {
+                    Some(k) => k,
+                    None => return serde_json::json!(null),
+                };
+                let key = match hex_decode(hex_key) {
+                    Ok(k) => k,
+                    Err(e) => return serde_json::json!({"error": e}),
+                };
+                match mgr.get_indexer(label) {
+                    Some(inst) => serde_json::json!(inst.storage.get_length(&key)),
+                    None => serde_json::json!({"error": format!("indexer '{}' not found", label)}),
+                }
+            }),
+        );
+    }
+
+    // Tertiary aliases (same implementation, semantic distinction)
+    for method_name in &["tertiarykvget", "tertiarykvgetlatest", "tertiarykvlen"] {
+        let mgr = manager.clone();
+        let is_latest = method_name.contains("latest");
+        let is_len = method_name.contains("len");
+        let name = method_name.to_string();
+        register(
+            &name,
+            Box::new(move |params: &serde_json::Value| {
+                let label = match params.get(0).and_then(|v| v.as_str()) {
+                    Some(l) => l,
+                    None => return serde_json::json!(null),
+                };
+                let hex_key = match params.get(1).and_then(|v| v.as_str()) {
+                    Some(k) => k,
+                    None => return serde_json::json!(null),
+                };
+                let key = match hex_decode(hex_key) {
+                    Ok(k) => k,
+                    Err(e) => return serde_json::json!({"error": e}),
+                };
+                match mgr.get_indexer(label) {
+                    Some(inst) => {
+                        if is_len {
+                            serde_json::json!(inst.storage.get_length(&key))
+                        } else if is_latest {
+                            match inst.storage.get_latest_canonical(&key) {
+                                Some(val) => serde_json::json!(hex_encode(&val)),
+                                None => serde_json::json!(null),
+                            }
+                        } else {
+                            match inst.storage.get(&key) {
+                                Some(val) => serde_json::json!(hex_encode(&val)),
+                                None => serde_json::json!(null),
+                            }
+                        }
+                    }
+                    None => serde_json::json!({"error": format!("indexer '{}' not found", label)}),
+                }
+            }),
+        );
+    }
+}
+
+/// Register admin KV write RPC methods (require auth + paused indexer).
+pub fn register_indexer_kv_write_rpcs<F>(register: &mut F, manager: Arc<IndexerManager>)
+where
+    F: FnMut(&str, Box<dyn Fn(&serde_json::Value) -> serde_json::Value + Send + Sync>),
+{
+    // secondarykvput [label, hex_key, hex_value]
+    for prefix in &["secondary", "tertiary"] {
+        let mgr = manager.clone();
+        let method = format!("{}kvput", prefix);
+        register(
+            &method,
+            Box::new(move |params: &serde_json::Value| {
+                let label = match params.get(0).and_then(|v| v.as_str()) {
+                    Some(l) => l,
+                    None => return serde_json::json!({"error": "missing label"}),
+                };
+                let hex_key = match params.get(1).and_then(|v| v.as_str()) {
+                    Some(k) => k,
+                    None => return serde_json::json!({"error": "missing hex_key"}),
+                };
+                let hex_val = match params.get(2).and_then(|v| v.as_str()) {
+                    Some(v) => v,
+                    None => return serde_json::json!({"error": "missing hex_value"}),
+                };
+                let key = match hex_decode(hex_key) {
+                    Ok(k) => k,
+                    Err(e) => return serde_json::json!({"error": e}),
+                };
+                let val = match hex_decode(hex_val) {
+                    Ok(v) => v,
+                    Err(e) => return serde_json::json!({"error": e}),
+                };
+                match mgr.get_indexer(label) {
+                    Some(inst) => {
+                        if !inst.paused.load(std::sync::atomic::Ordering::Relaxed) {
+                            return serde_json::json!({"error": "indexer must be paused for KV writes"});
+                        }
+                        match inst.storage.put(&key, &val) {
+                            Ok(()) => serde_json::json!({"ok": true}),
+                            Err(e) => serde_json::json!({"error": e}),
+                        }
+                    }
+                    None => serde_json::json!({"error": format!("indexer '{}' not found", label)}),
+                }
+            }),
+        );
+
+        let mgr2 = manager.clone();
+        let del_method = format!("{}kvdelete", prefix);
+        register(
+            &del_method,
+            Box::new(move |params: &serde_json::Value| {
+                let label = match params.get(0).and_then(|v| v.as_str()) {
+                    Some(l) => l,
+                    None => return serde_json::json!({"error": "missing label"}),
+                };
+                let hex_key = match params.get(1).and_then(|v| v.as_str()) {
+                    Some(k) => k,
+                    None => return serde_json::json!({"error": "missing hex_key"}),
+                };
+                let key = match hex_decode(hex_key) {
+                    Ok(k) => k,
+                    Err(e) => return serde_json::json!({"error": e}),
+                };
+                match mgr2.get_indexer(label) {
+                    Some(inst) => {
+                        if !inst.paused.load(std::sync::atomic::Ordering::Relaxed) {
+                            return serde_json::json!({"error": "indexer must be paused for KV deletes"});
+                        }
+                        match inst.storage.delete_batch(&[key]) {
+                            Ok(()) => serde_json::json!({"ok": true}),
+                            Err(e) => serde_json::json!({"error": e}),
+                        }
+                    }
+                    None => serde_json::json!({"error": format!("indexer '{}' not found", label)}),
+                }
+            }),
+        );
+
+        let mgr3 = manager.clone();
+        let append_method = format!("{}kvappend", prefix);
+        register(
+            &append_method,
+            Box::new(move |params: &serde_json::Value| {
+                let label = match params.get(0).and_then(|v| v.as_str()) {
+                    Some(l) => l,
+                    None => return serde_json::json!({"error": "missing label"}),
+                };
+                let hex_key = match params.get(1).and_then(|v| v.as_str()) {
+                    Some(k) => k,
+                    None => return serde_json::json!({"error": "missing hex_key"}),
+                };
+                let hex_val = match params.get(2).and_then(|v| v.as_str()) {
+                    Some(v) => v,
+                    None => return serde_json::json!({"error": "missing hex_value"}),
+                };
+                let height = match params.get(3).and_then(|v| v.as_u64()) {
+                    Some(h) => h as u32,
+                    None => return serde_json::json!({"error": "missing height"}),
+                };
+                let key = match hex_decode(hex_key) {
+                    Ok(k) => k,
+                    Err(e) => return serde_json::json!({"error": e}),
+                };
+                let val = match hex_decode(hex_val) {
+                    Ok(v) => v,
+                    Err(e) => return serde_json::json!({"error": e}),
+                };
+                match mgr3.get_indexer(label) {
+                    Some(inst) => {
+                        if !inst.paused.load(std::sync::atomic::Ordering::Relaxed) {
+                            return serde_json::json!({"error": "indexer must be paused for KV appends"});
+                        }
+                        match inst.storage.append(&key, &val, height) {
+                            Ok(()) => {
+                                let new_len = inst.storage.get_length(&key);
+                                serde_json::json!({"ok": true, "new_length": new_len})
+                            }
+                            Err(e) => serde_json::json!({"error": e}),
+                        }
+                    }
+                    None => serde_json::json!({"error": format!("indexer '{}' not found", label)}),
+                }
+            }),
+        );
+    }
+}
+
+fn hex_encode(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
     let hex = hex.strip_prefix("0x").unwrap_or(hex);
     if hex.is_empty() {

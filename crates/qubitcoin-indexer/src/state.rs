@@ -48,6 +48,22 @@ pub fn entry_height_key(key: &[u8], index: u32) -> Vec<u8> {
     k
 }
 
+/// Reorg marker: the height at or above which entries may be orphaned.
+/// When set, read operations validate entries against canonical block hashes.
+pub const REORG_HEIGHT_KEY: &[u8] = b"__REORG_HEIGHT__";
+
+/// Prefix for canonical block hash mapping: `"__H2H__/" ++ height_le32` → `hash[0..8]`.
+/// Used during deferred rollback to distinguish canonical vs orphaned entries.
+pub const HEIGHT_TO_HASH_PREFIX: &[u8] = b"__H2H__/";
+
+/// Build the key for canonical block hash at a height.
+pub fn height_to_hash_key(height: u32) -> Vec<u8> {
+    let mut k = Vec::with_capacity(HEIGHT_TO_HASH_PREFIX.len() + 4);
+    k.extend_from_slice(HEIGHT_TO_HASH_PREFIX);
+    k.extend_from_slice(&height.to_le_bytes());
+    k
+}
+
 /// Key for the set of logical keys modified at a given height.
 /// Format: `"__keyset__/" ++ height_le32`
 ///

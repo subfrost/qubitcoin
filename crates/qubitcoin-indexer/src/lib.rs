@@ -15,8 +15,8 @@ use config::IndexerConfig;
 use runtime::WasmIndexerRuntime;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use storage::IndexerStorage;
 
@@ -56,12 +56,37 @@ pub struct IndexerInstance {
     pub layer: config::IndexerLayer,
     /// Labels of indexers this one depends on (tertiary only).
     pub depends_on: Vec<String>,
+    /// Whether this indexer is paused (skipped by on_block_connected).
+    pub paused: AtomicBool,
+    /// Path to the RocksDB directory (for rsyncd exposure / admin).
+    pub db_path: PathBuf,
+}
+
+/// Info returned by `pause()`.
+pub struct PauseInfo {
+    pub label: String,
+    pub db_path: PathBuf,
+    pub tip_height: u32,
+}
+
+/// Info returned by `status()`.
+pub struct IndexerStatusInfo {
+    pub label: String,
+    pub height: u32,
+    pub paused: bool,
+    pub wasm_hash: String,
+    pub layer: config::IndexerLayer,
+    pub db_path: PathBuf,
+    pub smt_enabled: bool,
+    pub start_height: u32,
+    pub depends_on: Vec<String>,
 }
 
 /// Manages all loaded indexer instances.
 pub struct IndexerManager {
     indexers: HashMap<String, Arc<IndexerInstance>>,
     mode: IndexerMode,
+    datadir: PathBuf,
 }
 
 impl IndexerManager {
@@ -143,12 +168,18 @@ impl IndexerManager {
                 start_height: config.start_height,
                 layer: config.layer,
                 depends_on: config.depends_on.clone(),
+                paused: AtomicBool::new(false),
+                db_path: db_dir,
             });
 
             indexers.insert(config.label, instance);
         }
 
-        Ok(IndexerManager { indexers, mode })
+        Ok(IndexerManager {
+            indexers,
+            mode,
+            datadir: datadir.clone(),
+        })
     }
 
     /// Get a reference to a loaded indexer by label.
@@ -201,7 +232,9 @@ impl IndexerManager {
         let run_phase = |instances: &[&Arc<IndexerInstance>]| {
             rayon::scope(|s| {
                 for inst in instances {
-                    if height < inst.start_height {
+                    if height < inst.start_height
+                        || inst.paused.load(Ordering::Relaxed)
+                    {
                         continue;
                     }
                     let inst = Arc::clone(inst);
@@ -257,7 +290,9 @@ impl IndexerManager {
 
     /// Notify all indexers of a chain reorganization.
     ///
-    /// Each indexer rolls back its state to `rollback_height`.
+    /// Uses **deferred rollback**: sets a reorg marker and deletes only
+    /// metadata. The service stays live — reads filter orphaned entries.
+    /// Background pruning cleans up later.
     pub fn on_reorg(&self, rollback_height: u32) {
         for (label, inst) in &self.indexers {
             let current = inst.tip_height.load(Ordering::Relaxed);
@@ -266,28 +301,160 @@ impl IndexerManager {
                     indexer = %label,
                     from = current,
                     to = rollback_height,
-                    "rolling back indexer"
+                    "deferred rollback (service stays live)"
                 );
-                match rollback::rollback_to_height(&inst.storage, rollback_height) {
-                    Ok(deleted) => {
+                match rollback::rollback_deferred(&inst.storage, rollback_height) {
+                    Ok(metadata_deleted) => {
                         inst.tip_height.store(rollback_height, Ordering::Relaxed);
                         tracing::info!(
                             indexer = %label,
-                            deleted = deleted,
-                            "indexer rollback complete"
+                            metadata_deleted = metadata_deleted,
+                            "deferred rollback complete, background prune pending"
                         );
+                        // Spawn background prune task.
+                        let storage = inst.storage.clone();
+                        let label_owned = label.clone();
+                        std::thread::spawn(move || {
+                            match rollback::prune_orphaned(&storage) {
+                                Ok(pruned) => {
+                                    tracing::info!(
+                                        indexer = %label_owned,
+                                        pruned = pruned,
+                                        "background prune complete"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        indexer = %label_owned,
+                                        error = %e,
+                                        "background prune failed"
+                                    );
+                                }
+                            }
+                        });
                     }
                     Err(e) => {
                         tracing::error!(
                             indexer = %label,
                             error = %e,
-                            "indexer rollback failed"
+                            "deferred rollback failed"
                         );
                     }
                 }
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Admin lifecycle methods
+    // -----------------------------------------------------------------------
+
+    /// Pause an indexer. While paused, `on_block_connected` skips it.
+    /// Returns the DB path and tip height for admin operations (rsync, etc.).
+    pub fn pause(&self, label: &str) -> Result<PauseInfo, String> {
+        let inst = self
+            .get_indexer(label)
+            .ok_or_else(|| format!("indexer '{}' not found", label))?;
+        inst.paused.store(true, Ordering::Relaxed);
+        inst.storage.flush().ok(); // flush WAL for consistent state
+        Ok(PauseInfo {
+            label: label.to_string(),
+            db_path: inst.db_path.clone(),
+            tip_height: inst.tip_height.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Resume a paused indexer.
+    pub fn resume(&self, label: &str) -> Result<(), String> {
+        let inst = self
+            .get_indexer(label)
+            .ok_or_else(|| format!("indexer '{}' not found", label))?;
+        inst.paused.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Roll back a paused indexer to a specific height (immediate rollback).
+    pub fn rollback_indexer(&self, label: &str, height: u32) -> Result<u32, String> {
+        let inst = self
+            .get_indexer(label)
+            .ok_or_else(|| format!("indexer '{}' not found", label))?;
+        if !inst.paused.load(Ordering::Relaxed) {
+            return Err("indexer must be paused before rollback".to_string());
+        }
+        let deleted = rollback::rollback_to_height(&inst.storage, height)?;
+        inst.tip_height.store(height, Ordering::Relaxed);
+        Ok(deleted)
+    }
+
+    /// Hot-load a new WASM indexer module at runtime.
+    pub fn load(&mut self, label: &str, wasm_path: &Path, cfg: IndexerConfig) -> Result<String, String> {
+        let wasm_bytes = std::fs::read(wasm_path)
+            .map_err(|e| format!("failed to read WASM: {}", e))?;
+
+        let wasm_hash: [u8; 32] = Sha256::digest(&wasm_bytes).into();
+        let hash_hex: String = wasm_hash.iter().map(|b| format!("{:02x}", b)).collect();
+
+        let db_dir = self.datadir.join("indexers").join(label).join("db");
+        std::fs::create_dir_all(&db_dir)
+            .map_err(|e| format!("failed to create db dir: {}", e))?;
+
+        let storage = Arc::new(IndexerStorage::open(&db_dir)?);
+        storage.put(state::WASM_HASH_KEY, &wasm_hash)?;
+
+        let block_runtime = WasmIndexerRuntime::new(&wasm_bytes)?;
+        let view_runtime = WasmIndexerRuntime::new(&wasm_bytes)?;
+        let tip_height = storage.tip_height();
+
+        let instance = Arc::new(IndexerInstance {
+            label: label.to_string(),
+            block_runtime,
+            view_runtime,
+            storage,
+            wasm_hash,
+            tip_height: AtomicU32::new(tip_height),
+            smt_enabled: cfg.smt_enabled,
+            start_height: cfg.start_height,
+            layer: cfg.layer,
+            depends_on: cfg.depends_on.clone(),
+            paused: AtomicBool::new(false),
+            db_path: db_dir,
+        });
+
+        self.indexers.insert(label.to_string(), instance);
+        tracing::info!(label = label, hash = %hash_hex, "indexer hot-loaded");
+        Ok(hash_hex)
+    }
+
+    /// Unload an indexer.
+    pub fn unload(&mut self, label: &str) -> Result<(), String> {
+        if self.indexers.remove(label).is_none() {
+            return Err(format!("indexer '{}' not found", label));
+        }
+        tracing::info!(label = label, "indexer unloaded");
+        Ok(())
+    }
+
+    /// Get status info for all loaded indexers.
+    pub fn status(&self) -> Vec<IndexerStatusInfo> {
+        self.indexers
+            .values()
+            .map(|inst| IndexerStatusInfo {
+                label: inst.label.clone(),
+                height: inst.tip_height.load(Ordering::Relaxed),
+                paused: inst.paused.load(Ordering::Relaxed),
+                wasm_hash: inst.wasm_hash.iter().map(|b| format!("{:02x}", b)).collect(),
+                layer: inst.layer,
+                db_path: inst.db_path.clone(),
+                smt_enabled: inst.smt_enabled,
+                start_height: inst.start_height,
+                depends_on: inst.depends_on.clone(),
+            })
+            .collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // View methods
+    // -----------------------------------------------------------------------
 
     /// Call a view function on an indexer (async, with fuel-based yielding).
     ///

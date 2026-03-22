@@ -7,7 +7,7 @@
 //! registry for dispatching handlers, and request processing utilities.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
 // JSON-RPC types
@@ -165,15 +165,38 @@ impl RpcResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Auth tier
+// ---------------------------------------------------------------------------
+
+/// Authentication tier for RPC methods.
+///
+/// Determines whether a method requires HTTP Basic Auth credentials.
+/// Designed for reverse-proxy setups where Public methods are exposed
+/// to the world and Admin methods are restricted to operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthTier {
+    /// No authentication required. Safe for public reverse-proxy exposure.
+    Public,
+    /// Requires rpcuser/rpcpassword HTTP Basic Auth credentials.
+    Admin,
+}
+
+// ---------------------------------------------------------------------------
 // RPC handler type and registry
 // ---------------------------------------------------------------------------
 
 /// An RPC method handler: receives a request reference and returns a response.
 pub type RpcHandler = Box<dyn Fn(&RpcRequest) -> RpcResponse + Send + Sync>;
 
-/// Registry that maps method names to handler functions.
+/// Registry that maps method names to handler functions with auth tiers.
+///
+/// Supports optional per-user method whitelisting via `rpcwhitelist`,
+/// matching Bitcoin Core's `-rpcwhitelist=user:method1,method2` pattern.
 pub struct RpcRegistry {
-    methods: HashMap<String, RpcHandler>,
+    methods: HashMap<String, (AuthTier, RpcHandler)>,
+    /// Optional per-user method whitelist. If set for a user, only listed
+    /// methods are allowed. Users not in the map have no restrictions.
+    pub rpcwhitelist: Option<HashMap<String, HashSet<String>>>,
 }
 
 impl RpcRegistry {
@@ -181,17 +204,46 @@ impl RpcRegistry {
     pub fn new() -> Self {
         RpcRegistry {
             methods: HashMap::new(),
+            rpcwhitelist: None,
         }
     }
 
-    /// Register a handler for the given method name.
-    ///
-    /// If the method was already registered the previous handler is replaced.
+    /// Register a handler with an explicit auth tier.
+    pub fn register_with_tier<F>(&mut self, method: &str, tier: AuthTier, handler: F)
+    where
+        F: Fn(&RpcRequest) -> RpcResponse + Send + Sync + 'static,
+    {
+        self.methods
+            .insert(method.to_string(), (tier, Box::new(handler)));
+    }
+
+    /// Register a Public (no auth required) handler.
+    pub fn register_public<F>(&mut self, method: &str, handler: F)
+    where
+        F: Fn(&RpcRequest) -> RpcResponse + Send + Sync + 'static,
+    {
+        self.register_with_tier(method, AuthTier::Public, handler);
+    }
+
+    /// Register an Admin (auth required) handler.
+    pub fn register_admin<F>(&mut self, method: &str, handler: F)
+    where
+        F: Fn(&RpcRequest) -> RpcResponse + Send + Sync + 'static,
+    {
+        self.register_with_tier(method, AuthTier::Admin, handler);
+    }
+
+    /// Backwards-compatible register — defaults to Public tier.
     pub fn register<F>(&mut self, method: &str, handler: F)
     where
         F: Fn(&RpcRequest) -> RpcResponse + Send + Sync + 'static,
     {
-        self.methods.insert(method.to_string(), Box::new(handler));
+        self.register_public(method, handler);
+    }
+
+    /// Query the auth tier for a method. Returns `None` if unregistered.
+    pub fn auth_tier_for(&self, method: &str) -> Option<AuthTier> {
+        self.methods.get(method).map(|(tier, _)| *tier)
     }
 
     /// Dispatch a request to the appropriate handler.
@@ -199,18 +251,36 @@ impl RpcRegistry {
     /// Returns a `method not found` error if no handler is registered.
     pub fn dispatch(&self, request: &RpcRequest) -> RpcResponse {
         match self.methods.get(&request.method) {
-            Some(handler) => handler(request),
+            Some((_tier, handler)) => handler(request),
             None => {
-                // Debug: log the method name bytes to catch encoding issues
                 let method_bytes: Vec<u8> = request.method.bytes().collect();
-                eprintln!("[RPC dispatch] Method not found: {:?} (bytes: {:?}, registry has {} methods)",
-                    request.method, &method_bytes[..method_bytes.len().min(30)], self.methods.len());
+                eprintln!(
+                    "[RPC dispatch] Method not found: {:?} (bytes: {:?}, registry has {} methods)",
+                    request.method,
+                    &method_bytes[..method_bytes.len().min(30)],
+                    self.methods.len()
+                );
                 RpcResponse::error(
                     request.id.clone(),
                     RPC_METHOD_NOT_FOUND,
                     format!("Method not found: {}", request.method),
                 )
             }
+        }
+    }
+
+    /// Check if a user is allowed to call a method per `rpcwhitelist`.
+    ///
+    /// Returns `true` if no whitelist is configured, or if the user is not
+    /// in the whitelist map (unrestricted), or if the method is in their
+    /// allowed set.
+    pub fn user_allowed(&self, user: &str, method: &str) -> bool {
+        match &self.rpcwhitelist {
+            None => true,
+            Some(whitelist) => match whitelist.get(user) {
+                None => true, // user not in whitelist → unrestricted
+                Some(allowed) => allowed.contains(method),
+            },
         }
     }
 
@@ -245,7 +315,21 @@ impl Default for RpcRegistry {
 /// Parse a raw JSON string as an RPC request, dispatch it through the
 /// registry, and return the serialized JSON response string.
 pub fn process_request(registry: &RpcRegistry, raw: &str) -> String {
-    // Try to parse the raw JSON.
+    let request = match parse_rpc_request(raw) {
+        Ok(req) => req,
+        Err(resp_str) => return resp_str,
+    };
+    let response = registry.dispatch(&request);
+    serde_json::to_string(&response).unwrap_or_else(|_| {
+        r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error"},"id":null}"#
+            .to_string()
+    })
+}
+
+/// Parse and validate a raw JSON string into an `RpcRequest`.
+///
+/// Returns `Ok(request)` or `Err(serialized_error_response)`.
+pub fn parse_rpc_request(raw: &str) -> Result<RpcRequest, String> {
     let request: RpcRequest = match serde_json::from_str(raw) {
         Ok(req) => req,
         Err(e) => {
@@ -254,30 +338,27 @@ pub fn process_request(registry: &RpcRegistry, raw: &str) -> String {
                 RPC_PARSE_ERROR,
                 format!("Parse error: {}", e),
             );
-            return serde_json::to_string(&resp).unwrap_or_else(|_| {
+            return Err(serde_json::to_string(&resp).unwrap_or_else(|_| {
                 r#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error"},"id":null}"#
                     .to_string()
-            });
+            }));
         }
     };
 
-    // Validate the method field is not empty.
     if request.method.is_empty() {
         let resp = RpcResponse::error(
             request.id.clone(),
             RPC_INVALID_REQUEST,
             "Invalid request: method is empty".to_string(),
         );
-        return serde_json::to_string(&resp).unwrap_or_default();
+        return Err(serde_json::to_string(&resp).unwrap_or_default());
     }
 
-    // Dispatch and serialize.
-    let response = registry.dispatch(&request);
-    serde_json::to_string(&response).unwrap_or_else(|_| {
-        r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error"},"id":null}"#
-            .to_string()
-    })
+    Ok(request)
 }
+
+/// HTTP 403 Forbidden error code for RPC whitelist denials.
+pub const RPC_FORBIDDEN: i32 = -32604;
 
 // ---------------------------------------------------------------------------
 // Tests

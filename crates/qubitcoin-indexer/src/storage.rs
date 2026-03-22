@@ -129,12 +129,24 @@ impl IndexerStorage {
     /// Atomically append all key-value pairs from a block and record the
     /// per-height key set for efficient rollback.
     ///
-    /// This replaces the per-pair `append()` loop with a single WriteBatch
-    /// commit, reducing I/O by an order of magnitude on large blocks.
+    /// If `block_hash8` is provided (first 8 bytes of the block hash),
+    /// it is stored alongside the height in each entry's height record,
+    /// enabling deferred rollback canonicity checks.
     pub fn append_batch(
         &self,
         pairs: &[(Vec<u8>, Vec<u8>)],
         height: u32,
+    ) -> Result<(), String> {
+        self.append_batch_with_hash(pairs, height, None)
+    }
+
+    /// Like `append_batch` but also records a block hash prefix for
+    /// deferred rollback canonicity validation.
+    pub fn append_batch_with_hash(
+        &self,
+        pairs: &[(Vec<u8>, Vec<u8>)],
+        height: u32,
+        block_hash8: Option<&[u8]>,
     ) -> Result<(), String> {
         if pairs.is_empty() {
             return Ok(());
@@ -149,6 +161,17 @@ impl IndexerStorage {
         // Collect the set of logical keys modified at this height.
         let mut modified_keys: Vec<Vec<u8>> = Vec::with_capacity(pairs.len());
 
+        // Height record: height_le32 [++ blockhash8] for canonicity checks.
+        let height_record = match block_hash8 {
+            Some(hash) if hash.len() >= 8 => {
+                let mut rec = Vec::with_capacity(12);
+                rec.extend_from_slice(&height.to_le_bytes());
+                rec.extend_from_slice(&hash[..8]);
+                rec
+            }
+            _ => height.to_le_bytes().to_vec(),
+        };
+
         for (key, value) in pairs {
             let len_key = state::length_key(key);
             let current_len = length_cache
@@ -160,7 +183,7 @@ impl IndexerStorage {
             batch.put(&state::index_key(key, current_len), value);
             batch.put(
                 &state::entry_height_key(key, current_len),
-                &height.to_le_bytes(),
+                &height_record,
             );
 
             length_cache.insert(key.clone(), current_len + 1);
@@ -171,6 +194,13 @@ impl IndexerStorage {
         let keyset_key = state::height_keyset_key(height);
         let keyset_data = state::encode_key_set(&modified_keys);
         batch.put(&keyset_key, &keyset_data);
+
+        // Store canonical hash mapping for this height.
+        if let Some(hash) = block_hash8 {
+            if hash.len() >= 8 {
+                batch.put(&state::height_to_hash_key(height), &hash[..8]);
+            }
+        }
 
         // Update tip height in the same batch.
         batch.put(state::HEIGHT_KEY, &height.to_le_bytes());
@@ -228,6 +258,102 @@ impl IndexerStorage {
     /// Set the indexer tip height.
     pub fn set_tip_height(&self, height: u32) -> Result<(), String> {
         self.put(state::HEIGHT_KEY, &height.to_le_bytes())
+    }
+
+    // -----------------------------------------------------------------------
+    // Deferred rollback / reorg support
+    // -----------------------------------------------------------------------
+
+    /// Store the canonical block hash (first 8 bytes) for a height.
+    pub fn set_canonical_hash(&self, height: u32, hash8: &[u8]) -> Result<(), String> {
+        self.put(&state::height_to_hash_key(height), hash8)
+    }
+
+    /// Get the canonical block hash prefix for a height.
+    pub fn get_canonical_hash(&self, height: u32) -> Option<Vec<u8>> {
+        self.get(&state::height_to_hash_key(height))
+    }
+
+    /// Set the reorg height marker. Uses min(existing, new) to handle
+    /// cascading reorgs — the marker only moves backwards.
+    pub fn set_reorg_height(&self, height: u32) -> Result<(), String> {
+        let current = self.reorg_height();
+        let effective = match current {
+            Some(existing) => existing.min(height),
+            None => height,
+        };
+        self.put(state::REORG_HEIGHT_KEY, &effective.to_le_bytes())
+    }
+
+    /// Get the reorg height marker, or `None` if no reorg is pending.
+    pub fn reorg_height(&self) -> Option<u32> {
+        self.get_u32(state::REORG_HEIGHT_KEY)
+    }
+
+    /// Clear the reorg height marker (after background pruning completes).
+    pub fn clear_reorg_height(&self) -> Result<(), String> {
+        self.db
+            .delete(state::REORG_HEIGHT_KEY)
+            .map_err(|e| format!("indexer db delete reorg height: {}", e))
+    }
+
+    /// Reorg-aware read: get the latest canonical value for a key.
+    ///
+    /// If no reorg is pending (reorg_height is None), uses the fast path.
+    /// Otherwise, walks backward through entries validating each against
+    /// the canonical block hash for its height.
+    pub fn get_latest_canonical(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let reorg_h = self.reorg_height();
+        let len = self.get_length(key);
+        if len == 0 {
+            return None;
+        }
+
+        match reorg_h {
+            None => {
+                // Fast path: no reorg pending, latest entry is canonical.
+                self.get_at_index(key, len - 1)
+            }
+            Some(rh) => {
+                // Walk backward, skip entries at heights >= rh that aren't canonical.
+                for idx in (0..len).rev() {
+                    let h_key = state::entry_height_key(key, idx);
+                    if let Some(h_data) = self.get(&h_key) {
+                        if h_data.len() >= 4 {
+                            let entry_height = u32::from_le_bytes([
+                                h_data[0], h_data[1], h_data[2], h_data[3],
+                            ]);
+                            if entry_height < rh {
+                                // Below reorg boundary — always canonical.
+                                return self.get_at_index(key, idx);
+                            }
+                            // At or above reorg boundary — check canonical hash.
+                            // If we have a blockhash8 stored in the height data
+                            // (bytes 4..12), validate it.
+                            if h_data.len() >= 12 {
+                                let entry_hash8 = &h_data[4..12];
+                                if let Some(canonical) =
+                                    self.get_canonical_hash(entry_height)
+                                {
+                                    if canonical.len() >= 8
+                                        && &canonical[..8] == entry_hash8
+                                    {
+                                        return self.get_at_index(key, idx);
+                                    }
+                                    // Non-canonical: skip this entry.
+                                    continue;
+                                }
+                            }
+                            // No blockhash8 in height data (old format) — treat as canonical.
+                            return self.get_at_index(key, idx);
+                        }
+                    }
+                    // No height data — treat as canonical (legacy).
+                    return self.get_at_index(key, idx);
+                }
+                None
+            }
+        }
     }
 
     /// Delete a range of keys using a WriteBatch.

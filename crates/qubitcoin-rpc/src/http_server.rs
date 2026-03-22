@@ -7,7 +7,7 @@
 //! requests to the `RpcRegistry` for JSON-RPC processing.  Authentication
 //! via HTTP Basic Auth is supported when `rpc_user` / `rpc_password` are set.
 
-use crate::server::{process_request, RpcRegistry};
+use crate::server::{parse_rpc_request, process_request, AuthTier, RpcRegistry, RpcResponse};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -134,19 +134,6 @@ impl RpcServer {
                     }
                 };
 
-                // Check authentication if configured.
-                if auth_user.is_some() && auth_pass.is_some() {
-                    if !check_auth(
-                        &headers,
-                        auth_user.as_deref().unwrap(),
-                        auth_pass.as_deref().unwrap(),
-                    ) {
-                        let response = http_response(401, "Unauthorized");
-                        let _ = stream.write_all(response.as_bytes()).await;
-                        return;
-                    }
-                }
-
                 // Check method is POST.
                 if !headers.starts_with("POST") {
                     let response = http_response(405, "Method Not Allowed");
@@ -154,8 +141,53 @@ impl RpcServer {
                     return;
                 }
 
-                // Process JSON-RPC request.
-                let result = process_request(&registry, &body);
+                // Per-method auth: parse the JSON-RPC request to get the method
+                // name, then check if it requires authentication.
+                let auth_configured = auth_user.is_some() && auth_pass.is_some();
+                let result = match parse_rpc_request(&body) {
+                    Err(err_json) => err_json,
+                    Ok(request) => {
+                        let tier = registry
+                            .auth_tier_for(&request.method)
+                            .unwrap_or(AuthTier::Public);
+
+                        // Admin methods require auth.
+                        if tier == AuthTier::Admin && auth_configured {
+                            if !check_auth(
+                                &headers,
+                                auth_user.as_deref().unwrap(),
+                                auth_pass.as_deref().unwrap(),
+                            ) {
+                                let response = http_response(401, "Unauthorized");
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                return;
+                            }
+                        }
+
+                        // Optional per-user method whitelist.
+                        if auth_configured {
+                            if let Some(user) = extract_auth_user(&headers) {
+                                if !registry.user_allowed(&user, &request.method) {
+                                    let resp = RpcResponse::error(
+                                        request.id.clone(),
+                                        403,
+                                        format!("Method not allowed for user: {}", request.method),
+                                    );
+                                    serde_json::to_string(&resp).unwrap_or_default()
+                                } else {
+                                    let resp = registry.dispatch(&request);
+                                    serde_json::to_string(&resp).unwrap_or_default()
+                                }
+                            } else {
+                                let resp = registry.dispatch(&request);
+                                serde_json::to_string(&resp).unwrap_or_default()
+                            }
+                        } else {
+                            let resp = registry.dispatch(&request);
+                            serde_json::to_string(&resp).unwrap_or_default()
+                        }
+                    }
+                };
 
                 // Send HTTP response.
                 let response = format!(
@@ -198,6 +230,49 @@ fn check_auth(headers: &str, user: &str, pass: &str) -> bool {
         }
     }
     false
+}
+
+/// Extract the username from an HTTP Basic Auth header.
+///
+/// Decodes the Base64 `user:password` value and returns the user portion.
+fn extract_auth_user(headers: &str) -> Option<String> {
+    for line in headers.lines() {
+        let lower = line.to_lowercase();
+        if lower.starts_with("authorization: basic ") {
+            let b64 = line[21..].trim();
+            let decoded = base64_decode(b64)?;
+            return decoded.split(':').next().map(|s| s.to_string());
+        }
+    }
+    None
+}
+
+/// A minimal Base64 decoder.
+fn base64_decode(input: &str) -> Option<String> {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = Vec::new();
+    let bytes: Vec<u8> = input
+        .bytes()
+        .filter(|&b| b != b'=')
+        .map(|b| {
+            CHARS
+                .iter()
+                .position(|&c| c == b)
+                .unwrap_or(0) as u8
+        })
+        .collect();
+    for chunk in bytes.chunks(4) {
+        if chunk.len() >= 2 {
+            result.push((chunk[0] << 2) | (chunk[1] >> 4));
+        }
+        if chunk.len() >= 3 {
+            result.push((chunk[1] << 4) | (chunk[2] >> 2));
+        }
+        if chunk.len() >= 4 {
+            result.push((chunk[2] << 6) | chunk[3]);
+        }
+    }
+    String::from_utf8(result).ok()
 }
 
 /// A minimal Base64 encoder (no external dependency required).

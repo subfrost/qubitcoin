@@ -1,13 +1,146 @@
 //! Rollback logic for append-only indexer state.
 //!
-//! Uses per-height key sets (written by `append_batch`) for O(K) rollback
-//! where K is the number of keys modified above the target height.
-//! Falls back to a full DB scan for heights that lack key set data
-//! (e.g., blocks processed before the key set feature was added).
+//! Two rollback strategies:
+//!
+//! 1. **Deferred (zero-mutation):** Sets a reorg marker and deletes only
+//!    metadata. The service stays live — reads transparently filter orphaned
+//!    entries using canonical block hash validation. Background pruning
+//!    cleans up later. Takes <100ms.
+//!
+//! 2. **Immediate (keyset-based):** Uses per-height key sets to surgically
+//!    delete entries above the target height. Used for explicit admin
+//!    rollback when the indexer is paused.
+//!
+//! Falls back to a full DB scan for legacy data without key sets.
 
 use crate::state;
 use crate::storage::IndexerStorage;
 use std::collections::HashMap;
+
+// ---------------------------------------------------------------------------
+// Deferred rollback (zero-mutation, service stays live)
+// ---------------------------------------------------------------------------
+
+/// Deferred rollback: set a reorg marker and delete only metadata.
+///
+/// The service stays responsive — `get_latest_canonical()` transparently
+/// skips orphaned entries above the reorg marker. Background pruning
+/// (`prune_orphaned`) can clean up the stale data later.
+///
+/// Returns the number of metadata keys deleted (block hashes, state roots,
+/// keysets for heights above target).
+pub fn rollback_deferred(storage: &IndexerStorage, target_height: u32) -> Result<u32, String> {
+    let current_tip = storage.tip_height();
+    if current_tip <= target_height {
+        return Ok(0);
+    }
+
+    let mut batch = rocksdb::WriteBatch::default();
+    let mut deleted = 0u32;
+
+    // Set the reorg marker (uses min with existing for cascading reorgs).
+    let reorg_h = target_height + 1;
+    let effective = storage
+        .reorg_height()
+        .map(|existing| existing.min(reorg_h))
+        .unwrap_or(reorg_h);
+    batch.put(state::REORG_HEIGHT_KEY, &effective.to_le_bytes());
+
+    // Delete metadata for heights above target.
+    for h in (target_height + 1)..=current_tip {
+        // Delete canonical hash mapping.
+        batch.delete(state::height_to_hash_key(h));
+        // Delete keyset.
+        batch.delete(state::height_keyset_key(h));
+        deleted += 1;
+    }
+
+    // Reset tip height.
+    batch.put(state::HEIGHT_KEY, &target_height.to_le_bytes());
+
+    storage.write_raw_batch(batch)?;
+    Ok(deleted)
+}
+
+/// Background prune: delete orphaned entries above the reorg marker.
+///
+/// Walks keysets for heights >= reorg_height and deletes non-canonical
+/// entries. Clears the reorg marker when done.
+///
+/// Designed to be called from a spawned async task so the service
+/// continues serving during cleanup.
+pub fn prune_orphaned(storage: &IndexerStorage) -> Result<u32, String> {
+    let reorg_h = match storage.reorg_height() {
+        Some(h) => h,
+        None => return Ok(0), // no reorg pending
+    };
+
+    let tip = storage.tip_height();
+    let mut deleted = 0u32;
+    let mut batch = rocksdb::WriteBatch::default();
+    let mut length_cache: HashMap<Vec<u8>, u32> = HashMap::new();
+
+    // Walk from reorg_height upward to find orphaned entries.
+    // We scan keysets that may still be in the DB (they might have been
+    // deleted by rollback_deferred, or they might exist for heights that
+    // were re-indexed after the reorg).
+    for h in reorg_h..=tip.max(reorg_h + 10000) {
+        let keyset_key = state::height_keyset_key(h);
+        if let Some(keyset_data) = storage.get(&keyset_key) {
+            let keys = state::decode_key_set(&keyset_data);
+            for key in &keys {
+                // Check if this entry is canonical.
+                let current_len = length_cache
+                    .get(key)
+                    .copied()
+                    .unwrap_or_else(|| storage.get_length(key));
+                if current_len == 0 {
+                    continue;
+                }
+
+                let idx = current_len - 1;
+                let h_key = state::entry_height_key(key, idx);
+                if let Some(h_data) = storage.get(&h_key) {
+                    if h_data.len() >= 4 {
+                        let entry_height =
+                            u32::from_le_bytes([h_data[0], h_data[1], h_data[2], h_data[3]]);
+                        if entry_height >= reorg_h {
+                            // Check canonicity via blockhash8.
+                            let is_canonical = if h_data.len() >= 12 {
+                                let entry_hash8 = &h_data[4..12];
+                                storage
+                                    .get_canonical_hash(entry_height)
+                                    .map(|ch| ch.len() >= 8 && &ch[..8] == entry_hash8)
+                                    .unwrap_or(false)
+                            } else {
+                                true // old format, assume canonical
+                            };
+
+                            if !is_canonical {
+                                batch.delete(state::index_key(key, idx));
+                                batch.delete(&h_key);
+                                let len_key = state::length_key(key);
+                                batch.put(&len_key, &idx.to_le_bytes());
+                                length_cache.insert(key.clone(), idx);
+                                deleted += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Clear the reorg marker.
+    batch.delete(state::REORG_HEIGHT_KEY);
+
+    storage.write_raw_batch(batch)?;
+    Ok(deleted)
+}
+
+// ---------------------------------------------------------------------------
+// Immediate rollback (keyset-based, for admin operations)
+// ---------------------------------------------------------------------------
 
 /// Roll back `storage` so that no entries above `target_height` remain.
 ///
@@ -264,5 +397,111 @@ mod tests {
         let deleted = rollback_to_height(&storage, 100).unwrap();
         assert_eq!(deleted, 0);
         assert_eq!(storage.get_length(b"x"), 1);
+    }
+
+    // -- Deferred rollback tests -------------------------------------------
+
+    #[test]
+    fn test_deferred_rollback_sets_reorg_marker() {
+        let (storage, _dir) = temp_storage();
+
+        let hash8 = b"12345678";
+        storage
+            .append_batch_with_hash(
+                &[(b"key".to_vec(), b"v1".to_vec())],
+                10,
+                Some(hash8),
+            )
+            .unwrap();
+        storage
+            .append_batch_with_hash(
+                &[(b"key".to_vec(), b"v2".to_vec())],
+                20,
+                Some(b"abcdefgh"),
+            )
+            .unwrap();
+
+        // Deferred rollback to height 15.
+        let deleted = rollback_deferred(&storage, 15).unwrap();
+        assert!(deleted > 0);
+
+        // Reorg marker should be set.
+        assert_eq!(storage.reorg_height(), Some(16)); // target + 1
+
+        // Tip rolled back.
+        assert_eq!(storage.tip_height(), 15);
+
+        // Data is still physically present (not mutated).
+        assert_eq!(storage.get_length(b"key"), 2);
+    }
+
+    #[test]
+    fn test_deferred_rollback_cascading_uses_min() {
+        let (storage, _dir) = temp_storage();
+
+        storage
+            .append_batch(&[(b"k".to_vec(), b"v".to_vec())], 100)
+            .unwrap();
+
+        // First reorg to height 80.
+        rollback_deferred(&storage, 80).unwrap();
+        assert_eq!(storage.reorg_height(), Some(81));
+
+        // Second reorg to height 90 — should keep 81 (min).
+        storage.set_tip_height(100).unwrap(); // simulate re-indexing
+        rollback_deferred(&storage, 90).unwrap();
+        assert_eq!(storage.reorg_height(), Some(81)); // min(81, 91)
+
+        // Third reorg to height 70 — should update to 71.
+        storage.set_tip_height(100).unwrap();
+        rollback_deferred(&storage, 70).unwrap();
+        assert_eq!(storage.reorg_height(), Some(71)); // min(81, 71)
+    }
+
+    #[test]
+    fn test_reorg_aware_read_filters_orphaned() {
+        let (storage, _dir) = temp_storage();
+
+        let hash_a = b"AAAAAAAA";
+        let hash_b = b"BBBBBBBB";
+
+        // Block 10 with hash A.
+        storage
+            .append_batch_with_hash(
+                &[(b"counter".to_vec(), b"val_10".to_vec())],
+                10,
+                Some(hash_a),
+            )
+            .unwrap();
+
+        // Block 20 with hash B.
+        storage
+            .append_batch_with_hash(
+                &[(b"counter".to_vec(), b"val_20".to_vec())],
+                20,
+                Some(hash_b),
+            )
+            .unwrap();
+
+        // Without reorg, latest is val_20.
+        assert_eq!(
+            storage.get_latest_canonical(b"counter"),
+            Some(b"val_20".to_vec())
+        );
+
+        // Deferred rollback to 15: marks height >= 16 as suspect.
+        rollback_deferred(&storage, 15).unwrap();
+
+        // Now set canonical hash for height 20 to something DIFFERENT from hash_b.
+        // This simulates the new chain having a different block at height 20.
+        storage
+            .set_canonical_hash(20, b"CCCCCCCC")
+            .unwrap();
+
+        // Reorg-aware read should skip the orphaned val_20 and return val_10.
+        assert_eq!(
+            storage.get_latest_canonical(b"counter"),
+            Some(b"val_10".to_vec())
+        );
     }
 }
