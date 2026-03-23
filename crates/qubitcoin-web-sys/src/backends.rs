@@ -17,7 +17,8 @@ use serde_json::{Value, json};
 use qubitcoin_consensus::transaction::TransactionRef;
 use qubitcoin_indexer_web::runtime::WebIndexerRuntime;
 use qubitcoin_indexer_web::storage::WebIndexerStorage;
-use qubitcoin_indexer_core::traits::{IndexerStorageReader, IndexerStorageWriter};
+use qubitcoin_indexer_web::ExternalStorage;
+use qubitcoin_indexer_core::traits::{IndexerStorage, IndexerStorageReader, IndexerStorageWriter};
 use qubitcoin_tertiary_web::TertiaryRuntime;
 use qubitcoin_node::test_framework::TestChain;
 use qubitcoin_serialize::serialize;
@@ -105,18 +106,20 @@ fn address_to_script(address: &str) -> Option<Vec<u8>> {
 pub struct TertiaryIndexerInstance {
     pub label: String,
     pub runtime: TertiaryRuntime,
-    pub storage: WebIndexerStorage,
+    pub storage: Box<dyn IndexerStorage>,
 }
 
 /// Shared devnet state accessible by all backends via Rc<RefCell<...>>.
 pub struct DevnetState {
     pub chain: TestChain,
     pub alkanes_runtime: WebIndexerRuntime,
-    pub alkanes_storage: WebIndexerStorage,
+    pub alkanes_storage: Box<dyn IndexerStorage>,
     pub esplora_runtime: Option<WebIndexerRuntime>,
-    pub esplora_storage: Option<WebIndexerStorage>,
+    pub esplora_storage: Option<Box<dyn IndexerStorage>>,
     /// Tertiary indexers that run after secondary indexers.
     pub tertiary_indexers: Vec<TertiaryIndexerInstance>,
+    /// Whether to use external (JS-hosted) storage for new stores.
+    pub use_external_storage: bool,
 }
 
 impl DevnetState {
@@ -187,53 +190,15 @@ impl DevnetState {
         // Current tip height (before this block)
         let alkanes_height = self.alkanes_storage.tip_height();
 
-        // Index through alkanes
-        let keys_before = self.alkanes_storage.map().len();
-
-        let pairs = self.alkanes_runtime.run_block(alkanes_height, block_bytes.to_vec(), &self.alkanes_storage)
-            .map_err(|e| anyhow::anyhow!("alkanes index: {:?}", e))?;
-
-        let keys_after_run = self.alkanes_storage.map().len();
+        let pairs = self.alkanes_runtime.run_block(
+            alkanes_height, block_bytes.to_vec(), self.alkanes_storage.as_ref(),
+        ).map_err(|e| anyhow::anyhow!("alkanes index: {:?}", e))?;
 
         for (key, value) in &pairs {
-            // Use raw put instead of append — the WASM manages its own
-            // key layout (IndexPointer with /length, /N suffixes).
-            // The append-only wrapping with u32::MAX sentinels is WRONG
-            // for this use case — it double-wraps keys that are already
-            // structured by the WASM's IndexPointer.
             self.alkanes_storage.put(key, value)
                 .map_err(|e| anyhow::anyhow!("alkanes storage put: {}", e))?;
         }
 
-        let keys_after_append = self.alkanes_storage.map().len();
-
-        // CRITICAL CHECK: did run_block MODIFY the storage?
-        if keys_after_run != keys_before {
-            return Err(anyhow::anyhow!(
-                "BUG: run_block modified storage! height={} before={} after_run={} after_append={}",
-                alkanes_height, keys_before, keys_after_run, keys_after_append
-            ));
-        }
-
-        // Store a sentinel key that we can check later
-        if keys_after_append > keys_before {
-            let sentinel = format!("__test_sentinel_{}", alkanes_height);
-            self.alkanes_storage.put(sentinel.as_bytes(), &keys_after_append.to_le_bytes())
-                .map_err(|e| anyhow::anyhow!("sentinel put: {}", e))?;
-        }
-
-        // Check previous sentinel (did data survive from previous block?)
-        if alkanes_height > 1 {
-            let prev_sentinel = format!("__test_sentinel_{}", alkanes_height - 1);
-            let check = self.alkanes_storage.get(prev_sentinel.as_bytes());
-            if check.is_none() && alkanes_height < 5 {
-                // Only check first few blocks to avoid noise
-                return Err(anyhow::anyhow!(
-                    "BUG: sentinel from height {} not found at height {}! keys_before={}",
-                    alkanes_height - 1, alkanes_height, keys_before
-                ));
-            }
-        }
         self.alkanes_storage.set_tip_height(alkanes_height + 1)
             .map_err(|e| anyhow::anyhow!("alkanes set height: {}", e))?;
 
@@ -242,7 +207,7 @@ impl DevnetState {
             (&self.esplora_runtime, &mut self.esplora_storage)
         {
             let esplora_height = storage.tip_height();
-            let pairs = runtime.run_block(esplora_height, block_bytes.to_vec(), storage)
+            let pairs = runtime.run_block(esplora_height, block_bytes.to_vec(), storage.as_ref())
                 .map_err(|e| anyhow::anyhow!("esplora index: {:?}", e))?;
             for (key, value) in &pairs {
                 storage.append(key, value, esplora_height)
@@ -259,7 +224,7 @@ impl DevnetState {
                 let t_height = tertiary.storage.tip_height();
                 let pairs = tertiary.runtime.run_block(
                     t_height, block_bytes.to_vec(),
-                    &tertiary.storage, &secondary_storages,
+                    tertiary.storage.as_ref(), &secondary_storages,
                 ).map_err(|e| anyhow::anyhow!("tertiary '{}' index: {:?}", tertiary.label, e))?;
                 for (key, value) in &pairs {
                     tertiary.storage.put(key, value)
@@ -273,12 +238,21 @@ impl DevnetState {
         Ok(())
     }
 
+    /// Create a new storage instance based on the configured backend.
+    pub fn create_storage(&self) -> Box<dyn IndexerStorage> {
+        if self.use_external_storage {
+            Box::new(ExternalStorage::new())
+        } else {
+            Box::new(WebIndexerStorage::new())
+        }
+    }
+
     /// Build a map of secondary indexer name → storage pointer for tertiary access.
-    fn build_secondary_storage_map(&self) -> HashMap<String, *const WebIndexerStorage> {
-        let mut map = HashMap::new();
-        map.insert("alkanes".to_string(), &self.alkanes_storage as *const WebIndexerStorage);
+    fn build_secondary_storage_map(&self) -> HashMap<String, *const dyn IndexerStorageReader> {
+        let mut map: HashMap<String, *const dyn IndexerStorageReader> = HashMap::new();
+        map.insert("alkanes".to_string(), self.alkanes_storage.as_ref() as *const dyn IndexerStorageReader);
         if let Some(ref storage) = self.esplora_storage {
-            map.insert("esplora".to_string(), storage as *const WebIndexerStorage);
+            map.insert("esplora".to_string(), storage.as_ref() as *const dyn IndexerStorageReader);
         }
         map
     }
@@ -298,7 +272,7 @@ impl DevnetState {
         Some(
             tertiary.runtime.call_view(
                 fn_name, height, payload,
-                &tertiary.storage, &secondary_storages,
+                tertiary.storage.as_ref(), &secondary_storages,
             ).map_err(|e| anyhow::anyhow!("tertiary '{}' view '{}': {:?}", label, fn_name, e))
         )
     }
@@ -394,9 +368,31 @@ impl BitcoinBackend for DevnetBitcoinBackend {
                 let count = params.get(0)
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1) as u32;
-                // Address param is ignored — we always mine to the devnet key
+                let addr_str = params.get(1)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let mut state = self.state.borrow_mut();
-                let block_bytes_vec = state.mine_and_index(count)?;
+                // If an address is provided, mine with an extra coinbase output to that address
+                let block_bytes_vec = if !addr_str.is_empty() {
+                    if let Some(script) = address_to_script(addr_str) {
+                        let mut all_bytes = Vec::new();
+                        for _ in 0..count {
+                            // Build raw output: 8-byte LE value + 2-byte LE script_len + script
+                            let value: i64 = 5_000_000_000; // 50 BTC coinbase reward
+                            let mut raw = Vec::new();
+                            raw.extend_from_slice(&value.to_le_bytes());
+                            raw.extend_from_slice(&(script.len() as u16).to_le_bytes());
+                            raw.extend_from_slice(&script);
+                            let block_bytes = state.mine_with_coinbase_outputs_raw_and_index(&raw)?;
+                            all_bytes.push(block_bytes);
+                        }
+                        all_bytes
+                    } else {
+                        state.mine_and_index(count)?
+                    }
+                } else {
+                    state.mine_and_index(count)?
+                };
                 // Return array of block hashes
                 let hashes: Vec<Value> = block_bytes_vec.iter().map(|_bytes| {
                     // The chain already advanced, get recent hashes
@@ -532,7 +528,7 @@ impl MetashrewBackend for DevnetMetashrewBackend {
                     view_method,
                     height,
                     input_bytes.clone(),
-                    &state.alkanes_storage,
+                    state.alkanes_storage.as_ref(),
                 );
 
                 match result {
@@ -609,7 +605,7 @@ impl DevnetEsploraBackend {
                 "utxosbyscripthash",
                 esplora_height,
                 sh_hex.as_bytes().to_vec(),
-                storage,
+                storage.as_ref(),
             ) {
                 if let Ok(json_str) = String::from_utf8(result) {
                     if let Ok(parsed) = serde_json::from_str::<Value>(&json_str) {
@@ -744,7 +740,7 @@ impl EsploraBackend for DevnetEsploraBackend {
             (&state.esplora_runtime, &state.esplora_storage)
         {
             let esplora_height = storage.tip_height().saturating_sub(1);
-            if let Ok(result) = runtime.call_view("rest", esplora_height, path.as_bytes().to_vec(), storage) {
+            if let Ok(result) = runtime.call_view("rest", esplora_height, path.as_bytes().to_vec(), storage.as_ref()) {
                 if let Ok(json_str) = String::from_utf8(result) {
                     if let Ok(parsed) = serde_json::from_str::<Value>(&json_str) {
                         return Ok(parsed);

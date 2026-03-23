@@ -14,9 +14,10 @@ use alkanes_rpc_core::RpcDispatcher;
 use wasm_bindgen::prelude::*;
 
 use qubitcoin_common::keys::Key;
-use qubitcoin_indexer_core::traits::IndexerStorageReader;
+use qubitcoin_indexer_core::traits::{IndexerStorage, IndexerStorageReader};
 use qubitcoin_indexer_web::runtime::WebIndexerRuntime;
 use qubitcoin_indexer_web::storage::WebIndexerStorage;
+use qubitcoin_indexer_web::ExternalStorage;
 use qubitcoin_tertiary_web::TertiaryRuntime;
 use qubitcoin_node::test_framework::TestChain;
 
@@ -61,12 +62,22 @@ impl DevnetServer {
     /// * `alkanes_wasm` — compiled alkanes indexer WASM module bytes.
     /// * `esplora_wasm` — (optional) compiled esplora indexer WASM bytes.
     ///   Pass `undefined` or empty `Uint8Array` to skip.
+    /// Create a new devnet server.
+    ///
+    /// * `secret_key` — 32-byte key for the coinbase recipient.
+    /// * `alkanes_wasm` — compiled alkanes indexer WASM module bytes.
+    /// * `esplora_wasm` — (optional) compiled esplora indexer WASM bytes.
+    /// * `use_external_storage` — if true, use JS-hosted storage (IndexedDB/Map)
+    ///   instead of WASM-internal BTreeMap. Prevents OOM with many contracts.
     #[wasm_bindgen(constructor)]
     pub fn new(
         secret_key: &[u8],
         alkanes_wasm: &[u8],
         esplora_wasm: Option<js_sys::Uint8Array>,
+        use_external_storage: Option<bool>,
     ) -> Result<DevnetServer, JsValue> {
+        let external = use_external_storage.unwrap_or(false);
+
         if secret_key.len() != 32 {
             return Err(JsValue::from_str("secret_key must be exactly 32 bytes"));
         }
@@ -75,13 +86,21 @@ impl DevnetServer {
             .map_err(|e| JsValue::from_str(&format!("invalid secret key: {e}")))?;
 
         let alkanes_runtime = WebIndexerRuntime::new(alkanes_wasm)?;
-        let alkanes_storage = WebIndexerStorage::new();
+        let alkanes_storage: Box<dyn IndexerStorage> = if external {
+            Box::new(ExternalStorage::new())
+        } else {
+            Box::new(WebIndexerStorage::new())
+        };
 
         let (esplora_runtime, esplora_storage) = match esplora_wasm {
             Some(ref arr) if arr.length() > 0 => {
                 let bytes = arr.to_vec();
                 let runtime = WebIndexerRuntime::new(&bytes)?;
-                let storage = WebIndexerStorage::new();
+                let storage: Box<dyn IndexerStorage> = if external {
+                    Box::new(ExternalStorage::new())
+                } else {
+                    Box::new(WebIndexerStorage::new())
+                };
                 (Some(runtime), Some(storage))
             }
             _ => (None, None),
@@ -94,6 +113,7 @@ impl DevnetServer {
             esplora_runtime,
             esplora_storage,
             tertiary_indexers: Vec::new(),
+            use_external_storage: external,
         }));
 
         Ok(DevnetServer { state })
@@ -108,8 +128,9 @@ impl DevnetServer {
     #[wasm_bindgen(js_name = "addTertiary")]
     pub fn add_tertiary(&self, label: &str, wasm_bytes: &[u8]) -> Result<(), JsValue> {
         let runtime = TertiaryRuntime::new(wasm_bytes)?;
-        let storage = WebIndexerStorage::new();
-        self.state.borrow_mut().tertiary_indexers.push(
+        let mut state = self.state.borrow_mut();
+        let storage = state.create_storage();
+        state.tertiary_indexers.push(
             crate::backends::TertiaryIndexerInstance {
                 label: label.to_string(),
                 runtime,

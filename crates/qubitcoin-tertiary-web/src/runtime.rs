@@ -10,7 +10,6 @@
 
 use qubitcoin_indexer_core::proto::KeyValueFlush;
 use qubitcoin_indexer_core::traits::IndexerStorageReader;
-use qubitcoin_indexer_web::storage::WebIndexerStorage;
 
 use js_sys::{Function, Object, Reflect, Uint8Array, WebAssembly};
 use prost::Message;
@@ -47,8 +46,8 @@ impl TertiaryRuntime {
         &self,
         height: u32,
         block_data: Vec<u8>,
-        own_storage: &WebIndexerStorage,
-        secondary_storages: &HashMap<String, *const WebIndexerStorage>,
+        own_storage: &dyn IndexerStorageReader,
+        secondary_storages: &HashMap<String, *const dyn IndexerStorageReader>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, JsValue> {
         let mut input_data = Vec::with_capacity(4 + block_data.len());
         input_data.extend_from_slice(&height.to_le_bytes());
@@ -57,7 +56,13 @@ impl TertiaryRuntime {
         let state = Rc::new(RefCell::new(TertiaryHostState {
             input_data,
             pending_flush: None,
-            own_storage_ref: own_storage as *const WebIndexerStorage,
+            // SAFETY: own_storage outlives the TertiaryHostState — the caller (DevnetState)
+            // owns the storage and this function blocks until execution completes.
+            own_storage_ref: unsafe {
+                std::mem::transmute::<*const dyn IndexerStorageReader, *const dyn IndexerStorageReader>(
+                    own_storage as *const dyn IndexerStorageReader
+                )
+            },
             secondary_storages: secondary_storages.clone(),
             had_failure: false,
             completed: false,
@@ -67,18 +72,21 @@ impl TertiaryRuntime {
         let (import_object, _closures) = self.build_imports(&state)?;
         let instance = WebAssembly::Instance::new(&self.module, &import_object)?;
 
-        let exports = instance.exports();
-        let memory: WebAssembly::Memory =
-            Reflect::get(&exports, &"memory".into())?.dyn_into()?;
-        state.borrow_mut().memory = Some(memory);
+        {
+            let exports = instance.exports();
+            let memory: WebAssembly::Memory =
+                Reflect::get(&exports, &"memory".into())?.dyn_into()?;
+            state.borrow_mut().memory = Some(memory);
 
-        let start_fn: Function = Reflect::get(&exports, &"_start".into())?.dyn_into()?;
-        start_fn.call0(&JsValue::NULL)?;
+            let start_fn: Function = Reflect::get(&exports, &"_start".into())?.dyn_into()?;
+            start_fn.call0(&JsValue::NULL)?;
+        }
 
-        // Drop instance + closures before extracting results.
-        // This allows the JS GC to reclaim the WebAssembly::Memory.
+        // CRITICAL: Clear ALL JS references to allow GC.
+        state.borrow_mut().memory = None;
         drop(instance);
         drop(_closures);
+        drop(import_object);
 
         let state = state.borrow();
         if state.had_failure {
@@ -100,8 +108,8 @@ impl TertiaryRuntime {
         fn_name: &str,
         height: u32,
         payload: Vec<u8>,
-        own_storage: &WebIndexerStorage,
-        secondary_storages: &HashMap<String, *const WebIndexerStorage>,
+        own_storage: &dyn IndexerStorageReader,
+        secondary_storages: &HashMap<String, *const dyn IndexerStorageReader>,
     ) -> Result<Vec<u8>, JsValue> {
         let mut input_data = Vec::with_capacity(4 + payload.len());
         input_data.extend_from_slice(&height.to_le_bytes());
@@ -110,7 +118,13 @@ impl TertiaryRuntime {
         let state = Rc::new(RefCell::new(TertiaryHostState {
             input_data,
             pending_flush: None,
-            own_storage_ref: own_storage as *const WebIndexerStorage,
+            // SAFETY: own_storage outlives the TertiaryHostState — the caller (DevnetState)
+            // owns the storage and this function blocks until execution completes.
+            own_storage_ref: unsafe {
+                std::mem::transmute::<*const dyn IndexerStorageReader, *const dyn IndexerStorageReader>(
+                    own_storage as *const dyn IndexerStorageReader
+                )
+            },
             secondary_storages: secondary_storages.clone(),
             had_failure: false,
             completed: false,
@@ -120,20 +134,24 @@ impl TertiaryRuntime {
         let (import_object, _closures) = self.build_imports(&state)?;
         let instance = WebAssembly::Instance::new(&self.module, &import_object)?;
 
-        let exports = instance.exports();
-        let memory: WebAssembly::Memory =
-            Reflect::get(&exports, &"memory".into())?.dyn_into()?;
-        state.borrow_mut().memory = Some(memory.clone());
+        let result = {
+            let exports = instance.exports();
+            let memory: WebAssembly::Memory =
+                Reflect::get(&exports, &"memory".into())?.dyn_into()?;
+            state.borrow_mut().memory = Some(memory.clone());
 
-        let view_fn: Function = Reflect::get(&exports, &fn_name.into())?.dyn_into()?;
-        let result_ptr = view_fn.call0(&JsValue::NULL)?;
-        let ptr = result_ptr.as_f64().ok_or("view fn did not return i32")? as i32;
+            let view_fn: Function = Reflect::get(&exports, &fn_name.into())?.dyn_into()?;
+            let result_ptr = view_fn.call0(&JsValue::NULL)?;
+            let ptr = result_ptr.as_f64().ok_or("view fn did not return i32")? as i32;
 
-        let result = read_arraybuffer(&memory, ptr);
+            read_arraybuffer(&memory, ptr)
+        };
 
-        // Drop instance + closures to allow GC of WebAssembly::Memory.
+        // CRITICAL: Clear ALL JS references to allow GC.
+        state.borrow_mut().memory = None;
         drop(instance);
         drop(_closures);
+        drop(import_object);
 
         result
     }
@@ -380,9 +398,9 @@ struct TertiaryHostState {
     input_data: Vec<u8>,
     pending_flush: Option<Vec<(Vec<u8>, Vec<u8>)>>,
     /// Pointer to this tertiary indexer's own storage (read/write).
-    own_storage_ref: *const WebIndexerStorage,
+    own_storage_ref: *const dyn IndexerStorageReader,
     /// Named secondary indexer storages (read-only).
-    secondary_storages: HashMap<String, *const WebIndexerStorage>,
+    secondary_storages: HashMap<String, *const dyn IndexerStorageReader>,
     had_failure: bool,
     completed: bool,
     memory: Option<WebAssembly::Memory>,

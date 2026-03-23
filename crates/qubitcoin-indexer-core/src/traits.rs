@@ -33,6 +33,22 @@ pub trait IndexerStorageWriter: IndexerStorageReader {
     fn delete_batch(&self, keys: &[Vec<u8>]) -> Result<(), String>;
 }
 
+/// Combined storage trait for backends that support both read and write,
+/// plus export/import and key enumeration for rollback/stateRoot.
+///
+/// This is the primary trait used by `DevnetState` storage fields.
+/// Both `WebIndexerStorage` and `ExternalStorage` implement this.
+pub trait IndexerStorage: IndexerStorageWriter {
+    /// Export all key-value pairs as a flat binary blob.
+    fn export_bytes(&self) -> Vec<u8>;
+
+    /// Import key-value pairs from a flat binary blob, replacing all existing data.
+    fn import_bytes(&self, data: &[u8]) -> Result<usize, String>;
+
+    /// Get all logical keys and their append-list lengths (for rollback/stateRoot).
+    fn keys_with_lengths(&self) -> Vec<(Vec<u8>, u32)>;
+}
+
 /// A WASM indexer runtime that can process blocks and handle view calls.
 pub trait IndexerRuntime {
     /// Run a block through the indexer, returning key-value pairs to flush.

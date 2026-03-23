@@ -3,7 +3,6 @@
 //! Uses `js_sys::WebAssembly` to instantiate and run metashrew-compatible
 //! WASM indexer modules in the browser or Node.js environment.
 
-use crate::storage::WebIndexerStorage;
 use js_sys::{Function, Object, Reflect, Uint8Array, WebAssembly};
 use prost::Message;
 use qubitcoin_indexer_core::proto::KeyValueFlush;
@@ -37,7 +36,7 @@ impl WebIndexerRuntime {
         &self,
         height: u32,
         block_data: Vec<u8>,
-        storage: &WebIndexerStorage,
+        storage: &dyn IndexerStorageReader,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, JsValue> {
         // Metashrew ABI: input = [height_le32 ++ block_data]
         let mut input_data = Vec::with_capacity(4 + block_data.len());
@@ -48,7 +47,13 @@ impl WebIndexerRuntime {
             input_data,
             pending_flush: None,
             write_cache: std::collections::HashMap::new(),
-            storage_ref: storage as *const WebIndexerStorage,
+            // SAFETY: storage outlives the HostState — the caller (DevnetState)
+            // owns the storage and this function blocks until execution completes.
+            storage_ref: unsafe {
+                std::mem::transmute::<*const dyn IndexerStorageReader, *const dyn IndexerStorageReader>(
+                    storage as *const dyn IndexerStorageReader
+                )
+            },
             had_failure: false,
             completed: false,
             memory: None,
@@ -58,18 +63,24 @@ impl WebIndexerRuntime {
         let instance = WebAssembly::Instance::new(&self.module, &import_object)?;
 
         // Extract memory and store it in HostState before calling _start.
-        let exports = instance.exports();
-        let memory: WebAssembly::Memory =
-            Reflect::get(&exports, &"memory".into())?.dyn_into()?;
-        state.borrow_mut().memory = Some(memory);
+        {
+            let exports = instance.exports();
+            let memory: WebAssembly::Memory =
+                Reflect::get(&exports, &"memory".into())?.dyn_into()?;
+            state.borrow_mut().memory = Some(memory);
 
-        let start_fn: Function = Reflect::get(&exports, &"_start".into())?.dyn_into()?;
-        start_fn.call0(&JsValue::NULL)?;
+            let start_fn: Function = Reflect::get(&exports, &"_start".into())?.dyn_into()?;
+            start_fn.call0(&JsValue::NULL)?;
+            // start_fn and exports drop here (end of block scope)
+        }
 
-        // Drop instance + closures before extracting results.
-        // This allows the JS GC to reclaim the WebAssembly::Memory.
-        drop(instance);
-        drop(_closures);
+        // CRITICAL: Clear ALL JS references to allow GC of the WASM instance.
+        // The Memory, Instance, closures, and import object all form a reference
+        // cycle that prevents GC if any single reference survives.
+        state.borrow_mut().memory = None; // Release WebAssembly::Memory
+        drop(instance);                    // Release WebAssembly::Instance
+        drop(_closures);                   // Release closure JsValues
+        drop(import_object);              // Release import object holding closure refs
 
         let state = state.borrow();
         if state.had_failure {
@@ -91,7 +102,7 @@ impl WebIndexerRuntime {
         fn_name: &str,
         height: u32,
         payload: Vec<u8>,
-        storage: &WebIndexerStorage,
+        storage: &dyn IndexerStorageReader,
     ) -> Result<Vec<u8>, JsValue> {
         // Metashrew ABI: input = [height_le32 ++ payload]
         let mut input_data = Vec::with_capacity(4 + payload.len());
@@ -102,7 +113,13 @@ impl WebIndexerRuntime {
             input_data,
             pending_flush: None,
             write_cache: std::collections::HashMap::new(),
-            storage_ref: storage as *const WebIndexerStorage,
+            // SAFETY: storage outlives the HostState — the caller (DevnetState)
+            // owns the storage and this function blocks until execution completes.
+            storage_ref: unsafe {
+                std::mem::transmute::<*const dyn IndexerStorageReader, *const dyn IndexerStorageReader>(
+                    storage as *const dyn IndexerStorageReader
+                )
+            },
             had_failure: false,
             completed: false,
             memory: None,
@@ -111,21 +128,27 @@ impl WebIndexerRuntime {
         let (import_object, _closures) = self.build_imports(&state)?;
         let instance = WebAssembly::Instance::new(&self.module, &import_object)?;
 
-        // Extract memory and store it in HostState before calling the view fn.
-        let exports = instance.exports();
-        let memory: WebAssembly::Memory =
-            Reflect::get(&exports, &"memory".into())?.dyn_into()?;
-        state.borrow_mut().memory = Some(memory.clone());
+        // Extract memory and call the view function within a scope to limit
+        // JS reference lifetimes.
+        let result = {
+            let exports = instance.exports();
+            let memory: WebAssembly::Memory =
+                Reflect::get(&exports, &"memory".into())?.dyn_into()?;
+            state.borrow_mut().memory = Some(memory.clone());
 
-        let view_fn: Function = Reflect::get(&exports, &fn_name.into())?.dyn_into()?;
-        let result_ptr = view_fn.call0(&JsValue::NULL)?;
-        let ptr = result_ptr.as_f64().ok_or("view fn did not return i32")? as i32;
+            let view_fn: Function = Reflect::get(&exports, &fn_name.into())?.dyn_into()?;
+            let result_ptr = view_fn.call0(&JsValue::NULL)?;
+            let ptr = result_ptr.as_f64().ok_or("view fn did not return i32")? as i32;
 
-        let result = read_arraybuffer(&memory, ptr);
+            read_arraybuffer(&memory, ptr)
+            // exports, view_fn, memory clone drop here
+        };
 
-        // Drop instance + closures to allow GC of WebAssembly::Memory.
+        // CRITICAL: Clear ALL JS references to allow GC.
+        state.borrow_mut().memory = None;
         drop(instance);
         drop(_closures);
+        drop(import_object);
 
         result
     }
@@ -386,7 +409,7 @@ struct HostState {
     /// This is critical for indexers that flush multiple times per block
     /// (e.g. opshrew: deploy stores bytecode, then interaction reads it).
     write_cache: std::collections::HashMap<Vec<u8>, Vec<u8>>,
-    storage_ref: *const WebIndexerStorage,
+    storage_ref: *const dyn IndexerStorageReader,
     had_failure: bool,
     completed: bool,
     /// Set after instantiation, before calling _start or view fn.

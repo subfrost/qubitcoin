@@ -4,7 +4,7 @@
 //! uses a `HashMap<Vec<u8>, Vec<u8>>` instead of RocksDB.
 
 use qubitcoin_indexer_core::state;
-use qubitcoin_indexer_core::traits::{IndexerStorageReader, IndexerStorageWriter};
+use qubitcoin_indexer_core::traits::{IndexerStorage, IndexerStorageReader, IndexerStorageWriter};
 use std::cell::RefCell;
 use std::collections::BTreeMap as HashMap;
 
@@ -204,6 +204,20 @@ impl IndexerStorageWriter for WebIndexerStorage {
             map.remove(k);
         }
         Ok(())
+    }
+}
+
+impl IndexerStorage for WebIndexerStorage {
+    fn export_bytes(&self) -> Vec<u8> {
+        self.export_bytes()
+    }
+
+    fn import_bytes(&self, data: &[u8]) -> Result<usize, String> {
+        self.import_bytes(data)
+    }
+
+    fn keys_with_lengths(&self) -> Vec<(Vec<u8>, u32)> {
+        self.keys_with_lengths()
     }
 }
 
