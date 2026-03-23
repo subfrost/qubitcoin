@@ -95,15 +95,23 @@ fn parse_indexer_args_with_layer(args: &[&str], default_layer: IndexerLayer) -> 
 
         let label = parts[0];
         let path_str = parts[1];
-        let cli_deps: Vec<String> = if parts.len() >= 3 && default_layer == IndexerLayer::Tertiary
-        {
-            parts[2]
+        // For tertiary: third part is comma-separated dependency labels.
+        // For secondary: third part is start_height (numeric).
+        let cli_deps: Vec<String>;
+        let cli_start_height: u32;
+        if parts.len() >= 3 && default_layer == IndexerLayer::Tertiary {
+            cli_deps = parts[2]
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .collect()
+                .collect();
+            cli_start_height = 0;
+        } else if parts.len() >= 3 && default_layer == IndexerLayer::Secondary {
+            cli_deps = vec![];
+            cli_start_height = parts[2].trim().parse::<u32>().unwrap_or(0);
         } else {
-            vec![]
+            cli_deps = vec![];
+            cli_start_height = 0;
         };
 
         let path = PathBuf::from(path_str);
@@ -146,7 +154,7 @@ fn parse_indexer_args_with_layer(args: &[&str], default_layer: IndexerLayer) -> 
                     label: label.to_string(),
                     wasm_path,
                     smt_enabled: false,
-                    start_height: 0,
+                    start_height: cli_start_height,
                     layer: default_layer,
                     depends_on: cli_deps.clone(),
                 });

@@ -48,6 +48,9 @@ COPY --from=builder /build/target/release/qubitcoind /usr/local/bin/
 COPY --from=builder /build/target/release/qubitcoin-cli /usr/local/bin/
 COPY docker-entrypoint.sh /usr/local/bin/
 
+# Bake in prebuilt indexer WASMs
+COPY indexers/ /indexers/
+
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # P2P, RPC, ZMQ
