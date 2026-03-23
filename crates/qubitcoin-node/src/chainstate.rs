@@ -356,6 +356,13 @@ impl ChainstateManager {
         self.block_index.find_by_hash(hash)
     }
 
+    /// Get the block hash at a given height on the active chain.
+    pub fn get_block_hash_at_height(&self, height: i32) -> Option<String> {
+        let arena_idx = self.active_chainstate.chain.get_block_index(height)?;
+        let block = self.block_index.get(arena_idx);
+        Some(block.block_hash.to_hex())
+    }
+
     // -- Persistence helpers -------------------------------------------------
 
     /// Flush the UTXO cache to a persistent backing store.

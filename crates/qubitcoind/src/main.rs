@@ -1301,6 +1301,44 @@ fn register_live_rpcs(
 ) {
     use qubitcoin_rpc::server::{RpcRequest, RpcResponse, RPC_INVALID_PARAMS, RPC_MISC_ERROR};
 
+    // -- getblockhash (live, uses chainstate arena) -------------------------
+    let cs_hash = chainstate.clone();
+    registry.register("getblockhash", move |req: &RpcRequest| {
+        let height = match req
+            .params
+            .as_ref()
+            .and_then(|p| p.get(0))
+            .and_then(|v| v.as_i64())
+        {
+            Some(h) if h >= 0 => h as i32,
+            _ => {
+                return RpcResponse::error(
+                    req.id.clone(),
+                    RPC_INVALID_PARAMS,
+                    "Missing or invalid height parameter".into(),
+                )
+            }
+        };
+        let cs = cs_hash.lock();
+        let chain_height = cs.height();
+        if height > chain_height {
+            return RpcResponse::error(
+                req.id.clone(),
+                RPC_INVALID_PARAMS,
+                format!("Block height {} out of range (chain height {})", height, chain_height),
+            );
+        }
+        // Walk the arena to find the block at this height on the best chain.
+        match cs.get_block_hash_at_height(height) {
+            Some(hash) => RpcResponse::success(req.id.clone(), serde_json::json!(hash)),
+            None => RpcResponse::error(
+                req.id.clone(),
+                RPC_MISC_ERROR,
+                format!("Block at height {} not found in index", height),
+            ),
+        }
+    });
+
     // -- getblock -----------------------------------------------------------
     let cs = chainstate.clone();
     let bf = block_files.clone();
