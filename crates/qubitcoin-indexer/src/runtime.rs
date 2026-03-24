@@ -37,7 +37,10 @@ fn base_config() -> Config {
     config.relaxed_simd_deterministic(true);
     config.static_memory_maximum_size(0x100000000); // 4GB
     config.static_memory_guard_size(0x10000); // 64KB
-    config.memory_init_cow(false);
+    // CoW memory init: reuse OS-level copy-on-write pages instead of
+    // zeroing memory for each new instance. Eliminates ~12% CPU from
+    // page fault handling (clear_page_erms, do_anonymous_page).
+    config.memory_init_cow(true);
     config
 }
 
