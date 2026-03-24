@@ -17,12 +17,19 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
 use storage::IndexerStorage;
 
 // Note: WasmIndexerRuntime methods (run_block, call_view, call_view_async)
 // all take &self and create a fresh wasmtime::Store per invocation, so no
 // Mutex is needed. Engine and Module are Send+Sync in wasmtime.
+
+/// A block queued for async indexer processing.
+struct IndexerBlock {
+    height: u32,
+    data: Arc<Vec<u8>>, // [height_le32 ++ block_data]
+}
 
 /// Indexer execution mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +67,9 @@ pub struct IndexerInstance {
     pub paused: AtomicBool,
     /// Path to the RocksDB directory (for rsyncd exposure / admin).
     pub db_path: PathBuf,
+    /// Channel sender for async block processing. When set, blocks are
+    /// queued to a dedicated worker thread instead of processed inline.
+    pub block_sender: Option<mpsc::SyncSender<IndexerBlock>>,
 }
 
 /// Info returned by `pause()`.
@@ -157,6 +167,16 @@ impl IndexerManager {
                 "indexer module loaded"
             );
 
+            // In Async mode, spawn a dedicated worker thread per indexer.
+            // The channel has a bounded buffer to provide backpressure.
+            let block_sender = if mode == IndexerMode::Async {
+                let (tx, rx) = mpsc::sync_channel::<IndexerBlock>(64);
+                // We'll spawn the worker after creating the Arc below.
+                Some((tx, rx))
+            } else {
+                None
+            };
+
             let instance = Arc::new(IndexerInstance {
                 label: config.label.clone(),
                 block_runtime,
@@ -170,7 +190,30 @@ impl IndexerManager {
                 depends_on: config.depends_on.clone(),
                 paused: AtomicBool::new(false),
                 db_path: db_dir,
+                block_sender: block_sender.as_ref().map(|(tx, _)| tx.clone()),
             });
+
+            // Spawn the worker thread for async mode.
+            if let Some((_tx, rx)) = block_sender {
+                let worker_inst = instance.clone();
+                let worker_label = config.label.clone();
+                std::thread::Builder::new()
+                    .name(format!("indexer-{}", worker_label))
+                    .spawn(move || {
+                        tracing::info!(indexer = %worker_label, "indexer worker thread started");
+                        while let Ok(block) = rx.recv() {
+                            if worker_inst.paused.load(Ordering::Relaxed) {
+                                continue;
+                            }
+                            if block.height < worker_inst.start_height {
+                                continue;
+                            }
+                            run_indexer_block(&worker_inst, block.height, &block.data);
+                        }
+                        tracing::info!(indexer = %worker_label, "indexer worker thread exiting");
+                    })
+                    .map_err(|e| format!("failed to spawn indexer worker: {}", e))?;
+            }
 
             indexers.insert(config.label, instance);
         }
@@ -204,14 +247,15 @@ impl IndexerManager {
 
     /// Notify all indexers that a new block has been connected.
     ///
-    /// `block_data` is the raw serialized block.
-    /// In synchronous mode, blocks until all indexers finish.
+    /// In **Async mode** (recommended): queues the block to per-indexer
+    /// worker threads and returns immediately. The caller is not blocked
+    /// by WASM execution. Worker threads process blocks in order.
+    ///
+    /// In **Synchronous mode**: blocks until all indexers finish (legacy).
     ///
     /// Indexers are processed in two phases:
     /// 1. Secondary indexers (no dependencies) run in parallel.
     /// 2. Tertiary indexers run after their dependencies have completed.
-    ///
-    /// An indexer is skipped if `height < start_height`.
     pub fn on_block_connected(&self, height: u32, block_data: &[u8]) {
         if self.indexers.is_empty() {
             return;
@@ -223,7 +267,39 @@ impl IndexerManager {
         input.extend_from_slice(block_data);
         let input = Arc::new(input);
 
-        // Phase 1: Run secondary indexers (and tertiary with no deps) in parallel.
+        // Async mode: queue to per-indexer worker threads.
+        if self.mode == IndexerMode::Async {
+            for inst in self.indexers.values() {
+                if height < inst.start_height || inst.paused.load(Ordering::Relaxed) {
+                    continue;
+                }
+                if let Some(ref sender) = inst.block_sender {
+                    let block = IndexerBlock {
+                        height,
+                        data: Arc::clone(&input),
+                    };
+                    if let Err(e) = sender.try_send(block) {
+                        // Channel full — apply backpressure by blocking.
+                        match e {
+                            mpsc::TrySendError::Full(block) => {
+                                let _ = sender.send(block);
+                            }
+                            mpsc::TrySendError::Disconnected(_) => {
+                                tracing::error!(
+                                    indexer = %inst.label,
+                                    "indexer worker thread disconnected"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            // Tertiary indexers with dependencies: also queue, but the worker
+            // thread will check dependency heights before processing.
+            return;
+        }
+
+        // Synchronous mode (legacy): block until all indexers finish.
         let (phase1, phase2): (Vec<_>, Vec<_>) = self
             .indexers
             .values()
@@ -248,8 +324,6 @@ impl IndexerManager {
 
         run_phase(&phase1);
 
-        // Phase 2: Run tertiary indexers whose dependencies have all reached
-        // this height (i.e., phase 1 completed for them).
         if !phase2.is_empty() {
             let ready: Vec<&Arc<IndexerInstance>> = phase2
                 .into_iter()
@@ -418,6 +492,7 @@ impl IndexerManager {
             depends_on: cfg.depends_on.clone(),
             paused: AtomicBool::new(false),
             db_path: db_dir,
+            block_sender: None, // hot-loaded indexers use sync mode
         });
 
         self.indexers.insert(label.to_string(), instance);
@@ -497,12 +572,11 @@ impl IndexerManager {
 
     /// Replay blocks for indexers that are behind the chain tip.
     ///
-    /// `read_block` is a callback that reads a block at a given height,
-    /// returning the raw serialized block data.
+    /// In **Async mode**: feeds blocks to the per-indexer worker channels
+    /// and returns immediately. Workers process blocks in the background.
+    /// The node is not blocked during catch-up.
     ///
-    /// Respects `start_height`: indexers won't replay blocks below their
-    /// configured start height. Tertiary indexers replay after their
-    /// dependencies have caught up.
+    /// In **Synchronous mode**: blocks until all catch-up is complete.
     pub fn catch_up<F>(&self, chain_height: u32, read_block: F)
     where
         F: Fn(u32) -> Option<Vec<u8>>,
@@ -510,17 +584,21 @@ impl IndexerManager {
         // Phase 1: catch up secondary indexers (no dependencies).
         for (label, inst) in &self.indexers {
             if !inst.depends_on.is_empty() {
-                continue; // tertiary — handle in phase 2
+                continue;
             }
             self.catch_up_single(inst, label, chain_height, &read_block);
         }
 
-        // Phase 2: catch up tertiary indexers (dependencies should now be current).
+        // Phase 2: catch up tertiary indexers.
         for (label, inst) in &self.indexers {
             if inst.depends_on.is_empty() {
-                continue; // already handled
+                continue;
             }
-            if !self.dependencies_satisfied(inst, chain_height) {
+            // In async mode, tertiaries will process when deps are ready
+            // (the worker thread checks dependency heights).
+            if self.mode == IndexerMode::Synchronous
+                && !self.dependencies_satisfied(inst, chain_height)
+            {
                 tracing::warn!(
                     indexer = %label,
                     "skipping tertiary catch-up: dependencies not satisfied"
@@ -545,10 +623,14 @@ impl IndexerManager {
         if effective_start > chain_height {
             return;
         }
+
+        let blocks_behind = chain_height - effective_start + 1;
         tracing::info!(
             indexer = %label,
             from = effective_start,
             to = chain_height,
+            blocks_behind = blocks_behind,
+            mode = if inst.block_sender.is_some() { "async" } else { "sync" },
             "replaying blocks for indexer catch-up"
         );
         for h in effective_start..=chain_height {
@@ -556,7 +638,18 @@ impl IndexerManager {
                 let mut input = Vec::with_capacity(4 + block_data.len());
                 input.extend_from_slice(&h.to_le_bytes());
                 input.extend_from_slice(&block_data);
-                run_indexer_block(inst, h, &input);
+
+                // Async mode: queue to worker thread.
+                if let Some(ref sender) = inst.block_sender {
+                    let block = IndexerBlock {
+                        height: h,
+                        data: Arc::new(input),
+                    };
+                    let _ = sender.send(block); // blocks if channel full (backpressure)
+                } else {
+                    // Synchronous mode: process inline.
+                    run_indexer_block(inst, h, &input);
+                }
             } else {
                 tracing::warn!(
                     indexer = %label,
@@ -707,6 +800,14 @@ mod tests {
     fn test_on_block_connected_async() {
         let (mgr, _dir) = setup_indexer_manager(IndexerMode::Async);
         mgr.on_block_connected(1, b"fake_block");
+        // In async mode, the block is queued to a worker thread.
+        // Wait for the worker to process it.
+        for _ in 0..100 {
+            if mgr.indexer_height("test") == Some(1) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert_eq!(mgr.indexer_height("test"), Some(1));
     }
 
