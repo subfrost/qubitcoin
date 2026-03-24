@@ -112,6 +112,7 @@ impl DevnetServer {
             alkanes_storage,
             esplora_runtime,
             esplora_storage,
+            additional_secondaries: Vec::new(),
             tertiary_indexers: Vec::new(),
             use_external_storage: external,
         }));
@@ -132,6 +133,28 @@ impl DevnetServer {
         let storage = state.create_storage();
         state.tertiary_indexers.push(
             crate::backends::TertiaryIndexerInstance {
+                label: label.to_string(),
+                runtime,
+                storage,
+            },
+        );
+        Ok(())
+    }
+
+    /// Add an additional secondary indexer WASM module.
+    ///
+    /// * `label` — unique name for this secondary indexer (e.g., "charms", "brc20").
+    /// * `wasm_bytes` — compiled secondary indexer WASM module bytes.
+    ///
+    /// Additional secondaries run after alkanes/esplora but before tertiary indexers.
+    /// Their storage is accessible to tertiary indexers via `__secondary_get(label, key)`.
+    #[wasm_bindgen(js_name = "addSecondary")]
+    pub fn add_secondary(&self, label: &str, wasm_bytes: &[u8]) -> Result<(), JsValue> {
+        let runtime = WebIndexerRuntime::new(wasm_bytes)?;
+        let mut state = self.state.borrow_mut();
+        let storage = state.create_storage();
+        state.additional_secondaries.push(
+            crate::backends::SecondaryIndexerInstance {
                 label: label.to_string(),
                 runtime,
                 storage,

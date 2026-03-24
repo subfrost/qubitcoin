@@ -35,11 +35,23 @@ export interface TertiaryIndexerConfig {
     /** Compiled tertiary indexer WASM module bytes. */
     wasm: Uint8Array;
 }
+/** An additional secondary indexer WASM to load into the devnet. */
+export interface SecondaryIndexerConfig {
+    /** Unique label for this secondary indexer (e.g., "charms", "brc20"). */
+    label: string;
+    /** Compiled secondary indexer WASM module bytes. */
+    wasm: Uint8Array;
+}
 export interface DevnetTestHarnessOptions {
     /** Compiled alkanes indexer WASM module bytes. */
     alkanesWasm: Uint8Array;
     /** Optional compiled esplora indexer WASM module bytes. */
     esploraWasm?: Uint8Array;
+    /**
+     * Optional additional secondary indexer WASMs. These run after alkanes/esplora
+     * but before tertiary indexers. Their storage is accessible via __secondary_get.
+     */
+    additionalSecondaries?: SecondaryIndexerConfig[];
     /**
      * Optional tertiary indexer WASMs. Tertiary indexers run after secondary
      * indexers and can read their state via __secondary_get host functions.

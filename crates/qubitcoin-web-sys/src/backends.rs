@@ -116,10 +116,20 @@ pub struct DevnetState {
     pub alkanes_storage: Box<dyn IndexerStorage>,
     pub esplora_runtime: Option<WebIndexerRuntime>,
     pub esplora_storage: Option<Box<dyn IndexerStorage>>,
+    /// Additional named secondary indexers (beyond alkanes + esplora).
+    /// Each gets its own storage and is indexed on every block.
+    pub additional_secondaries: Vec<SecondaryIndexerInstance>,
     /// Tertiary indexers that run after secondary indexers.
     pub tertiary_indexers: Vec<TertiaryIndexerInstance>,
     /// Whether to use external (JS-hosted) storage for new stores.
     pub use_external_storage: bool,
+}
+
+/// A named secondary indexer instance with its own runtime and storage.
+pub struct SecondaryIndexerInstance {
+    pub label: String,
+    pub runtime: WebIndexerRuntime,
+    pub storage: Box<dyn IndexerStorage>,
 }
 
 impl DevnetState {
@@ -217,6 +227,20 @@ impl DevnetState {
                 .map_err(|e| anyhow::anyhow!("esplora set height: {}", e))?;
         }
 
+        // Index through additional secondary indexers
+        for secondary in &mut self.additional_secondaries {
+            let s_height = secondary.storage.tip_height();
+            let pairs = secondary.runtime.run_block(
+                s_height, block_bytes.to_vec(), secondary.storage.as_ref(),
+            ).map_err(|e| anyhow::anyhow!("secondary '{}' index: {:?}", secondary.label, e))?;
+            for (key, value) in &pairs {
+                secondary.storage.put(key, value)
+                    .map_err(|e| anyhow::anyhow!("secondary '{}' put: {}", secondary.label, e))?;
+            }
+            secondary.storage.set_tip_height(s_height + 1)
+                .map_err(|e| anyhow::anyhow!("secondary '{}' set height: {}", secondary.label, e))?;
+        }
+
         // Index through tertiary indexers (run after all secondary indexers)
         if !self.tertiary_indexers.is_empty() {
             let secondary_storages = self.build_secondary_storage_map();
@@ -253,6 +277,9 @@ impl DevnetState {
         map.insert("alkanes".to_string(), self.alkanes_storage.as_ref() as *const dyn IndexerStorageReader);
         if let Some(ref storage) = self.esplora_storage {
             map.insert("esplora".to_string(), storage.as_ref() as *const dyn IndexerStorageReader);
+        }
+        for secondary in &self.additional_secondaries {
+            map.insert(secondary.label.clone(), secondary.storage.as_ref() as *const dyn IndexerStorageReader);
         }
         map
     }
@@ -523,7 +550,45 @@ impl MetashrewBackend for DevnetMetashrewBackend {
                     block_tag.parse::<u32>().unwrap_or(0)
                 };
 
-                // Try alkanes (secondary) first
+                // Check if view_method targets a specific indexer (e.g., "charms/indexerheight")
+                if let Some((indexer_label, fn_name)) = view_method.split_once('/') {
+                    // Route to named indexer
+                    // Try additional secondaries
+                    for secondary in &state.additional_secondaries {
+                        if secondary.label == indexer_label {
+                            match secondary.runtime.call_view(
+                                fn_name, height, input_bytes.clone(), secondary.storage.as_ref(),
+                            ) {
+                                Ok(data) => {
+                                    return Ok(JsonRpcResponse::success(
+                                        json!(format!("0x{}", hex::encode(&data))),
+                                        request.id.clone(),
+                                    ));
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                    // Try tertiary indexers
+                    for tertiary in &state.tertiary_indexers {
+                        if tertiary.label == indexer_label {
+                            if let Some(Ok(data)) = state.call_tertiary_view(
+                                indexer_label, fn_name, height, input_bytes.clone(),
+                            ) {
+                                return Ok(JsonRpcResponse::success(
+                                    json!(format!("0x{}", hex::encode(&data))),
+                                    request.id.clone(),
+                                ));
+                            }
+                        }
+                    }
+                    return Err(anyhow::anyhow!(
+                        "dispatch error: view '{}/{}' not found in any indexer",
+                        indexer_label, fn_name,
+                    ));
+                }
+
+                // No prefix — try alkanes (primary secondary) first
                 let result = state.alkanes_runtime.call_view(
                     view_method,
                     height,
@@ -539,9 +604,23 @@ impl MetashrewBackend for DevnetMetashrewBackend {
                         ));
                     }
                     Err(_) => {
-                        // If alkanes doesn't have the view, try tertiary indexers.
-                        // Convention: view_method is the exported fn name. Each
-                        // tertiary indexer is tried in order; first match wins.
+                        // Try additional secondary indexers
+                        for secondary in &state.additional_secondaries {
+                            match secondary.runtime.call_view(
+                                view_method, height, input_bytes.clone(),
+                                secondary.storage.as_ref(),
+                            ) {
+                                Ok(data) => {
+                                    return Ok(JsonRpcResponse::success(
+                                        json!(format!("0x{}", hex::encode(&data))),
+                                        request.id.clone(),
+                                    ));
+                                }
+                                Err(_) => continue,
+                            }
+                        }
+
+                        // Try tertiary indexers
                         for tertiary in &state.tertiary_indexers {
                             if let Some(Ok(data)) = state.call_tertiary_view(
                                 &tertiary.label, view_method, height, input_bytes.clone(),
@@ -554,7 +633,7 @@ impl MetashrewBackend for DevnetMetashrewBackend {
                         }
                         // No indexer handled it
                         return Err(anyhow::anyhow!(
-                            "view '{}' not found in alkanes or any tertiary indexer",
+                            "view '{}' not found in alkanes or any secondary/tertiary indexer",
                             view_method,
                         ));
                     }

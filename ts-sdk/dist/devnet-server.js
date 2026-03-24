@@ -109,7 +109,13 @@ export class DevnetTestHarness {
             ? new Uint8Array(opts.esploraWasm)
             : undefined;
         const server = new wasm.DevnetServer(secretKey, opts.alkanesWasm, esploraArr);
-        // Load tertiary indexers (run after secondary indexers)
+        // Load additional secondary indexers (run after alkanes/esplora, before tertiaries)
+        if (opts.additionalSecondaries) {
+            for (const si of opts.additionalSecondaries) {
+                server.addSecondary(si.label, si.wasm);
+            }
+        }
+        // Load tertiary indexers (run after all secondary indexers)
         if (opts.tertiaryIndexers) {
             for (const ti of opts.tertiaryIndexers) {
                 server.addTertiary(ti.label, ti.wasm);
