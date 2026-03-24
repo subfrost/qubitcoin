@@ -3542,6 +3542,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "qubitcoin-support"
+version = "0.1.0"
+
+[[package]]
 name = "qubitcoin-sys"
 version = "0.1.0"
 dependencies = [
@@ -3570,6 +3574,7 @@ version = "0.1.0"
 dependencies = [
  "prost",
  "prost-build",
+ "qubitcoin-support",
 ]
 
 [[package]]

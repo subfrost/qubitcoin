@@ -21,6 +21,7 @@ members = [
     "crates/qubitcoin-web-sys",
     "crates/qubitcoin-tertiary-web",
     "crates/qubitcoin-tertiary-support",
+    "crates/qubitcoin-support",
     "crates/qubitcoin-sys",
     "crates/qubitcoind",
 ]

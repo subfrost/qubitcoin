@@ -8,6 +8,7 @@ description = "Client-side support library for authoring tertiary indexer WASMs"
 
 [dependencies]
 prost = "0.12"
+qubitcoin-support = { path = "../qubitcoin-support" }
 
 [build-dependencies]
 prost-build = "0.12"

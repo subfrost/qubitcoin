@@ -28,6 +28,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod compat;
+pub mod secondary_pointer;
+
+pub use secondary_pointer::SecondaryPointer;
+pub use qubitcoin_support::{KeyValuePointer, ByteView};
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/metashrew.rs"));
 }
