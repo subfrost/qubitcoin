@@ -128,14 +128,35 @@ export declare class DevnetTestHarness {
     private handleLuaRpc;
     private handleFetchRequest;
     /**
-     * Resolve a REST-style URL + body into a JSON-RPC method + params.
+     * Transform a decoded quspo response into the REST format the SDK expects.
      *
-     * Maps espo data API REST endpoints to the RPC dispatcher's namespace:
-     *   /get-all-pools-details    → ammdata.get_pools
-     *   /get-all-token-pairs      → ammdata.get_pools
-     *   /get-alkanes-by-address   → essentials.get_address_balances
-     *   /get-bitcoin-price        → (handled inline)
-     *   /get-all-amm-tx-history   → ammdata.get_activity
+     * The SDK's data API clients expect specific response shapes:
+     *   get-all-pools-details → { statusCode: 200, data: [pool...] }
+     *   get-alkanes-by-address → { statusCode: 200, data: [balance...] }
+     *   get-all-amm-tx-history → { statusCode: 200, data: [tx...] }
+     *   get-alkane-details → { statusCode: 200, data: {name, symbol, ...} }
+     *   get-candles → { statusCode: 200, data: {candles: [...]} }
+     */
+    private transformQuspoResponse;
+    /**
+     * Resolve a REST-style URL + body into a quspo metashrew_view call
+     * or an inline mock response.
+     *
+     * REST endpoints from the SDK's data API are mapped to quspo tertiary
+     * indexer views via metashrew_view JSON-RPC:
+     *
+     *   /get-all-pools-details      → quspo get_pools
+     *   /get-all-token-pairs        → quspo get_pools
+     *   /get-alkanes-by-address     → quspo get_alkanes_by_address
+     *   /get-bitcoin-price          → inline mock {usd: 100000}
+     *   /get-all-amm-tx-history     → quspo get_activity
+     *   /get-alkane-details         → quspo get_token_details
+     *   /get-candles                → quspo get_candles
+     *   /get-pools                  → quspo get_pools
+     *   /get-pool-details           → quspo get_pools (single)
+     *   /get-address-positions      → quspo get_user_positions
+     *   /get-wrap-events            → quspo get_wrap_events
+     *   /get-unwrap-events          → quspo get_unwrap_events
      */
     private resolveRestMethod;
 }
