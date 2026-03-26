@@ -572,13 +572,22 @@ impl MetashrewBackend for DevnetMetashrewBackend {
                     // Try tertiary indexers
                     for tertiary in &state.tertiary_indexers {
                         if tertiary.label == indexer_label {
-                            if let Some(Ok(data)) = state.call_tertiary_view(
+                            match state.call_tertiary_view(
                                 indexer_label, fn_name, height, input_bytes.clone(),
                             ) {
-                                return Ok(JsonRpcResponse::success(
-                                    json!(format!("0x{}", hex::encode(&data))),
-                                    request.id.clone(),
-                                ));
+                                Some(Ok(data)) => {
+                                    return Ok(JsonRpcResponse::success(
+                                        json!(format!("0x{}", hex::encode(&data))),
+                                        request.id.clone(),
+                                    ));
+                                }
+                                Some(Err(e)) => {
+                                    return Err(anyhow::anyhow!(
+                                        "tertiary '{}' view '{}' failed: {}",
+                                        indexer_label, fn_name, e,
+                                    ));
+                                }
+                                None => {}
                             }
                         }
                     }
@@ -622,13 +631,23 @@ impl MetashrewBackend for DevnetMetashrewBackend {
 
                         // Try tertiary indexers
                         for tertiary in &state.tertiary_indexers {
-                            if let Some(Ok(data)) = state.call_tertiary_view(
+                            match state.call_tertiary_view(
                                 &tertiary.label, view_method, height, input_bytes.clone(),
                             ) {
-                                return Ok(JsonRpcResponse::success(
-                                    json!(format!("0x{}", hex::encode(&data))),
-                                    request.id.clone(),
-                                ));
+                                Some(Ok(data)) => {
+                                    return Ok(JsonRpcResponse::success(
+                                        json!(format!("0x{}", hex::encode(&data))),
+                                        request.id.clone(),
+                                    ));
+                                }
+                                Some(Err(e)) => {
+                                    // View function found but execution failed — return the error
+                                    return Err(anyhow::anyhow!(
+                                        "tertiary '{}' view '{}' failed: {}",
+                                        tertiary.label, view_method, e,
+                                    ));
+                                }
+                                None => continue, // Tertiary indexer not found, try next
                             }
                         }
                         // No indexer handled it
