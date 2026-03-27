@@ -2792,7 +2792,7 @@ dependencies = [
 
 [[package]]
 name = "metashrew-support"
-version = "10.0.0"
+version = "9.0.1"
 dependencies = [
  "anyhow",
  "bech32 0.11.1",

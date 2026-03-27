@@ -625,7 +625,14 @@ impl MetashrewBackend for DevnetMetashrewBackend {
                                         request.id.clone(),
                                     ));
                                 }
-                                Err(_) => continue,
+                                Err(e) => {
+                                    // Log the error but continue to next secondary
+                                    web_sys::console::warn_1(
+                                        &format!("secondary '{}' view '{}' error: {:?}",
+                                            secondary.label, view_method, e).into()
+                                    );
+                                    continue;
+                                }
                             }
                         }
 
