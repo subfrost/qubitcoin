@@ -451,6 +451,31 @@ impl BitcoinBackend for DevnetBitcoinBackend {
                 state.mine_with_txs_and_index(vec![Arc::new(tx)])?;
                 Ok(JsonRpcResponse::success(json!(txid), id))
             }
+            // Batch broadcast: accepts array of hex-encoded raw transactions,
+            // mines them ALL in a single block (atomic), returns array of txids.
+            // Matches the patched bitcoind sendrawtransactions RPC from
+            // ~/alkanes-rs/patch/bitcoind.
+            "sendrawtransactions" => {
+                let tx_hexes = params.get(0)
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let mut txs: Vec<TransactionRef> = Vec::new();
+                let mut txids: Vec<String> = Vec::new();
+                for hex_val in &tx_hexes {
+                    let hex_tx = hex_val.as_str().unwrap_or("");
+                    let tx_bytes = hex::decode(hex_tx)
+                        .map_err(|e| anyhow::anyhow!("invalid tx hex in batch: {}", e))?;
+                    let tx = types::tx_from_bytes(&tx_bytes)
+                        .map_err(|e| anyhow::anyhow!("invalid tx in batch: {:?}", e))?;
+                    txids.push(tx.txid().to_hex());
+                    txs.push(Arc::new(tx));
+                }
+                // Mine ALL transactions in a single block
+                let mut state = self.state.borrow_mut();
+                state.mine_with_txs_and_index(txs)?;
+                Ok(JsonRpcResponse::success(json!(txids), id))
+            }
             "getrawtransaction" => {
                 let txid_hex = params.get(0)
                     .and_then(|v| v.as_str())
