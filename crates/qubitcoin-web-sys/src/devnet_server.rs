@@ -160,6 +160,9 @@ impl DevnetServer {
                 storage,
             },
         );
+        web_sys::console::log_1(
+            &format!("[devnet] Added secondary '{}' (total: {})", label, state.additional_secondaries.len()).into()
+        );
         Ok(())
     }
 

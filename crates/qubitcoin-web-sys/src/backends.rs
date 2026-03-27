@@ -614,6 +614,7 @@ impl MetashrewBackend for DevnetMetashrewBackend {
                     }
                     Err(_) => {
                         // Try additional secondary indexers
+                        let mut last_secondary_error: Option<String> = None;
                         for secondary in &state.additional_secondaries {
                             match secondary.runtime.call_view(
                                 view_method, height, input_bytes.clone(),
@@ -626,11 +627,10 @@ impl MetashrewBackend for DevnetMetashrewBackend {
                                     ));
                                 }
                                 Err(e) => {
-                                    // Log the error but continue to next secondary
-                                    web_sys::console::warn_1(
-                                        &format!("secondary '{}' view '{}' error: {:?}",
-                                            secondary.label, view_method, e).into()
-                                    );
+                                    last_secondary_error = Some(format!(
+                                        "secondary '{}' view '{}': {:?}",
+                                        secondary.label, view_method, e
+                                    ));
                                     continue;
                                 }
                             }
@@ -658,9 +658,12 @@ impl MetashrewBackend for DevnetMetashrewBackend {
                             }
                         }
                         // No indexer handled it
+                        let n_secondaries = state.additional_secondaries.len();
+                        let n_tertiaries = state.tertiary_indexers.len();
+                        let extra = last_secondary_error.map(|e| format!(". Last error: {}", e)).unwrap_or_default();
                         return Err(anyhow::anyhow!(
-                            "view '{}' not found in alkanes or any secondary/tertiary indexer",
-                            view_method,
+                            "view '{}' not found in alkanes or {} secondary/{} tertiary indexers{}",
+                            view_method, n_secondaries, n_tertiaries, extra,
                         ));
                     }
                 }
