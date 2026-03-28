@@ -49,6 +49,17 @@ impl TertiaryRuntime {
         own_storage: &dyn IndexerStorageReader,
         secondary_storages: &HashMap<String, *const dyn IndexerStorageReader>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, JsValue> {
+        self.run_block_with_config(height, block_data, own_storage, secondary_storages, vec![])
+    }
+
+    pub fn run_block_with_config(
+        &self,
+        height: u32,
+        block_data: Vec<u8>,
+        own_storage: &dyn IndexerStorageReader,
+        secondary_storages: &HashMap<String, *const dyn IndexerStorageReader>,
+        config_data: Vec<u8>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, JsValue> {
         let mut input_data = Vec::with_capacity(4 + block_data.len());
         input_data.extend_from_slice(&height.to_le_bytes());
         input_data.extend_from_slice(&block_data);
@@ -64,6 +75,7 @@ impl TertiaryRuntime {
                 )
             },
             secondary_storages: secondary_storages.clone(),
+            config_data: config_data.clone(),
             had_failure: false,
             completed: false,
             memory: None,
@@ -111,6 +123,18 @@ impl TertiaryRuntime {
         own_storage: &dyn IndexerStorageReader,
         secondary_storages: &HashMap<String, *const dyn IndexerStorageReader>,
     ) -> Result<Vec<u8>, JsValue> {
+        self.call_view_with_config(fn_name, height, payload, own_storage, secondary_storages, vec![])
+    }
+
+    pub fn call_view_with_config(
+        &self,
+        fn_name: &str,
+        height: u32,
+        payload: Vec<u8>,
+        own_storage: &dyn IndexerStorageReader,
+        secondary_storages: &HashMap<String, *const dyn IndexerStorageReader>,
+        config_data: Vec<u8>,
+    ) -> Result<Vec<u8>, JsValue> {
         let mut input_data = Vec::with_capacity(4 + payload.len());
         input_data.extend_from_slice(&height.to_le_bytes());
         input_data.extend_from_slice(&payload);
@@ -126,6 +150,7 @@ impl TertiaryRuntime {
                 )
             },
             secondary_storages: secondary_storages.clone(),
+            config_data: config_data.clone(),
             had_failure: false,
             completed: false,
             memory: None,
@@ -318,6 +343,31 @@ impl TertiaryRuntime {
             closures.push(TertiaryClosureHandle::from_closure(closure));
         }
 
+        // __host_config_len() -> i32
+        {
+            let s = state.clone();
+            let closure = Closure::wrap(Box::new(move || -> i32 {
+                s.borrow().config_data.len() as i32
+            }) as Box<dyn Fn() -> i32>);
+            Reflect::set(&env, &"__host_config_len".into(), closure.as_ref())?;
+            closures.push(TertiaryClosureHandle::from_closure(closure));
+        }
+
+        // __load_config(ptr: i32)
+        {
+            let s = state.clone();
+            let closure = Closure::wrap(Box::new(move |ptr: i32| {
+                let st = s.borrow();
+                let memory = match st.memory.as_ref() {
+                    Some(m) => m,
+                    None => return,
+                };
+                write_to_memory(memory, ptr as u32, &st.config_data);
+            }) as Box<dyn Fn(i32)>);
+            Reflect::set(&env, &"__load_config".into(), closure.as_ref())?;
+            closures.push(TertiaryClosureHandle::from_closure(closure));
+        }
+
         // __flush(data_ptr: i32)
         {
             let s = state.clone();
@@ -401,6 +451,8 @@ struct TertiaryHostState {
     own_storage_ref: *const dyn IndexerStorageReader,
     /// Named secondary indexer storages (read-only).
     secondary_storages: HashMap<String, *const dyn IndexerStorageReader>,
+    /// Runtime-provided configuration (JSON bytes).
+    config_data: Vec<u8>,
     had_failure: bool,
     completed: bool,
     memory: Option<WebAssembly::Memory>,

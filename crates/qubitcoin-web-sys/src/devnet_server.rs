@@ -128,6 +128,19 @@ impl DevnetServer {
     /// Tertiary indexers run after all secondary indexers and can read their state.
     #[wasm_bindgen(js_name = "addTertiary")]
     pub fn add_tertiary(&self, label: &str, wasm_bytes: &[u8]) -> Result<(), JsValue> {
+        self.add_tertiary_with_config(label, wasm_bytes, &[])
+    }
+
+    /// Add a tertiary indexer WASM module with runtime configuration.
+    ///
+    /// Config is passed to the WASM via `__host_config_len()` / `__load_config()`.
+    #[wasm_bindgen(js_name = "addTertiaryWithConfig")]
+    pub fn add_tertiary_with_config(
+        &self,
+        label: &str,
+        wasm_bytes: &[u8],
+        config: &[u8],
+    ) -> Result<(), JsValue> {
         let runtime = TertiaryRuntime::new(wasm_bytes)?;
         let mut state = self.state.borrow_mut();
         let storage = state.create_storage();
@@ -136,6 +149,7 @@ impl DevnetServer {
                 label: label.to_string(),
                 runtime,
                 storage,
+                config: config.to_vec(),
             },
         );
         Ok(())

@@ -107,6 +107,8 @@ pub struct TertiaryIndexerInstance {
     pub label: String,
     pub runtime: TertiaryRuntime,
     pub storage: Box<dyn IndexerStorage>,
+    /// Runtime-provided configuration (JSON bytes) passed to host functions.
+    pub config: Vec<u8>,
 }
 
 /// Shared devnet state accessible by all backends via Rc<RefCell<...>>.
@@ -246,9 +248,10 @@ impl DevnetState {
             let secondary_storages = self.build_secondary_storage_map();
             for tertiary in &mut self.tertiary_indexers {
                 let t_height = tertiary.storage.tip_height();
-                let pairs = tertiary.runtime.run_block(
+                let pairs = tertiary.runtime.run_block_with_config(
                     t_height, block_bytes.to_vec(),
                     tertiary.storage.as_ref(), &secondary_storages,
+                    tertiary.config.clone(),
                 ).map_err(|e| anyhow::anyhow!("tertiary '{}' index: {:?}", tertiary.label, e))?;
                 for (key, value) in &pairs {
                     tertiary.storage.put(key, value)
@@ -297,9 +300,10 @@ impl DevnetState {
         let tertiary = self.tertiary_indexers.iter().find(|t| t.label == label)?;
         let secondary_storages = self.build_secondary_storage_map();
         Some(
-            tertiary.runtime.call_view(
+            tertiary.runtime.call_view_with_config(
                 fn_name, height, payload,
                 tertiary.storage.as_ref(), &secondary_storages,
+                tertiary.config.clone(),
             ).map_err(|e| anyhow::anyhow!("tertiary '{}' view '{}': {:?}", label, fn_name, e))
         )
     }
