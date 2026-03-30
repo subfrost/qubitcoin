@@ -517,6 +517,17 @@ async fn main() {
             .expect("failed to load genesis block");
         chainstate.flush_coins(coins_db.as_ref());
 
+        // Write genesis block to disk so getblock(hash, 0) works.
+        let genesis_hash = genesis.header.block_hash();
+        if let Ok(pos) = block_files.write_block(&genesis, magic_bytes) {
+            if let Some(arena_idx) = chainstate.lookup_block_index(&genesis_hash) {
+                let idx = chainstate.block_index_mut().get_mut(arena_idx);
+                idx.file = pos.file;
+                idx.data_pos = pos.pos;
+                chainstate.mark_dirty(arena_idx);
+            }
+        }
+
         // Persist genesis block index.
         let dirty = chainstate.dirty_block_indices();
         let refs: Vec<&qubitcoin_common::chain::BlockIndex> = dirty.into_iter().collect();
@@ -1025,18 +1036,19 @@ async fn main() {
                     Err(e) => return RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, format!("write: {}", e)),
                 };
 
-                // Update block index with file position.
-                if let Some(arena_idx) = cs.lookup_block_index(&block_hash) {
-                    let idx = cs.block_index_mut().get_mut(arena_idx);
-                    idx.file = pos.file;
-                    idx.data_pos = pos.pos;
-                    cs.mark_dirty(arena_idx);
-                }
-
                 // Process through chainstate (validates + connects).
+                // This must happen BEFORE updating data_pos because process_new_block
+                // creates the block index entry via accept_block_header.
                 tracing::info!(height = height, time = time, prev_hash = %prev_hash.to_hex(), "mining block");
                 match cs.process_new_block(&block) {
                     Ok((true, undo)) => {
+                        // Update block index with file position AFTER the entry exists.
+                        if let Some(arena_idx) = cs.lookup_block_index(&block_hash) {
+                            let idx = cs.block_index_mut().get_mut(arena_idx);
+                            idx.file = pos.file;
+                            idx.data_pos = pos.pos;
+                            cs.mark_dirty(arena_idx);
+                        }
                         // Write undo data.
                         if let Some(undo_data) = undo {
                             if let Ok(undo_pos) = bf_gen.write_undo(pos.file, &undo_data) {

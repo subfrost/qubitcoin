@@ -619,7 +619,16 @@ impl IndexerManager {
         F: Fn(u32) -> Option<Vec<u8>>,
     {
         let indexer_height = inst.tip_height.load(Ordering::Relaxed);
-        let effective_start = std::cmp::max(indexer_height + 1, inst.start_height);
+        // Distinguish "never processed" (height=0, no data) from
+        // "processed up to height 0" (height=0, has data).
+        // If tip_height is 0 and storage has no tip key, start from start_height.
+        let has_processed = inst.storage.tip_height() > 0
+            || inst.storage.get(crate::state::HEIGHT_KEY).is_some();
+        let effective_start = if has_processed {
+            indexer_height + 1
+        } else {
+            inst.start_height
+        };
         if effective_start > chain_height {
             return;
         }
@@ -710,16 +719,25 @@ fn run_indexer_block(inst: &IndexerInstance, height: u32, input: &[u8]) {
                 }
             }
 
-            // Write all key-value pairs + tip height + per-height keyset
-            // in a single atomic WriteBatch.
-            if let Err(e) = inst.storage.append_batch(&pairs, height) {
-                tracing::error!(
-                    indexer = %inst.label,
-                    height = height,
-                    error = %e,
-                    "failed to write indexer batch"
-                );
-                return;
+            // Write raw pairs + tip height. The pairs from __flush are already
+            // in the final storage format (metashrew's length_key/index_key
+            // entries are produced by the WASM itself). Do NOT use append_batch
+            // which would double-wrap them.
+            {
+                let mut batch = rocksdb::WriteBatch::default();
+                for (k, v) in &pairs {
+                    batch.put(k, v);
+                }
+                batch.put(crate::state::HEIGHT_KEY, &height.to_le_bytes());
+                if let Err(e) = inst.storage.write_raw_batch(batch) {
+                    tracing::error!(
+                        indexer = %inst.label,
+                        height = height,
+                        error = %e,
+                        "failed to write indexer batch"
+                    );
+                    return;
+                }
             }
             inst.tip_height.store(height, Ordering::Relaxed);
 

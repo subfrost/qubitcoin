@@ -6,6 +6,7 @@
 
 use crate::storage::IndexerStorage;
 use prost::Message;
+use std::collections::HashMap;
 use std::sync::Arc;
 use wasmtime::*;
 
@@ -24,6 +25,10 @@ pub struct WasmState {
     pub label: String,
     pub view_mode: bool,
     pub limits: StoreLimits,
+    /// Write-through cache: __flush writes are staged here so subsequent
+    /// __get/__get_len calls within the same _start() can read them back.
+    /// Matches qubitcoin-indexer-web's write_cache behavior.
+    pub write_cache: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 /// Build the deterministic engine config matching metashrew-runtime.
@@ -40,6 +45,9 @@ fn base_config() -> Config {
     // CoW memory init: reuse OS-level copy-on-write pages instead of
     // zeroing memory for each new instance. Eliminates ~12% CPU from
     // page fault handling (clear_page_erms, do_anonymous_page).
+    // Must match metashrew-runtime: false ensures deterministic memory
+    // initialization. With true, stale memory pages from previous
+    // instances can leak, causing non-deterministic WASM execution.
     config.memory_init_cow(true);
     config
 }
@@ -63,6 +71,7 @@ fn new_state(
             .tables(usize::MAX)
             .instances(usize::MAX)
             .build(),
+        write_cache: HashMap::new(),
     }
 }
 
@@ -295,7 +304,11 @@ fn link_host_functions_sync(linker: &mut Linker<WasmState>) -> Result<(), String
                     Ok(k) => k,
                     Err(_) => return 0,
                 };
-                match caller.data().storage.get_latest(&key) {
+                // Check write_cache first (same-block __flush writes)
+                if let Some(v) = caller.data().write_cache.get(&key) {
+                    return v.len() as i32;
+                }
+                match caller.data().storage.get(&key) {
                     Some(v) => v.len() as i32,
                     None => 0,
                 }
@@ -313,7 +326,14 @@ fn link_host_functions_sync(linker: &mut Linker<WasmState>) -> Result<(), String
                     Ok(k) => k,
                     Err(_) => return,
                 };
-                if let Some(value) = caller.data().storage.get_latest(&key) {
+                // Check write_cache first (same-block __flush writes)
+                let value = caller
+                    .data()
+                    .write_cache
+                    .get(&key)
+                    .cloned()
+                    .or_else(|| caller.data().storage.get(&key));
+                if let Some(value) = value {
                     memory.write(&mut caller, value_ptr as usize, &value).ok();
                 }
             },
@@ -395,7 +415,10 @@ fn link_host_functions_async(linker: &mut Linker<WasmState>) -> Result<(), Strin
                         Ok(k) => k,
                         Err(_) => return 0i32,
                     };
-                    match caller.data().storage.get_latest(&key) {
+                    if let Some(v) = caller.data().write_cache.get(&key) {
+                        return v.len() as i32;
+                    }
+                    match caller.data().storage.get(&key) {
                         Some(v) => v.len() as i32,
                         None => 0,
                     }
@@ -415,7 +438,13 @@ fn link_host_functions_async(linker: &mut Linker<WasmState>) -> Result<(), Strin
                         Ok(k) => k,
                         Err(_) => return,
                     };
-                    if let Some(value) = caller.data().storage.get_latest(&key) {
+                    let value = caller
+                        .data()
+                        .write_cache
+                        .get(&key)
+                        .cloned()
+                        .or_else(|| caller.data().storage.get(&key));
+                    if let Some(value) = value {
                         memory
                             .write(&mut caller, value_ptr as usize, &value)
                             .expect("FATAL: __get memory write failed");
@@ -496,7 +525,23 @@ fn flush_handler(caller: &mut Caller<'_, WasmState>, data_ptr: i32) {
         i += 2;
     }
 
-    caller.data_mut().pending_flush = Some(pairs);
+    // Stage flush writes in write_cache so subsequent __get/__get_len
+    // calls within the same _start() can read them back. This matches
+    // qubitcoin-indexer-web's write_cache behavior.
+    for (k, v) in &pairs {
+        caller.data_mut().write_cache.insert(k.clone(), v.clone());
+    }
+
+    // Do NOT write to RocksDB here — matching qubitcoin-indexer-web which
+    // says "storage is not modified (the caller applies pending_flush)".
+    // The write_cache handles same-block read-after-write visibility.
+    // The caller (run_indexer_block) writes to storage after _start() returns.
+
+    // Accumulate pairs across multiple __flush calls within a single _start().
+    match caller.data_mut().pending_flush.as_mut() {
+        Some(existing) => existing.extend(pairs),
+        None => caller.data_mut().pending_flush = Some(pairs),
+    }
     caller.data_mut().completed = true;
 }
 
@@ -697,4 +742,175 @@ mod tests {
             assert_eq!(len as usize, size);
         }
     }
+
+    /// Test the real alkanes WASM against a regtest genesis block.
+        ///
+        /// This catches storage format mismatches between qubitcoind's
+        /// append_batch/get_latest and metashrew-runtime's SMT-backed store.
+        ///
+        /// The alkanes WASM processes the genesis block and calls __flush
+        /// with KV pairs. We write them via append_batch and read them back
+        /// via get_latest to verify round-trip correctness.
+        #[test]
+        fn test_alkanes_wasm_genesis_roundtrip() {
+            let wasm_path = std::path::PathBuf::from(
+                std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".into()),
+            )
+            .join(".local/qubitcoin/indexers/alkanes/program.wasm");
+
+            if !wasm_path.exists() {
+                eprintln!("Skipping test: alkanes WASM not found at {:?}", wasm_path);
+                return;
+            }
+
+            let wasm_bytes = std::fs::read(&wasm_path).unwrap();
+            let runtime = WasmIndexerRuntime::new(&wasm_bytes).unwrap();
+            let (storage, _dir) = temp_storage();
+
+            // Build a minimal regtest genesis block.
+            // The alkanes indexer processes the raw block bytes prefixed with height.
+            // For the genesis block: height=0, block=regtest genesis hex.
+            let genesis_hex = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4adae5494dffff7f20020000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a0100000043410496b538e853519c726a2c91e61ec11600ae1390813a627c66fb8be7947be63c52da7589379515d4e0a604f8141781e62294721166bf621e73a82cbf2342c858eeac00000000";
+            let genesis_bytes: Vec<u8> = (0..genesis_hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&genesis_hex[i..i + 2], 16).unwrap())
+                .collect();
+
+            let height: u32 = 0;
+            let mut input = Vec::with_capacity(4 + genesis_bytes.len());
+            input.extend_from_slice(&height.to_le_bytes());
+            input.extend_from_slice(&genesis_bytes);
+
+            // Process block 0
+            let pairs = runtime
+                .run_block(input, Arc::clone(&storage), "alkanes")
+                .expect("failed to process genesis block");
+
+            assert!(!pairs.is_empty(), "genesis block should produce KV pairs");
+            eprintln!("Genesis block produced {} KV pairs", pairs.len());
+
+            // Write via append_batch (simulates run_indexer_block)
+            storage
+                .append_batch(&pairs, height)
+                .expect("append_batch failed");
+
+            // Read back every key via get_latest and verify round-trip
+            let mut mismatches = 0;
+            for (key, expected_value) in &pairs {
+                match storage.get_latest(key) {
+                    Some(actual_value) => {
+                        if actual_value != *expected_value {
+                            mismatches += 1;
+                            if mismatches <= 3 {
+                                eprintln!(
+                                    "MISMATCH key={} expected_len={} actual_len={}",
+                                    String::from_utf8_lossy(&key[..key.len().min(40)]),
+                                    expected_value.len(),
+                                    actual_value.len()
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        mismatches += 1;
+                        if mismatches <= 3 {
+                            eprintln!(
+                                "MISSING key={} ({} bytes)",
+                                String::from_utf8_lossy(&key[..key.len().min(40)]),
+                                key.len()
+                            );
+                        }
+                    }
+                }
+            }
+
+            assert_eq!(
+                mismatches, 0,
+                "{} of {} keys failed round-trip through append_batch/get_latest",
+                mismatches,
+                pairs.len()
+            );
+
+            // Also verify tip_height was set
+            assert_eq!(storage.tip_height(), 0, "tip should be 0 after genesis");
+
+            // Now process a second empty block (height 1).
+            // Build a minimal valid regtest block with only a coinbase.
+            // Use height=1 and prev_hash from genesis.
+            let height1: u32 = 1;
+            let mut input1 = Vec::with_capacity(4 + genesis_bytes.len());
+            input1.extend_from_slice(&height1.to_le_bytes());
+            // Reuse genesis bytes (the WASM will process it as height 1)
+            input1.extend_from_slice(&genesis_bytes);
+
+            let pairs1 = runtime
+                .run_block(input1, Arc::clone(&storage), "alkanes")
+                .expect("failed to process block 1");
+
+            eprintln!("Block 1 produced {} KV pairs", pairs1.len());
+
+            storage
+                .append_batch(&pairs1, height1)
+                .expect("append_batch block 1 failed");
+
+            // Verify all block 1 pairs round-trip
+            let mut mismatches1 = 0;
+            for (key, expected_value) in &pairs1 {
+                match storage.get_latest(key) {
+                    Some(actual_value) => {
+                        if actual_value != *expected_value {
+                            mismatches1 += 1;
+                            if mismatches1 <= 3 {
+                                eprintln!(
+                                    "MISMATCH blk1 key={} expected_len={} actual_len={}",
+                                    String::from_utf8_lossy(&key[..key.len().min(40)]),
+                                    expected_value.len(),
+                                    actual_value.len()
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        mismatches1 += 1;
+                        if mismatches1 <= 3 {
+                            eprintln!(
+                                "MISSING blk1 key={}",
+                                String::from_utf8_lossy(&key[..key.len().min(40)])
+                            );
+                        }
+                    }
+                }
+            }
+
+            assert_eq!(
+                mismatches1, 0,
+                "Block 1: {} of {} keys failed round-trip",
+                mismatches1,
+                pairs1.len()
+            );
+
+            // CRITICAL: verify block 0 keys are still readable after block 1
+            let mut stale0 = 0;
+            for (key, _) in &pairs {
+                if storage.get_latest(key).is_none() {
+                    stale0 += 1;
+                    if stale0 <= 3 {
+                        eprintln!(
+                            "STALE blk0 key={}",
+                            String::from_utf8_lossy(&key[..key.len().min(40)])
+                        );
+                    }
+                }
+            }
+
+            assert_eq!(
+                stale0, 0,
+                "Block 0: {} of {} keys became unreadable after block 1",
+                stale0,
+                pairs.len()
+            );
+
+            assert_eq!(storage.tip_height(), 1, "tip should be 1 after block 1");
+            eprintln!("All blocks verified: {} + {} pairs", pairs.len(), pairs1.len());
+        }
 }

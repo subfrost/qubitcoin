@@ -172,6 +172,7 @@ impl BlockFileManager {
             ));
         }
         let path = self.block_file_path(pos.file);
+        eprintln!("[read_block] file={}, pos={}, path={}", pos.file, pos.pos, path.display());
         let mut file = File::open(&path)?;
         file.seek(SeekFrom::Start(pos.pos as u64))?;
 
