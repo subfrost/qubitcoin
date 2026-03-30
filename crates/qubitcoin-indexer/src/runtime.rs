@@ -101,8 +101,11 @@ pub struct WasmIndexerRuntime {
 impl WasmIndexerRuntime {
     /// Compile a WASM module from bytes.
     pub fn new(wasm_bytes: &[u8]) -> Result<Self, String> {
-        // Sync engine for block processing.
-        let config = base_config();
+        // Async engine for block processing (matching metashrew/rockshrew).
+        // async_support is required because the host functions use
+        // func_wrap_async and _start is called with call_async.
+        let mut config = base_config();
+        config.async_support(true);
         let engine = Engine::new(&config).map_err(|e| format!("wasmtime engine: {}", e))?;
         let module =
             Module::new(&engine, wasm_bytes).map_err(|e| format!("wasmtime compile: {}", e))?;
@@ -124,9 +127,11 @@ impl WasmIndexerRuntime {
         })
     }
 
-    /// Run `_start()` synchronously for block processing.
+    /// Run `_start()` for block processing using async execution.
     ///
-    /// Called from rayon threads. Uses the sync engine.
+    /// Uses call_async matching metashrew-runtime's execution model.
+    /// This is critical because the alkanes WASM's embedded wasmi interpreter
+    /// needs the async fiber stack for deeply recursive extcall operations.
     pub fn run_block(
         &self,
         input_data: Vec<u8>,
@@ -137,16 +142,28 @@ impl WasmIndexerRuntime {
         let mut store = Store::new(&self.engine, state);
         store.limiter(|s| &mut s.limits);
 
-        let instance = self.instantiate_sync(&mut store)?;
+        // Use async instantiation + execution (matching metashrew).
+        let instance = self.instantiate_async_block(&mut store)?;
         prepare_memory(&instance, &mut store);
 
         let start_fn = instance
             .get_typed_func::<(), ()>(&mut store, "_start")
             .map_err(|e| format!("missing _start: {}", e))?;
 
-        start_fn
-            .call(&mut store, ())
-            .map_err(|e| format!("_start failed: {}", e))?;
+        // Use call_async via a one-shot tokio runtime.
+        // The async fiber gives the WASM more stack space for
+        // deeply nested extcalls.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("tokio runtime: {}", e))?;
+
+        rt.block_on(async {
+            start_fn
+                .call_async(&mut store, ())
+                .await
+                .map_err(|e| format!("_start failed: {}", e))
+        })?;
 
         let state = store.into_data();
         if state.had_failure {
@@ -252,6 +269,28 @@ impl WasmIndexerRuntime {
         linker
             .instantiate(&mut *store, &self.module)
             .map_err(|e| format!("wasmtime instantiate: {}", e))
+    }
+
+    /// Link async host functions and instantiate for block processing.
+    /// Uses the same engine (with async_support) as block processing.
+    fn instantiate_async_block(&self, store: &mut Store<WasmState>) -> Result<Instance, String> {
+        let mut linker = Linker::new(&self.engine);
+        link_host_functions_async(&mut linker)?;
+        linker
+            .define_unknown_imports_as_traps(&self.module)
+            .map_err(|e| format!("define unknown imports: {}", e))?;
+        // Use blocking instantiate since we're in a sync context
+        // (the async comes from call_async on _start)
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("tokio runtime: {}", e))?;
+        rt.block_on(async {
+            linker
+                .instantiate_async(&mut *store, &self.module)
+                .await
+                .map_err(|e| format!("wasmtime instantiate_async: {}", e))
+        })
     }
 
     /// Link host functions and instantiate asynchronously.
