@@ -517,6 +517,101 @@ impl BitcoinBackend for DevnetBitcoinBackend {
                     id,
                 ))
             }
+            "testmempoolaccept" => {
+                // In devnet mode, all valid transactions are accepted.
+                // Parse the array of raw tx hexes and validate each.
+                let tx_hexes = params.get(0)
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let mut results = Vec::new();
+                for hex_val in &tx_hexes {
+                    let hex_tx = hex_val.as_str().unwrap_or("");
+                    match hex::decode(hex_tx) {
+                        Ok(tx_bytes) => {
+                            match types::tx_from_bytes(&tx_bytes) {
+                                Ok(tx) => {
+                                    results.push(json!({
+                                        "txid": tx.txid().to_hex(),
+                                        "allowed": true,
+                                        "vsize": tx_bytes.len(),
+                                        "fees": { "base": 0.0 }
+                                    }));
+                                }
+                                Err(e) => {
+                                    results.push(json!({
+                                        "txid": "",
+                                        "allowed": false,
+                                        "reject-reason": format!("invalid tx: {:?}", e)
+                                    }));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            results.push(json!({
+                                "txid": "",
+                                "allowed": false,
+                                "reject-reason": format!("invalid hex: {}", e)
+                            }));
+                        }
+                    }
+                }
+                Ok(JsonRpcResponse::success(json!(results), id))
+            }
+            "getmempoolentry" => {
+                // Devnet mines transactions immediately, so the mempool is
+                // always empty. Return a not-found error matching bitcoind.
+                let _txid = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
+                Ok(JsonRpcResponse::error(
+                    INTERNAL_ERROR,
+                    "Transaction not in mempool".to_string(),
+                    id,
+                ))
+            }
+            "getmempoolinfo" => {
+                // Return a minimal mempool info (always empty in devnet)
+                Ok(JsonRpcResponse::success(json!({
+                    "loaded": true,
+                    "size": 0,
+                    "bytes": 0,
+                    "usage": 0,
+                    "total_fee": 0.0,
+                    "maxmempool": 300000000,
+                    "mempoolminfee": 0.00001000,
+                    "minrelaytxfee": 0.00001000,
+                    "incrementalrelayfee": 0.00001000,
+                    "unbroadcastcount": 0,
+                    "fullrbf": false,
+                }), id))
+            }
+            "getrawmempool" => {
+                // Devnet mines immediately — mempool is always empty
+                Ok(JsonRpcResponse::success(json!([]), id))
+            }
+            "gettxout" => {
+                let txid_hex = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
+                let vout = params.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let state = self.state.borrow();
+                for block in (0..=state.chain.height()).filter_map(|h| state.chain.block_at(h)) {
+                    for tx in &block.vtx {
+                        if tx.txid().to_hex() == txid_hex {
+                            if let Some(txout) = tx.vout.get(vout) {
+                                return Ok(JsonRpcResponse::success(json!({
+                                    "bestblock": state.chain.tip_hash().to_hex(),
+                                    "confirmations": 1,
+                                    "value": txout.value.to_sat() as f64 / 100_000_000.0,
+                                    "scriptPubKey": {
+                                        "hex": hex::encode(txout.script_pubkey.as_bytes()),
+                                    },
+                                    "coinbase": tx.vin.first().map_or(false, |i| i.prevout.is_null()),
+                                }), id));
+                            }
+                        }
+                    }
+                }
+                // UTXO not found or already spent — return null (matches bitcoind)
+                Ok(JsonRpcResponse::success(json!(null), id))
+            }
             _ => Ok(JsonRpcResponse::error(
                 METHOD_NOT_FOUND,
                 format!("Bitcoin method not supported in devnet: {}", method),
