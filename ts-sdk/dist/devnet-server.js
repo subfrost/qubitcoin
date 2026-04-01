@@ -224,6 +224,44 @@ export class DevnetTestHarness {
             this.originalFetch = null;
         }
     }
+    // -- Snapshot / Restore ----------------------------------------------------
+    /**
+     * Export the full devnet state to a binary blob.
+     *
+     * Captures chain (all blocks), alkanes indexer, esplora indexer, and all
+     * tertiary indexer states. The blob can be passed to `importState()` to
+     * restore the devnet to this exact point.
+     *
+     * Use this for test isolation: snapshot after expensive setup (mining,
+     * contract deployment), then restore before each test for a clean baseline.
+     *
+     * @example
+     * ```ts
+     * // Expensive setup once
+     * harness.mineBlocks(201);
+     * deployContracts(harness);
+     * const snapshot = harness.exportState();
+     *
+     * // Fast restore before each test
+     * beforeEach(() => harness.importState(snapshot));
+     * ```
+     */
+    exportState() {
+        return this.server.exportState();
+    }
+    /**
+     * Restore the devnet from a previously exported state blob.
+     *
+     * Replaces all chain data, alkanes/esplora indexer state, and tertiary
+     * indexer state with the contents of the blob. The coinbase key must
+     * match the one used when the snapshot was taken (same mnemonic).
+     *
+     * After import, `height`, `indexerHeight`, and `tipHashHex` reflect
+     * the restored state. New `mineBlocks()` calls continue from there.
+     */
+    importState(data) {
+        this.server.importState(data);
+    }
     /** Clean up: restore fetch and free WASM resources. */
     dispose() {
         this.restoreFetch();

@@ -38,6 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
     curl \
+    gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Create qubitcoin user
@@ -58,7 +59,6 @@ EXPOSE 8333 8332 28332
 
 VOLUME /home/qubitcoin/.qubitcoin
 
-USER qubitcoin
 WORKDIR /home/qubitcoin
 
 ENTRYPOINT ["docker-entrypoint.sh"]

@@ -1525,6 +1525,117 @@ fn register_live_rpcs(
         }
     });
 
+    // -- scantxoutset -------------------------------------------------------
+    // Scans the UTXO set for outputs matching the given descriptors.
+    // Supports: rawtr(<xonly_hex>), raw(<script_hex>), addr(<address>)
+    // Bitcoin Core compatible: scantxoutset "start" [descriptors...]
+    let cs_scan = chainstate.clone();
+    let coins_db_scan = coins_db.clone();
+    registry.register("scantxoutset", move |req: &RpcRequest| {
+        let params = match req.params.as_ref() {
+            Some(p) => p,
+            None => {
+                return RpcResponse::error(
+                    req.id.clone(),
+                    RPC_INVALID_PARAMS,
+                    "Missing parameters".into(),
+                )
+            }
+        };
+
+        // params[0] = "start" (action), params[1] = array of descriptors
+        let descriptors = match params.get(1).and_then(|v| v.as_array()) {
+            Some(d) => d,
+            None => {
+                return RpcResponse::error(
+                    req.id.clone(),
+                    RPC_INVALID_PARAMS,
+                    "Missing descriptors array".into(),
+                )
+            }
+        };
+
+        // Parse descriptors to extract target script patterns
+        let mut target_scripts: Vec<(String, Vec<u8>)> = Vec::new();
+        for desc_val in descriptors {
+            let desc = match desc_val.as_str() {
+                Some(s) => s,
+                None => continue,
+            };
+
+            if let Some(inner) = desc.strip_prefix("rawtr(").and_then(|s| s.strip_suffix(')')) {
+                // rawtr(<32-byte-xonly-hex>) → P2TR scriptPubKey: OP_1 PUSH32 <key>
+                if let Ok(key_bytes) = hex_to_bytes(inner).ok_or(()) {
+                    if key_bytes.len() == 32 {
+                        let mut script = vec![0x51, 0x20]; // OP_1 PUSH32
+                        script.extend_from_slice(&key_bytes);
+                        target_scripts.push((desc.to_string(), script));
+                    }
+                }
+            } else if let Some(inner) = desc.strip_prefix("raw(").and_then(|s| s.strip_suffix(')')) {
+                // raw(<script_hex>) → literal scriptPubKey
+                if let Ok(script) = hex_to_bytes(inner).ok_or(()) {
+                    target_scripts.push((desc.to_string(), script));
+                }
+            } else if let Some(inner) = desc.strip_prefix("addr(").and_then(|s| s.strip_suffix(')')) {
+                // addr(<address>) → decode address to scriptPubKey
+                // For bech32/bech32m addresses, decode the witness program
+                if let Some(script) = decode_address_to_script(inner) {
+                    target_scripts.push((desc.to_string(), script));
+                }
+            }
+        }
+
+        if target_scripts.is_empty() {
+            return RpcResponse::success(
+                req.id.clone(),
+                serde_json::json!({
+                    "success": true,
+                    "searched_items": 0,
+                    "unspents": [],
+                    "total_amount": 0.0,
+                }),
+            );
+        }
+
+        // Scan the UTXO set (from disk, not just cache)
+        let cs = cs_scan.lock();
+        let mut results: Vec<serde_json::Value> = Vec::new();
+        let mut total_amount: f64 = 0.0;
+        let height = cs.height();
+
+        // Iterate all coins in the database (full UTXO set)
+        for (outpoint, coin) in coins_db_scan.iter_all_coins() {
+            let script_bytes = coin.tx_out.script_pubkey.as_bytes();
+            for (desc, target) in &target_scripts {
+                if script_bytes == target.as_slice() {
+                    let amount = coin.tx_out.value.to_sat() as f64 / 100_000_000.0;
+                    total_amount += amount;
+                    results.push(serde_json::json!({
+                        "txid": outpoint.hash.to_hex(),
+                        "vout": outpoint.n,
+                        "scriptPubKey": script_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+                        "desc": desc,
+                        "amount": amount,
+                        "coinbase": coin.coinbase,
+                        "height": coin.height,
+                    }));
+                    break;
+                }
+            }
+        }
+
+        RpcResponse::success(
+            req.id.clone(),
+            serde_json::json!({
+                "success": true,
+                "searched_items": target_scripts.len(),
+                "unspents": results,
+                "total_amount": total_amount,
+            }),
+        )
+    });
+
     // -- sendrawtransaction -------------------------------------------------
     let mp = mempool.clone();
     let cs2 = chainstate.clone();
@@ -2018,6 +2129,70 @@ fn register_wallet_rpcs(
             }
         }
     });
+}
+
+/// Simple hex string to bytes decoder.
+fn hex_to_bytes(hex: &str) -> Option<Vec<u8>> {
+    let hex = hex.strip_prefix("0x").unwrap_or(hex);
+    if hex.len() % 2 != 0 { return None; }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// Decode a bech32/bech32m address to a scriptPubKey.
+/// Supports segwit v0 (bech32) and v1+ (bech32m) including P2TR.
+fn decode_address_to_script(address: &str) -> Option<Vec<u8>> {
+    // Simple bech32/bech32m decoder for qc1/bcrt1/tb1/bc1 addresses
+    let addr = address.to_lowercase();
+
+    // Find the separator '1' (last occurrence)
+    let sep_pos = addr.rfind('1')?;
+    let data_part = &addr[sep_pos + 1..];
+
+    if data_part.len() < 7 {
+        return None;
+    }
+
+    // Bech32 charset decoding
+    const CHARSET: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    let mut data5: Vec<u8> = Vec::new();
+    for c in data_part.chars() {
+        let idx = CHARSET.find(c)? as u8;
+        data5.push(idx);
+    }
+
+    // Remove the 6-character checksum
+    if data5.len() < 7 {
+        return None;
+    }
+    let data5 = &data5[..data5.len() - 6];
+
+    // First 5-bit value is the witness version
+    let witness_version = data5[0];
+    if witness_version > 16 {
+        return None;
+    }
+
+    // Convert remaining 5-bit groups to 8-bit
+    let mut witness_program = Vec::new();
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for &val in &data5[1..] {
+        acc = (acc << 5) | val as u32;
+        bits += 5;
+        while bits >= 8 {
+            bits -= 8;
+            witness_program.push((acc >> bits) as u8);
+        }
+    }
+
+    // Build scriptPubKey: OP_N <push> <witness_program>
+    let op_n = if witness_version == 0 { 0x00 } else { 0x50 + witness_version };
+    let mut script = vec![op_n, witness_program.len() as u8];
+    script.extend_from_slice(&witness_program);
+    Some(script)
 }
 
 fn print_usage() {

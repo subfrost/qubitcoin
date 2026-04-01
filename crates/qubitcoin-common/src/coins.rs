@@ -15,7 +15,7 @@ use qubitcoin_consensus::{OutPoint, Transaction, TxOut};
 use qubitcoin_primitives::{Amount, BlockHash};
 use qubitcoin_script::Script;
 use qubitcoin_serialize::{read_varint, write_varint, Decodable, Encodable, Error as SerError};
-use qubitcoin_storage::{Database, DbWrapper};
+use qubitcoin_storage::{Database, DbIterator, DbWrapper};
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -610,6 +610,24 @@ impl CoinsViewCache {
         self.cache.read().len()
     }
 
+    /// Iterate over all non-spent coins in the cache.
+    ///
+    /// Returns a snapshot of (OutPoint, Coin) pairs. Spent coins (with
+    /// negative value sentinel) are excluded. This is used by scantxoutset.
+    pub fn iter_coins(&self) -> Vec<(OutPoint, Coin)> {
+        self.cache
+            .read()
+            .iter()
+            .filter_map(|(outpoint, entry)| {
+                // Skip spent entries
+                if entry.coin.tx_out.value.to_sat() < 0 {
+                    return None;
+                }
+                Some((outpoint.clone(), entry.coin.clone()))
+            })
+            .collect()
+    }
+
     /// Get the approximate dynamic memory usage of cached coins.
     pub fn dynamic_memory_usage(&self) -> u64 {
         self.usage.load(Ordering::Relaxed)
@@ -1081,6 +1099,32 @@ impl<D: Database> CoinsViewDB<D> {
     pub fn raw_key_exists(&self, outpoint: &OutPoint) -> bool {
         let key = coin_db_key(outpoint);
         self.db.exists(&key).unwrap_or(false)
+    }
+
+    /// Iterate all coins in the database.
+    ///
+    /// This scans the entire UTXO set on disk by seeking to the first 'C' key
+    /// and iterating until the prefix changes. Used by `scantxoutset`.
+    pub fn iter_all_coins(&self) -> Vec<(OutPoint, Coin)> {
+        let mut results = Vec::new();
+        let raw_db = self.db.inner();
+        let mut iter = raw_db.new_iterator();
+        iter.seek(&[DB_COIN]);
+        while iter.valid() {
+            let key = iter.key();
+            if key.is_empty() || key[0] != DB_COIN {
+                break;
+            }
+            // Parse the outpoint from key[1..]
+            if let Ok(outpoint) = OutPoint::decode(&mut std::io::Cursor::new(&key[1..])) {
+                // Deserialize coin from the raw value (handling obfuscation via DbWrapper)
+                if let Ok(Some(coin)) = self.db.read::<_, Coin>(&key) {
+                    results.push((outpoint, coin));
+                }
+            }
+            iter.next();
+        }
+        results
     }
 
     /// Write the best block hash to the database.
