@@ -19,6 +19,13 @@ wasmtime = "18.0.4"
 prost = "0.12"
 sha2 = "0.10"
 toml = "0.8"
+# Metashrew runtime — the production WASM indexer engine.
+# Using the real metashrew crates ensures exact storage format
+# compatibility with the alkanes.wasm and other indexer modules.
+metashrew-runtime = { path = "../../../metashrew/crates/metashrew-runtime" }
+rockshrew-runtime = { path = "../../../metashrew/crates/rockshrew-runtime" }
+metashrew-sync = { path = "../../../metashrew/crates/metashrew-sync" }
+async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -24,6 +24,7 @@ members = [
     "crates/qubitcoin-support",
     "crates/qubitcoin-sys",
     "crates/qubitcoind",
+    "crates/qubitcoin-compat-jsonrpc",
 ]
 
 [workspace.package]

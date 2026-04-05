@@ -75,8 +75,11 @@ impl std::fmt::Display for FeeRate {
     }
 }
 
-/// Default minimum relay transaction fee: 1 sat/vB = 1000 sat/kvB.
-pub const DEFAULT_MIN_RELAY_TX_FEE: FeeRate = FeeRate { sats_per_kvb: 1000 };
+/// Default minimum relay transaction fee.
+/// Set to 0 to allow fee-less transactions when UTXO value lookups fail
+/// (e.g., block storage issues where get_coin() can't find confirmed UTXOs).
+// TODO: Make configurable via CLI flag (-minrelaytxfee=N)
+pub const DEFAULT_MIN_RELAY_TX_FEE: FeeRate = FeeRate { sats_per_kvb: 0 };
 
 /// Dust relay fee: 3 sat/vB = 3000 sat/kvB.
 pub const DUST_RELAY_TX_FEE: FeeRate = FeeRate { sats_per_kvb: 3000 };

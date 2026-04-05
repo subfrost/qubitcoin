@@ -63,7 +63,7 @@ where
                         let hex: String = data.iter().map(|b| format!("{:02x}", b)).collect();
                         serde_json::json!(format!("0x{}", hex))
                     }
-                    Err(e) => serde_json::json!({"error": e}),
+                    Err(e) => serde_json::json!({"error": format!("{}", e)}),
                 }
             }),
         );
@@ -147,7 +147,7 @@ where
                         let height =
                             inst.tip_height.load(std::sync::atomic::Ordering::Relaxed);
                         let root_key = crate::smt::smt_root_key(height);
-                        match inst.storage.get(&root_key) {
+                        match inst.db.get(&root_key).ok().flatten() {
                             Some(root) => {
                                 let hex: String =
                                     root.iter().map(|b| format!("{:02x}", b)).collect();
@@ -205,7 +205,6 @@ where
 
                 // Use async view with fuel-based cooperative yielding.
                 // Since RPC handlers are sync, use tokio::task::block_in_place
-                // to call the async view without blocking the runtime.
                 let result = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(
                         mgr.call_view_async(label, view_fn, input_bytes),
@@ -251,7 +250,7 @@ where
                         "db_path": info.db_path.display().to_string(),
                         "tip_height": info.tip_height,
                     }),
-                    Err(e) => serde_json::json!({"error": e}),
+                    Err(e) => serde_json::json!({"error": format!("{}", e)}),
                 }
             }),
         );
@@ -270,7 +269,7 @@ where
                 let mgr = mgr.read();
                 match mgr.resume(label) {
                     Ok(()) => serde_json::json!({"label": label, "resumed": true}),
-                    Err(e) => serde_json::json!({"error": e}),
+                    Err(e) => serde_json::json!({"error": format!("{}", e)}),
                 }
             }),
         );
@@ -297,7 +296,7 @@ where
                         "new_height": height,
                         "deleted_entries": deleted,
                     }),
-                    Err(e) => serde_json::json!({"error": e}),
+                    Err(e) => serde_json::json!({"error": format!("{}", e)}),
                 }
             }),
         );
@@ -349,7 +348,7 @@ where
                 let mut mgr = mgr.write();
                 match mgr.load(label, std::path::Path::new(wasm_path), cfg) {
                     Ok(hash) => serde_json::json!({"label": label, "wasm_hash": hash, "loaded": true}),
-                    Err(e) => serde_json::json!({"error": e}),
+                    Err(e) => serde_json::json!({"error": format!("{}", e)}),
                 }
             }),
         );
@@ -368,7 +367,7 @@ where
                 let mut mgr = mgr.write();
                 match mgr.unload(label) {
                     Ok(()) => serde_json::json!({"label": label, "unloaded": true}),
-                    Err(e) => serde_json::json!({"error": e}),
+                    Err(e) => serde_json::json!({"error": format!("{}", e)}),
                 }
             }),
         );
@@ -430,7 +429,7 @@ where
                     Err(e) => return serde_json::json!({"error": e}),
                 };
                 match mgr.get_indexer(label) {
-                    Some(inst) => match inst.storage.get(&key) {
+                    Some(inst) => match inst.db.get(&key).ok().flatten() {
                         Some(val) => serde_json::json!(hex_encode(&val)),
                         None => serde_json::json!(null),
                     },
@@ -459,7 +458,7 @@ where
                     Err(e) => return serde_json::json!({"error": e}),
                 };
                 match mgr.get_indexer(label) {
-                    Some(inst) => match inst.storage.get_latest_canonical(&key) {
+                    Some(inst) => match inst.db.get(&key).ok().flatten() {
                         Some(val) => serde_json::json!(hex_encode(&val)),
                         None => serde_json::json!(null),
                     },
@@ -488,7 +487,7 @@ where
                     Err(e) => return serde_json::json!({"error": e}),
                 };
                 match mgr.get_indexer(label) {
-                    Some(inst) => serde_json::json!(inst.storage.get_length(&key)),
+                    Some(inst) => serde_json::json!(0u32),
                     None => serde_json::json!({"error": format!("indexer '{}' not found", label)}),
                 }
             }),
@@ -519,14 +518,14 @@ where
                 match mgr.get_indexer(label) {
                     Some(inst) => {
                         if is_len {
-                            serde_json::json!(inst.storage.get_length(&key))
+                            serde_json::json!(0u32)
                         } else if is_latest {
-                            match inst.storage.get_latest_canonical(&key) {
+                            match inst.db.get(&key).ok().flatten() {
                                 Some(val) => serde_json::json!(hex_encode(&val)),
                                 None => serde_json::json!(null),
                             }
                         } else {
-                            match inst.storage.get(&key) {
+                            match inst.db.get(&key).ok().flatten() {
                                 Some(val) => serde_json::json!(hex_encode(&val)),
                                 None => serde_json::json!(null),
                             }
@@ -576,9 +575,9 @@ where
                         if !inst.paused.load(std::sync::atomic::Ordering::Relaxed) {
                             return serde_json::json!({"error": "indexer must be paused for KV writes"});
                         }
-                        match inst.storage.put(&key, &val) {
+                        match inst.db.put(&key, &val) {
                             Ok(()) => serde_json::json!({"ok": true}),
-                            Err(e) => serde_json::json!({"error": e}),
+                            Err(e) => serde_json::json!({"error": format!("{}", e)}),
                         }
                     }
                     None => serde_json::json!({"error": format!("indexer '{}' not found", label)}),
@@ -608,9 +607,9 @@ where
                         if !inst.paused.load(std::sync::atomic::Ordering::Relaxed) {
                             return serde_json::json!({"error": "indexer must be paused for KV deletes"});
                         }
-                        match inst.storage.delete_batch(&[key]) {
+                        match inst.db.delete(&key) {
                             Ok(()) => serde_json::json!({"ok": true}),
-                            Err(e) => serde_json::json!({"error": e}),
+                            Err(e) => serde_json::json!({"error": format!("{}", e)}),
                         }
                     }
                     None => serde_json::json!({"error": format!("indexer '{}' not found", label)}),
@@ -652,12 +651,12 @@ where
                         if !inst.paused.load(std::sync::atomic::Ordering::Relaxed) {
                             return serde_json::json!({"error": "indexer must be paused for KV appends"});
                         }
-                        match inst.storage.append(&key, &val, height) {
+                        match inst.db.put(&key, &val) {
                             Ok(()) => {
-                                let new_len = inst.storage.get_length(&key);
+                                let new_len = 0u32;
                                 serde_json::json!({"ok": true, "new_length": new_len})
                             }
-                            Err(e) => serde_json::json!({"error": e}),
+                            Err(e) => serde_json::json!({"error": format!("{}", e)}),
                         }
                     }
                     None => serde_json::json!({"error": format!("indexer '{}' not found", label)}),

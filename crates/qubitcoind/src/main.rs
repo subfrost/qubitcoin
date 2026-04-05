@@ -830,6 +830,7 @@ async fn main() {
         let mp_gen = mempool.clone();
         let params_gen = params.clone();
         let magic_gen = magic_bytes;
+        let bi_db_gen = block_index_db.clone();
 
         registry.register("generatetoaddress", move |req: &RpcRequest| {
             let params_arr = match req.params.as_ref().and_then(|p| p.as_array()) {
@@ -1055,8 +1056,13 @@ async fn main() {
                                 cs.set_undo_pos(&block_hash, undo_pos.pos);
                             }
                         }
-                        // Flush coins.
+                        // Flush coins + block index to disk for crash safety.
                         cs.flush_coins(cdb_gen.as_ref());
+                        let dirty = cs.dirty_block_indices();
+                        if !dirty.is_empty() {
+                            let refs: Vec<&qubitcoin_common::chain::BlockIndex> = dirty.into_iter().collect();
+                            bi_db_gen.write_block_indices(&refs);
+                        }
                         // Update RPC state.
                         *ns_gen.chain_height.write() = height;
                         *ns_gen.best_block_hash.write() = block_hash.to_hex();
@@ -1250,13 +1256,27 @@ async fn main() {
 
     tracing::info!("Qubitcoin Core startup complete");
 
-    // 12. Main loop: wait for shutdown signal
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => {
-            tracing::info!("received shutdown signal");
+    // 12. Main loop: wait for shutdown signal (ctrl-c or SIGTERM)
+    {
+        #[cfg(unix)]
+        {
+            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to register SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("received SIGINT (ctrl-c)");
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!("received SIGTERM");
+                }
+            }
         }
-        Err(e) => {
-            tracing::error!(error = %e, "error waiting for shutdown");
+        #[cfg(not(unix))]
+        {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => tracing::info!("received shutdown signal"),
+                Err(e) => tracing::error!(error = %e, "error waiting for shutdown"),
+            }
         }
     }
 
@@ -1694,6 +1714,7 @@ fn register_live_rpcs(
         let cs_guard = cs2.lock();
         let height = cs_guard.height();
         let mut total_in: i64 = 0;
+        let mut missing_inputs = Vec::new();
         for input in &tx.vin {
             if input.prevout.is_null() { continue; } // coinbase
             if let Some(coin) = cs_guard.coins_tip().get_coin(&input.prevout) {
@@ -1702,10 +1723,26 @@ fn register_live_rpcs(
                 // Check mempool for unconfirmed parent output
                 if let Some(output) = parent_tx.vout.get(input.prevout.n as usize) {
                     total_in += output.value.to_sat();
+                } else {
+                    missing_inputs.push(input.prevout.clone());
                 }
+            } else {
+                missing_inputs.push(input.prevout.clone());
             }
         }
         drop(cs_guard);
+
+        if !missing_inputs.is_empty() {
+            return RpcResponse::error(
+                req.id.clone(),
+                RPC_MISC_ERROR,
+                format!(
+                    "bad-txns-inputs-missingorspent: {} input(s) not found in UTXO set or mempool",
+                    missing_inputs.len()
+                ),
+            );
+        }
+
         let total_out: i64 = tx.vout.iter().map(|o| o.value.to_sat()).sum();
         let fee = qubitcoin_primitives::Amount::from_sat(std::cmp::max(0, total_in - total_out));
 

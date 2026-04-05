@@ -110,10 +110,9 @@ impl WasmIndexerRuntime {
         let module =
             Module::new(&engine, wasm_bytes).map_err(|e| format!("wasmtime compile: {}", e))?;
 
-        // Async engine with fuel for view functions.
+        // Async engine for view functions (no fuel — wasmi needs uninterrupted execution).
         let mut async_config = base_config();
         async_config.async_support(true);
-        async_config.consume_fuel(true);
         let async_engine =
             Engine::new(&async_config).map_err(|e| format!("async wasmtime engine: {}", e))?;
         let async_module = Module::new(&async_engine, wasm_bytes)
@@ -197,13 +196,12 @@ impl WasmIndexerRuntime {
         let mut store = Store::new(&self.async_engine, state);
         store.limiter(|s| &mut s.limits);
 
-        // Set fuel for cooperative yielding (matching metashrew).
-        store
-            .set_fuel(u64::MAX)
-            .map_err(|e| format!("set fuel: {}", e))?;
-        store
-            .fuel_async_yield_interval(Some(10000))
-            .map_err(|e| format!("fuel yield interval: {}", e))?;
+        // Fuel disabled — the internal wasmi interpreter needs uninterrupted
+        // execution for deeply nested extcalls. Fuel-based yielding can cause
+        // "unexpected end of file" errors when wasmi is mid-parse.
+        //
+        // store.set_fuel(u64::MAX).ok();
+        // store.fuel_async_yield_interval(Some(10000)).ok();
 
         let instance = self.instantiate_async(&mut store).await?;
         prepare_memory(&instance, &mut store);
@@ -347,6 +345,10 @@ fn link_host_functions_sync(linker: &mut Linker<WasmState>) -> Result<(), String
                 if let Some(v) = caller.data().write_cache.get(&key) {
                     return v.len() as i32;
                 }
+                // Raw get: the WASM module manages its own append-only
+                // key layout (metashrew length_key/index_key pattern).
+                // We store KV pairs from __flush directly via write_batch,
+                // so raw get() is correct here.
                 match caller.data().storage.get(&key) {
                     Some(v) => v.len() as i32,
                     None => 0,
@@ -371,7 +373,10 @@ fn link_host_functions_sync(linker: &mut Linker<WasmState>) -> Result<(), String
                     .write_cache
                     .get(&key)
                     .cloned()
-                    .or_else(|| caller.data().storage.get(&key));
+                    .or_else(|| {
+                        // Raw get: WASM manages its own key layout.
+                        caller.data().storage.get(&key)
+                    });
                 if let Some(value) = value {
                     memory.write(&mut caller, value_ptr as usize, &value).ok();
                 }
@@ -457,6 +462,7 @@ fn link_host_functions_async(linker: &mut Linker<WasmState>) -> Result<(), Strin
                     if let Some(v) = caller.data().write_cache.get(&key) {
                         return v.len() as i32;
                     }
+                    // Raw get: the WASM module manages its own storage format.
                     match caller.data().storage.get(&key) {
                         Some(v) => v.len() as i32,
                         None => 0,
@@ -482,10 +488,20 @@ fn link_host_functions_async(linker: &mut Linker<WasmState>) -> Result<(), Strin
                         .write_cache
                         .get(&key)
                         .cloned()
-                        .or_else(|| caller.data().storage.get(&key));
-                    if let Some(value) = value {
+                        .or_else(|| {
+                            caller.data().storage.get(&key)
+                        });
+                    if let Some(ref value) = value {
+                        if value.len() > 10000 && caller.data().view_mode {
+                            tracing::info!(
+                                key_len = key.len(),
+                                val_len = value.len(),
+                                first4 = %format!("{:02x}{:02x}{:02x}{:02x}", value[0], value[1], value[2], value[3]),
+                                "async __get large read (view mode)"
+                            );
+                        }
                         memory
-                            .write(&mut caller, value_ptr as usize, &value)
+                            .write(&mut caller, value_ptr as usize, value)
                             .expect("FATAL: __get memory write failed");
                     }
                 })
