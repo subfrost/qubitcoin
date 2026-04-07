@@ -15,7 +15,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rayon = { workspace = true }
 tokio = { workspace = true }
-wasmtime = "18.0.4"
+wasmtime = "43"
 prost = "0.12"
 sha2 = "0.10"
 toml = "0.8"

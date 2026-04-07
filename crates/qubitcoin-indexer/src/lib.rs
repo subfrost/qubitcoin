@@ -154,8 +154,8 @@ impl IndexerManager {
             let mut wasm_config = wasmtime::Config::default();
             wasm_config.cranelift_nan_canonicalization(true);
             wasm_config.relaxed_simd_deterministic(true);
-            wasm_config.static_memory_maximum_size(0x100000000); // 4GB
-            wasm_config.static_memory_guard_size(0x10000); // 64KB
+            wasm_config.memory_reservation(0x100000000); // 4GB
+            wasm_config.memory_guard_size(0x10000); // 64KB
             wasm_config.memory_init_cow(false); // deterministic init
             wasm_config.async_support(true);
             let engine = wasmtime::Engine::new(&wasm_config)
