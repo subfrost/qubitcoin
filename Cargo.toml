@@ -18,6 +18,13 @@ members = [
     "crates/qubitcoin-indexer",
     "crates/qubitcoin-indexer-core",
     "crates/qubitcoin-indexer-web",
+    # qubitcoin-indexer-fork is a self-contained crate at
+    # crates/qubitcoin-indexer-fork (declares its own [workspace]); it
+    # is intentionally NOT a member of this workspace because the
+    # parent workspace currently has a librocksdb-sys version conflict
+    # (qubitcoin-indexer 0.22 vs metashrew-sync's 0.21 path-dep) that
+    # prevents resolution. The fork crate doesn't use rocksdb so it
+    # builds cleanly in isolation.
     "crates/qubitcoin-web-sys",
     "crates/qubitcoin-tertiary-web",
     "crates/qubitcoin-tertiary-support",
