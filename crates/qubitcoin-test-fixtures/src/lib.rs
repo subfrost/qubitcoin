@@ -209,11 +209,24 @@ impl TestChain {
             for snap in &popped.consumed_snapshots {
                 self.utxos.insert(snap.outpoint, snap.clone());
             }
-            // Return the popped txs to the mempool (minus the
-            // coinbase, which by convention sits at index 0 and
-            // can't be remixed into another chain).
-            for tx in popped.txs.into_iter().skip(1) {
-                self.mempool.push(tx);
+            // Return the popped txs to the mempool. Coinbase txs
+            // (no inputs) can't be remixed into another chain so
+            // they're dropped — BUT their outputs ARE restored as
+            // mempool UTXOs so harness code can observe the
+            // "rolled-back coinbase value sits in the mempool"
+            // semantic (mirrors real-world behaviour where the
+            // wallet's confirmed coinbase rolls back to unconfirmed).
+            for tx in popped.txs.into_iter() {
+                if tx.inputs.is_empty() {
+                    for out in &tx.outputs {
+                        let mut u = out.clone();
+                        u.confirmations = 0;
+                        u.mempool       = true;
+                        self.utxos.insert(u.outpoint, u);
+                    }
+                } else {
+                    self.mempool.push(tx);
+                }
             }
         }
         // Reduce confirmations on everyone else.
