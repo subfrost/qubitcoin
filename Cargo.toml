@@ -32,6 +32,12 @@ members = [
     "crates/qubitcoin-sys",
     "crates/qubitcoind",
     "crates/qubitcoin-compat-jsonrpc",
+    # qubitcoin-test-fixtures is also a self-contained crate (declares
+    # its own [workspace] at crates/qubitcoin-test-fixtures) for the
+    # same reason as qubitcoin-indexer-fork — it path-deps into the
+    # parent crates but doesn't want the parent's heavy test-only
+    # dep graph to leak into projects that just want TestChain + UTXO
+    # snapshot primitives.
 ]
 
 [workspace.package]
@@ -61,6 +67,11 @@ qubitcoin-tertiary-web = { path = "crates/qubitcoin-tertiary-web" }
 qubitcoin-tertiary-support = { path = "crates/qubitcoin-tertiary-support" }
 qubitcoin-web-sys = { path = "crates/qubitcoin-web-sys" }
 qubitcoin-sys = { path = "crates/qubitcoin-sys" }
+# qubitcoin-test-fixtures is path-deppable from this workspace but
+# carries its own [workspace] so it can also be path-deppable from
+# OTHER workspaces (subfrost-mobile-integ-tests etc.) without
+# colliding on resolver-2 unification.
+qubitcoin-test-fixtures = { path = "crates/qubitcoin-test-fixtures" }
 
 # External dependencies
 secp256k1 = { version = "0.29" }
