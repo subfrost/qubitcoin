@@ -435,36 +435,38 @@ impl DevnetServer {
         // restored from the imported blobs below. (Replaying blocks through
         // the indexer runtimes would double-index on top of the blobs.)
         //
-        // Block 0 is the genesis the freshly-constructed devnet already has.
-        // It is deterministic for a given secret key, so we verify it matches
-        // and skip it rather than re-connecting it.
-        let current_height = state.chain.height();
+        // importState must be safely repeatable on a USED server (the
+        // documented snapshot-restore-between-tests pattern re-imports into
+        // the same harness). Rather than requiring a fresh chain, rebuild a
+        // brand-new chain from the same coinbase key and replay the snapshot
+        // blocks into it, then swap it in. This both rolls BACK a chain that
+        // advanced past the snapshot and rolls FORWARD a stale one — the
+        // post-import chain is always exactly the snapshot chain.
+        //
+        // Block 0 is the genesis, deterministic for a given coinbase key, so
+        // we verify it matches the rebuilt chain's genesis and skip it.
         if !blocks.is_empty() {
-            if current_height != 0 {
-                return Err(parse_err(&format!(
-                    "chain already at height {} — importState requires a freshly constructed devnet",
-                    current_height
-                )));
-            }
+            let key = state.chain.coinbase_key().clone();
+            let mut new_chain = TestChain::new_with_key_wpkh(key);
             let snapshot_genesis = blocks[0].header.block_hash();
-            if state.chain.tip_hash() != &snapshot_genesis {
+            if new_chain.tip_hash() != &snapshot_genesis {
                 return Err(parse_err(
                     "snapshot genesis does not match this devnet's genesis (different secret key?)",
                 ));
             }
             for (i, block) in blocks.into_iter().enumerate().skip(1) {
-                state
-                    .chain
+                new_chain
                     .connect_block(block)
                     .map_err(|e| parse_err(&format!("replay block {}: {}", i, e)))?;
             }
-            let replayed_height = state.chain.height();
+            let replayed_height = new_chain.height();
             if replayed_height != chain_height as i32 {
                 return Err(parse_err(&format!(
                     "replay ended at height {} but snapshot recorded {}",
                     replayed_height, chain_height
                 )));
             }
+            state.chain = new_chain;
         }
 
         // Import indexer storage
