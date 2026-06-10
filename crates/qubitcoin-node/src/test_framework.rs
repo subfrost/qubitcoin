@@ -349,6 +349,60 @@ impl TestChain {
         (0..count).map(|_| self.mine_block(vec![])).collect()
     }
 
+    /// Connect a pre-built block to the chain tip without mining.
+    ///
+    /// Used by devnet snapshot restore (`DevnetServer::importState`) to replay
+    /// the snapshot's original serialized blocks instead of re-mining empty
+    /// ones — so the chain's blocks, UTXO set (coins view), and tip hash
+    /// exactly match the chain that produced the snapshot. Without this,
+    /// every chain-derived query after a restore (e.g. the esplora
+    /// address→UTXO block-scan fallback) sees a chain with no transactions
+    /// and plain-BTC balances read zero.
+    ///
+    /// The block must link to the current tip (`prev_blockhash == tip_hash`).
+    /// No PoW or script re-validation is performed — the block comes from a
+    /// trusted local snapshot that this same chain produced.
+    pub fn connect_block(&mut self, block: Block) -> Result<(), String> {
+        if block.header.prev_blockhash != self.tip_hash {
+            return Err(format!(
+                "connect_block: prev_blockhash mismatch at height {} (expected tip {:?}, got {:?})",
+                self.height + 1,
+                self.tip_hash,
+                block.header.prev_blockhash,
+            ));
+        }
+        if block.vtx.is_empty() {
+            return Err(format!(
+                "connect_block: block at height {} has no transactions",
+                self.height + 1
+            ));
+        }
+
+        let height = self.height + 1;
+
+        // Update the UTXO set — identical bookkeeping to `mine_block`.
+        for (tx_idx, tx) in block.vtx.iter().enumerate() {
+            let is_coinbase = tx_idx == 0;
+            add_coins(&self.coins, tx, height as u32, is_coinbase);
+
+            // Spend inputs (skip coinbase -- it has no real inputs).
+            if !is_coinbase {
+                for input in &tx.vin {
+                    self.coins.spend_coin(&input.prevout);
+                }
+            }
+        }
+
+        // Update chain state.
+        self.height = height;
+        self.tip_hash = block.header.block_hash();
+        self.headers.push(block.header.clone());
+        self.coinbase_txns.push(block.vtx[0].clone());
+        self.blocks.push(block);
+
+        Ok(())
+    }
+
     // --- Transaction helpers -----------------------------------------------
 
     /// Create a simple transaction that spends a single UTXO at `input` and
@@ -832,6 +886,75 @@ mod tests {
         assert!(
             next.is_some(),
             "Newly matured coinbases should be available"
+        );
+    }
+
+    // -- connect_block (snapshot replay) -----------------------------------
+
+    #[test]
+    fn test_connect_block_replays_chain_exactly() {
+        // Build a source chain with real, non-empty blocks (the shape a
+        // devnet snapshot captures).
+        let mut source = TestChain::new();
+        source.mine_empty_blocks(103); // mature several coinbases
+        let dest = Script::from_bytes(vec![0x51]);
+        let send = Amount::from_sat(1 * SAT_PER_COIN);
+        for _ in 0..3 {
+            let (outpoint, _) = source
+                .get_spendable_output()
+                .expect("source chain should have a spendable coinbase");
+            let tx = source
+                .create_transaction(&outpoint, send, &dest)
+                .expect("transaction creation should succeed");
+            source.mine_block(vec![tx]);
+        }
+        assert_eq!(source.height(), 106);
+
+        // Rebuild a fresh chain (same coinbase key → identical deterministic
+        // genesis) by connecting the source's blocks. This is exactly what
+        // DevnetServer::importState does on snapshot restore.
+        let mut replica = TestChain::new_with_key(source.coinbase_key().clone());
+        assert_eq!(
+            replica.tip_hash(),
+            &source.block_at(0).unwrap().header.block_hash(),
+            "genesis must be deterministic for the same coinbase key"
+        );
+
+        for h in 1..=source.height() {
+            let block = source.block_at(h).unwrap().clone();
+            replica
+                .connect_block(block)
+                .expect("connect_block should accept sequential snapshot blocks");
+        }
+
+        // Chain state must match exactly.
+        assert_eq!(replica.height(), source.height());
+        assert_eq!(replica.tip_hash(), source.tip_hash());
+
+        // The chain-derived UTXO view must match — this is what the esplora
+        // address→UTXO block-scan fallback reads after a restore.
+        let norm = |v: Vec<(OutPoint, Amount, i32)>| {
+            v.into_iter()
+                .map(|(o, a, h)| (format!("{:?}", o), a.to_sat(), h))
+                .collect::<Vec<_>>()
+        };
+        let src_utxos = norm(source.utxos_for_script(&dest));
+        let rep_utxos = norm(replica.utxos_for_script(&dest));
+        assert_eq!(src_utxos.len(), 3, "destination script should hold 3 UTXOs");
+        assert_eq!(rep_utxos, src_utxos, "replayed UTXO set must match source");
+
+        // Spent-coin tracking must agree (inputs were spent during replay).
+        assert_eq!(
+            replica.mature_coinbase_count(),
+            source.mature_coinbase_count()
+        );
+
+        // A non-sequential block must be rejected.
+        let mut bad = TestChain::new_with_key(source.coinbase_key().clone());
+        let later = source.block_at(5).unwrap().clone();
+        assert!(
+            bad.connect_block(later).is_err(),
+            "block that does not link to the tip must be rejected"
         );
     }
 }

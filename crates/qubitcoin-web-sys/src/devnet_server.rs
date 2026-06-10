@@ -350,12 +350,24 @@ impl DevnetServer {
         let num_blocks = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
         pos += 4;
 
-        // Skip over block data (we reconstruct the chain by mining empty blocks)
+        // Deserialize every block so the chain can be replayed below. The
+        // snapshot's blocks are the source of truth for the chain — replaying
+        // them (instead of re-mining empty placeholders) is what keeps the
+        // post-restore chain byte-identical to the one that produced the
+        // snapshot, including all transaction outputs.
+        let mut blocks: Vec<qubitcoin_consensus::block::Block> =
+            Vec::with_capacity(num_blocks as usize);
         for i in 0..num_blocks {
             if pos + 4 > data.len() { return Err(parse_err(&format!("truncated block {} length", i))); }
             let block_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
             pos += 4;
             if pos + block_len > data.len() { return Err(parse_err(&format!("truncated block {} data", i))); }
+            let block = crate::types::block_from_bytes(&data[pos..pos + block_len])
+                .map_err(|e| {
+                    let msg = e.as_string().unwrap_or_else(|| "deserialize error".to_string());
+                    parse_err(&format!("block {}: {}", i, msg))
+                })?;
+            blocks.push(block);
             pos += block_len;
         }
 
@@ -406,22 +418,52 @@ impl DevnetServer {
         // All parsing succeeded — now apply the state.
         let mut state = self.state.borrow_mut();
 
-        // Advance the chain to the exported height by mining empty blocks.
-        // We don't replay the original blocks (which may have had transactions)
-        // because the indexer state is authoritative — it comes from the imported
-        // blobs. The chain is needed for:
-        // 1. Correct height() / tip_hash() responses
-        // 2. Coinbase UTXO set (same key → same outputs)
-        // 3. Future mine_block() calls that need prev_blockhash
+        // Replay the snapshot's original blocks into the chain.
         //
-        // Transaction UTXOs from the original chain won't exist, but the esplora
-        // indexer has the correct UTXO data in its imported storage.
+        // Previously this mined EMPTY blocks up to the target height, on the
+        // theory that "the indexer state is authoritative". That broke every
+        // chain-derived query after a restore: the esplora address→UTXO
+        // block-scan fallback (DevnetEsploraBackend::utxos_for_address) saw a
+        // chain with no transactions, so plain-BTC balances read zero even
+        // though the indexer blobs were restored; getSpendableOutput /
+        // utxos_for_script were likewise empty, and the tip hash didn't match
+        // the snapshot's. The real blocks are right here in the snapshot —
+        // replay them so the chain's blocks, coins view, and tip hash exactly
+        // match the pre-snapshot chain.
+        //
+        // The indexers are NOT re-run during replay — their storage is
+        // restored from the imported blobs below. (Replaying blocks through
+        // the indexer runtimes would double-index on top of the blobs.)
+        //
+        // Block 0 is the genesis the freshly-constructed devnet already has.
+        // It is deterministic for a given secret key, so we verify it matches
+        // and skip it rather than re-connecting it.
         let current_height = state.chain.height();
-        let target_height = chain_height as i32;
-        if target_height > current_height {
-            let blocks_to_mine = (target_height - current_height) as u32;
-            for _ in 0..blocks_to_mine {
-                state.chain.mine_block(vec![]);
+        if !blocks.is_empty() {
+            if current_height != 0 {
+                return Err(parse_err(&format!(
+                    "chain already at height {} — importState requires a freshly constructed devnet",
+                    current_height
+                )));
+            }
+            let snapshot_genesis = blocks[0].header.block_hash();
+            if state.chain.tip_hash() != &snapshot_genesis {
+                return Err(parse_err(
+                    "snapshot genesis does not match this devnet's genesis (different secret key?)",
+                ));
+            }
+            for (i, block) in blocks.into_iter().enumerate().skip(1) {
+                state
+                    .chain
+                    .connect_block(block)
+                    .map_err(|e| parse_err(&format!("replay block {}: {}", i, e)))?;
+            }
+            let replayed_height = state.chain.height();
+            if replayed_height != chain_height as i32 {
+                return Err(parse_err(&format!(
+                    "replay ended at height {} but snapshot recorded {}",
+                    replayed_height, chain_height
+                )));
             }
         }
 
