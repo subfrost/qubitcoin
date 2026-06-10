@@ -753,7 +753,9 @@ mod tests {
             .unwrap();
         assert_eq!(result.len(), 4);
         let len = u32::from_le_bytes([result[0], result[1], result[2], result[3]]);
-        assert_eq!(len, 5);
+        // Metashrew ABI: call_view prepends [height_le32] to the payload,
+        // so the module sees 4 + 5 input bytes.
+        assert_eq!(len, 4 + 5);
     }
 
     #[tokio::test]
@@ -768,7 +770,8 @@ mod tests {
             .unwrap();
         assert_eq!(result.len(), 4);
         let len = u32::from_le_bytes([result[0], result[1], result[2], result[3]]);
-        assert_eq!(len, 5);
+        // Metashrew ABI height prefix, as in test_call_view_sync.
+        assert_eq!(len, 4 + 5);
     }
 
     #[test]
@@ -794,7 +797,8 @@ mod tests {
                 .call_view("get_input_len", input, storage.clone(), "test")
                 .unwrap();
             let len = u32::from_le_bytes([result[0], result[1], result[2], result[3]]);
-            assert_eq!(len as usize, size);
+            // Metashrew ABI height prefix adds 4 bytes ahead of the payload.
+            assert_eq!(len as usize, size + 4);
         }
     }
 
