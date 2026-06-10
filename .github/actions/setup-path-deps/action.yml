@@ -1,0 +1,45 @@
+name: Setup external path dependencies
+description: >
+  The workspace has path dependencies on sibling checkouts that must live
+  NEXT TO the repository directory: ../alkanes-rs (alkanes-rpc-core,
+  alkanes-cli-common — see crates/qubitcoin-web-sys/Cargo.toml) and
+  ../metashrew (metashrew-runtime, rockshrew-runtime, metashrew-sync — see
+  crates/qubitcoin-indexer/Cargo.toml). Without them, every cargo command
+  fails at manifest load. This action recreates that layout on the runner,
+  pinned to known-good SHAs.
+
+inputs:
+  alkanes-rs-sha:
+    description: subfrost/alkanes-rs commit to pin
+    default: c928fb74e3a462671185ca920318463cfb44686d
+  metashrew-sha:
+    description: kungfuflex/metashrew commit to pin
+    default: 31c4198c578c1642b02f7ca6cd662612e7a8079c
+
+runs:
+  using: composite
+  steps:
+    - name: Clone alkanes-rs (pinned)
+      shell: bash
+      run: |
+        git init -q ../alkanes-rs
+        git -C ../alkanes-rs remote add origin https://github.com/subfrost/alkanes-rs.git
+        git -C ../alkanes-rs fetch -q --depth 1 origin ${{ inputs.alkanes-rs-sha }}
+        git -C ../alkanes-rs checkout -q FETCH_HEAD
+        test -f ../alkanes-rs/crates/alkanes-rpc-core/Cargo.toml
+
+    - name: Clone metashrew (pinned) and align rocksdb
+      shell: bash
+      run: |
+        git init -q ../metashrew
+        git -C ../metashrew remote add origin https://github.com/kungfuflex/metashrew.git
+        git -C ../metashrew fetch -q --depth 1 origin ${{ inputs.metashrew-sha }}
+        git -C ../metashrew checkout -q FETCH_HEAD
+        test -f ../metashrew/crates/metashrew-runtime/Cargo.toml
+        # Align metashrew's rocksdb 0.21 pin with this workspace's 0.22 so the
+        # librocksdb-sys `links` conflict (documented in the root Cargo.toml
+        # workspace-members comment) doesn't block dependency resolution.
+        # metashrew crates are resolution-only for these jobs — none of the
+        # packages we build compile metashrew code.
+        find ../metashrew -name Cargo.toml -maxdepth 3 -exec \
+          sed -i 's/rocksdb = "0\.21[^"]*"/rocksdb = "0.22"/; s/rocksdb = { version = "0\.21[^"]*"/rocksdb = { version = "0.22"/' {} +
