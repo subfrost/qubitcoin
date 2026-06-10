@@ -19,6 +19,13 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Install protoc
+      shell: bash
+      # prost-build in the alkanes-rs dependency tree shells out to protoc.
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq protobuf-compiler
+
     - name: Clone alkanes-rs (pinned)
       shell: bash
       run: |
