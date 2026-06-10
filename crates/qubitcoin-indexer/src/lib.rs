@@ -204,7 +204,10 @@ impl IndexerManager {
                             .expect("tokio for genesis");
                         rt.block_on(async {
                             {
-                                let mut ctx = runtime.context.write().await;
+                                let mut ctx = runtime
+                                    .context
+                                    .write()
+                                    .expect("metashrew context lock poisoned");
                                 ctx.block = genesis_bytes;
                                 ctx.height = 0;
                             }
@@ -810,7 +813,10 @@ fn run_indexer_block(inst: &IndexerInstance, height: u32, input: &[u8]) {
             rt.block_on(async move {
                 {
                     let mut ctx = runtime_ref.write().await;
-                    let mut inner = ctx.context.write().await;
+                    let mut inner = ctx
+                        .context
+                        .write()
+                        .expect("metashrew context lock poisoned");
                     inner.height = height;
                     inner.block = block_data_owned;
                 }
