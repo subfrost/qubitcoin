@@ -27,7 +27,7 @@ qubitcoin-indexer-web = { workspace = true }
 qubitcoin-tertiary-web = { workspace = true }
 
 # RPC core (alkanes dispatch + codec)
-alkanes-rpc-core = { path = "../../../alkanes-rs/crates/alkanes-rpc-core", default-features = false, features = ["web-compat"] }
+alkanes-rpc-core = { git = "https://github.com/kungfuflex/alkanes-rs", branch = "develop", default-features = false, features = ["web-compat"] }
 
 # WASM bindings
 wasm-bindgen = { workspace = true }

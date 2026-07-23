@@ -70,7 +70,9 @@ impl RocksDatabase {
         block_opts.set_block_cache(&rocksdb::Cache::new_lru_cache(block_cache_mb * 1024 * 1024));
         // Bloom filter: 10 bits/key, ~1% false positive rate.
         block_opts.set_bloom_filter(10.0, false);
-        block_opts.set_optimize_filters_for_memory(true);
+        // (set_optimize_filters_for_memory is a rocksdb 0.22-only knob; we pin
+        // 0.21 to match kungfuflex/metashrew's storage engine, so it's omitted —
+        // a filter-block fragmentation optimization, not a correctness concern.)
         // Put index/filter blocks IN the block cache for predictable memory.
         block_opts.set_cache_index_and_filter_blocks(true);
         // Pin L0 index/filter — most frequently accessed, prevent eviction.

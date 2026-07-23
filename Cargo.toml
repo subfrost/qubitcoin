@@ -20,24 +20,22 @@ members = [
     "crates/qubitcoin-indexer-web",
     # qubitcoin-indexer-fork is a self-contained crate at
     # crates/qubitcoin-indexer-fork (declares its own [workspace]); it
-    # is intentionally NOT a member of this workspace because the
-    # parent workspace currently has a librocksdb-sys version conflict
-    # (qubitcoin-indexer 0.22 vs metashrew-sync's 0.21 path-dep) that
-    # prevents resolution. The fork crate doesn't use rocksdb so it
-    # builds cleanly in isolation.
+    # is intentionally NOT a member of this workspace (it carries its own
+    # [workspace] table). The former librocksdb-sys conflict is resolved:
+    # the workspace now pins rocksdb 0.21, matching the kungfuflex/metashrew
+    # develop git dep (metashrew-sync/rockshrew-runtime) — single -sys crate.
     "crates/qubitcoin-web-sys",
     "crates/qubitcoin-tertiary-web",
     "crates/qubitcoin-tertiary-support",
     "crates/qubitcoin-support",
     "crates/qubitcoin-sys",
     "crates/qubitcoind",
-    "crates/qubitcoin-compat-jsonrpc",
-    # qubitcoin-test-fixtures is also a self-contained crate (declares
-    # its own [workspace] at crates/qubitcoin-test-fixtures) for the
-    # same reason as qubitcoin-indexer-fork — it path-deps into the
-    # parent crates but doesn't want the parent's heavy test-only
-    # dep graph to leak into projects that just want TestChain + UTXO
-    # snapshot primitives.
+    # qubitcoin-compat-jsonrpc and qubitcoin-test-fixtures are also
+    # self-contained crates (each declares its own [workspace]) for the
+    # same reason as qubitcoin-indexer-fork — they carry their own lock /
+    # lean dep graph and are intentionally NOT members of this workspace.
+    # (Listing a crate that declares its own [workspace] as a member here
+    # trips cargo's "multiple workspace roots" error.)
 ]
 
 [workspace.package]
@@ -89,7 +87,7 @@ log = "0.4" # kept for backward compat; prefer tracing for new code
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 tokio = { version = "1", features = ["full"] }
-rocksdb = "0.22"
+rocksdb = "0.21.0" # aligned with kungfuflex/metashrew develop (rockshrew/metashrew-sync pin 0.21) to keep a single librocksdb-sys
 bitflags = "2"
 rayon = "1.10"
 sha2 = "0.10"

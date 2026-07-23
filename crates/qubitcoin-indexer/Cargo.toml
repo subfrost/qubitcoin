@@ -22,9 +22,9 @@ toml = "0.8"
 # Metashrew runtime — the production WASM indexer engine.
 # Using the real metashrew crates ensures exact storage format
 # compatibility with the alkanes.wasm and other indexer modules.
-metashrew-runtime = { path = "../../../metashrew/crates/metashrew-runtime" }
-rockshrew-runtime = { path = "../../../metashrew/crates/rockshrew-runtime" }
-metashrew-sync = { path = "../../../metashrew/crates/metashrew-sync" }
+metashrew-runtime = { git = "https://github.com/kungfuflex/metashrew", branch = "develop" }
+rockshrew-runtime = { git = "https://github.com/kungfuflex/metashrew", branch = "develop" }
+metashrew-sync = { git = "https://github.com/kungfuflex/metashrew", branch = "develop" }
 async-trait = "0.1"
 
 [dev-dependencies]
