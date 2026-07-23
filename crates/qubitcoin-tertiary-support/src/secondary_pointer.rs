@@ -8,6 +8,8 @@
 //! use qubitcoin_support::KeyValuePointer;
 //!
 //! // Read pool balance the same way alkanes-rs writes it:
+//! let token_id_bytes: Vec<u8> = vec![/* serialized AlkaneId */];
+//! let pool_id_bytes: Vec<u8> = vec![/* serialized AlkaneId */];
 //! let ptr = SecondaryPointer::for_indexer("alkanes")
 //!     .keyword("/alkanes/")
 //!     .select(&token_id_bytes)

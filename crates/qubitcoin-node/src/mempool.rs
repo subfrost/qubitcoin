@@ -11,8 +11,10 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
-use qubitcoin_consensus::transaction::{OutPoint, TransactionRef};
+use qubitcoin_consensus::check::WITNESS_SCALE_FACTOR;
+use qubitcoin_consensus::transaction::{OutPoint, TransactionRef, TxOut};
 use qubitcoin_primitives::{Amount, Txid};
+use qubitcoin_serialize::Encodable;
 
 // ---------------------------------------------------------------------------
 // FeeRate
@@ -107,6 +109,56 @@ pub const MAX_BIP125_REPLACEMENT_CANDIDATES: usize = 100;
 
 /// Default mempool transaction expiration time (14 days, matching Bitcoin Core).
 pub const DEFAULT_MEMPOOL_EXPIRY_HOURS: u64 = 336;
+
+// ---------------------------------------------------------------------------
+// Dust policy
+// ---------------------------------------------------------------------------
+
+/// Compute the dust threshold for a transaction output.
+///
+/// Maps to: `GetDustThreshold` in src/policy/policy.cpp.
+///
+/// An output is "dust" when its value is so small that spending it would cost
+/// more (in fees, at the dust relay feerate) than the output is worth. The
+/// threshold is the fee — at `dust_relay_fee` — of the bytes needed to both
+/// create and later spend the output. With the default `DUST_RELAY_TX_FEE`
+/// (3000 sat/kvB) this yields Bitcoin Core's well-known thresholds:
+/// 546 sat for P2PKH and 294 sat for P2WPKH.
+///
+/// Unspendable outputs (e.g. `OP_RETURN` data carriers) are never dust and
+/// return a threshold of 0.
+pub fn get_dust_threshold(txout: &TxOut, dust_relay_fee: FeeRate) -> i64 {
+    if txout.script_pubkey.is_unspendable() {
+        return 0;
+    }
+
+    // Serialized size of the output itself (8-byte value + scriptPubKey with
+    // its CompactSize length prefix). Encoding into a Vec cannot fail.
+    let mut buf = Vec::new();
+    txout
+        .encode(&mut buf)
+        .expect("encoding a TxOut into a Vec cannot fail");
+    let mut spend_size = buf.len();
+
+    if txout.script_pubkey.is_witness_program().is_some() {
+        // A future spend of a witness output: the prevout (36) + sequence (4) +
+        // scriptSig length (1, empty) plus a witness-discounted input script of
+        // 107 weight-bytes (107 / WITNESS_SCALE_FACTOR vbytes) + 4.
+        spend_size += 32 + 4 + 1 + (107 / WITNESS_SCALE_FACTOR as usize) + 4;
+    } else {
+        // A future spend of a non-witness output: the classic 148-byte input.
+        spend_size += 32 + 4 + 1 + 107 + 4;
+    }
+
+    dust_relay_fee.get_fee(spend_size).to_sat()
+}
+
+/// Returns `true` if `txout` is considered dust under relay policy.
+///
+/// Maps to: `IsDust` in src/policy/policy.h.
+pub fn is_dust(txout: &TxOut, dust_relay_fee: FeeRate) -> bool {
+    txout.value.to_sat() < get_dust_threshold(txout, dust_relay_fee)
+}
 
 // ---------------------------------------------------------------------------
 // MempoolEntry
@@ -994,21 +1046,22 @@ pub enum MempoolAcceptResult {
     },
 }
 
-/// Accept a transaction into the mempool, performing simplified policy checks.
+/// Accept a transaction into the mempool, performing policy checks.
 ///
-/// This is a simplified version of Bitcoin Core's `MemPoolAccept::AcceptSingleTransaction`.
-/// The caller provides the pre-computed fee and virtual size. Full script
-/// validation is assumed to have already been performed.
+/// A partial port of Bitcoin Core's `MemPoolAccept::AcceptSingleTransaction`
+/// (src/validation.cpp). The caller provides the pre-computed fee and virtual
+/// size. Full script validation is assumed to have already been performed.
 ///
-/// Checks performed:
+/// Checks performed, in order:
 /// 1. Duplicate detection.
-/// 2. Minimum relay fee enforcement.
-/// 3. Conflict (double-spend) detection with simplified RBF:
-///    - The replacement must pay a strictly higher fee rate than every
-///      conflicting transaction.
-///    - The replacement must pay at least `incremental_relay_fee` more per
-///      kvB than the highest-feerate conflict.
-/// 4. Capacity check (`has_room`).
+/// 2. Standardness: reject dust outputs (Core's `IsStandardTx` dust check).
+/// 3. Minimum relay fee enforcement.
+/// 4. Candidate entry construction.
+/// 5. Conflict (double-spend) detection with full BIP125 replace-by-fee via
+///    [`TxMemPool::check_rbf`], honouring the pool's full-RBF policy.
+/// 6. Descendant package-limit check.
+/// 7. Capacity check (`has_room`).
+/// 8. Commit (replace conflicts, or add).
 pub fn accept_to_mempool(
     pool: &TxMemPool,
     tx: &TransactionRef,
@@ -1025,7 +1078,23 @@ pub fn accept_to_mempool(
         };
     }
 
-    // 2. Fee rate check.
+    // 2. Standardness: reject transactions with dust outputs.
+    //    Matches the `dust` check in Bitcoin Core's `IsStandardTx`
+    //    (src/policy/policy.cpp), which runs during `PreChecks` before the
+    //    fee-rate checks below.
+    for txout in &tx.vout {
+        if is_dust(txout, DUST_RELAY_TX_FEE) {
+            return MempoolAcceptResult::Rejected {
+                reason: format!(
+                    "dust: output value {} below dust threshold {}",
+                    txout.value.to_sat(),
+                    get_dust_threshold(txout, DUST_RELAY_TX_FEE),
+                ),
+            };
+        }
+    }
+
+    // 3. Fee rate check.
     let fee_rate = if vsize > 0 {
         FeeRate::new(fee.to_sat() * 1000 / vsize as i64)
     } else {
@@ -1040,53 +1109,8 @@ pub fn accept_to_mempool(
         };
     }
 
-    // 3. Conflict (double-spend) detection and simplified RBF.
-    let mut conflicts: Vec<Txid> = Vec::new();
-    {
-        let spenders = pool.spenders.read();
-        for input in &tx.vin {
-            if let Some(conflict_txid) = spenders.get(&input.prevout) {
-                if !conflicts.contains(conflict_txid) {
-                    conflicts.push(*conflict_txid);
-                }
-            }
-        }
-    }
-
-    if !conflicts.is_empty() {
-        // Simplified RBF: accept replacement if the new tx pays any fee.
-        // Bitcoin Core requires the new fee rate to beat the old by the incremental
-        // relay fee, but for simplicity (and regtest usability), we accept any
-        // replacement that pays a non-zero fee rate.
-        if fee_rate <= FeeRate::ZERO {
-            return MempoolAcceptResult::Rejected {
-                reason: format!("insufficient-fee-for-rbf: {} < minimum non-zero", fee_rate),
-            };
-        }
-        {
-            // Log but accept — evict conflicts below.
-            let entries = pool.entries.read();
-            for conflict_txid in &conflicts {
-                if let Some(_conflict_entry) = entries.get(conflict_txid) {
-                    // Old RBF check was here — now we just accept any replacement with fee > 0.
-                }
-            }
-        }
-
-        // Remove conflicting transactions (and their descendants).
-        for conflict_txid in &conflicts {
-            pool.remove_recursive(conflict_txid);
-        }
-    }
-
-    // 4. Capacity check.
-    if !pool.has_room(vsize) {
-        return MempoolAcceptResult::Rejected {
-            reason: "mempool-full".to_string(),
-        };
-    }
-
-    // Construct entry and add.
+    // 4. Construct the candidate entry. It is used by the BIP125 replacement
+    //    and package-limit checks below, and finally committed to the pool.
     let entry = MempoolEntry::new(
         tx.clone(),
         fee,
@@ -1099,7 +1123,41 @@ pub fn accept_to_mempool(
         0,     // sig_op_cost - caller would set this
     );
 
-    pool.add_unchecked(entry);
+    // 5. Conflict detection + replace-by-fee (BIP125).
+    //    Delegate to `check_rbf`, which enforces the full BIP125 rule set
+    //    (signaling, no-new-unconfirmed-inputs, higher absolute fee, pays for
+    //    its own bandwidth at the incremental relay fee, and the replacement
+    //    candidate cap) and honours the pool's full-RBF policy
+    //    (`-mempoolfullrbf`, default-on since Bitcoin Core v28). It returns the
+    //    set of transactions that would be evicted (empty when there is no
+    //    conflict). This replaces the previous "accept any replacement paying a
+    //    non-zero feerate" shortcut, which ignored BIP125 entirely.
+    let evicted = match pool.check_rbf(&entry) {
+        Ok(evicted) => evicted,
+        Err(reason) => return MempoolAcceptResult::Rejected { reason },
+    };
+
+    // 6. Descendant package-limit check (Bitcoin Core's
+    //    CTxMemPool::CalculateDescendants / CheckDescendantLimits): adding this
+    //    child must not push any in-mempool parent past its descendant limits.
+    if let Err(reason) = pool.check_descendant_limits(&entry) {
+        return MempoolAcceptResult::Rejected { reason };
+    }
+
+    // 7. Capacity check.
+    if !pool.has_room(vsize) {
+        return MempoolAcceptResult::Rejected {
+            reason: "mempool-full".to_string(),
+        };
+    }
+
+    // 8. Commit: for a replacement, evict the conflicting set and add; otherwise
+    //    add directly.
+    if evicted.is_empty() {
+        pool.add_unchecked(entry);
+    } else {
+        pool.replace(entry, &evicted);
+    }
 
     MempoolAcceptResult::Accepted { txid }
 }
@@ -1355,7 +1413,11 @@ mod tests {
 
     #[test]
     fn test_accept_low_fee_rejected() {
-        let pool = TxMemPool::new();
+        // Use an explicit 1 sat/vB (= 1000 sat/kvB) minimum relay fee, matching
+        // Bitcoin Core's DEFAULT_MIN_RELAY_TX_FEE. (The pool's process-wide
+        // default is deliberately 0 as a workaround for fee-lookup failures, so
+        // enforcement must be exercised with an explicit non-zero floor here.)
+        let pool = TxMemPool::new_with_limits(FeeRate::from_sat_per_vb(1), DEFAULT_MAX_MEMPOOL_SIZE);
         let tx = make_tx(22, vec![dummy_outpoint(22)], 1);
 
         // Fee of 1 sat for 200 vB => 5 sat/kvB, below min relay of 1000 sat/kvB.
@@ -1618,6 +1680,63 @@ mod tests {
 
         let entry2 = MempoolEntry::new(tx, Amount::from_sat(1000), 200, 0, 1, false, 0);
         assert!(!pool.add_unchecked(entry2));
+    }
+
+    // -- Dust policy tests --
+
+    #[test]
+    fn test_dust_thresholds_match_core() {
+        // P2PKH: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG (25 bytes).
+        let mut p2pkh = vec![0x76, 0xa9, 0x14];
+        p2pkh.extend_from_slice(&[0u8; 20]);
+        p2pkh.extend_from_slice(&[0x88, 0xac]);
+        let p2pkh_out = TxOut::new(Amount::from_sat(600), Script::from_bytes(p2pkh));
+        // Bitcoin Core's canonical P2PKH dust threshold at 3000 sat/kvB is 546.
+        assert_eq!(get_dust_threshold(&p2pkh_out, DUST_RELAY_TX_FEE), 546);
+        assert!(is_dust(
+            &TxOut::new(Amount::from_sat(545), p2pkh_out.script_pubkey.clone()),
+            DUST_RELAY_TX_FEE
+        ));
+        assert!(!is_dust(&p2pkh_out, DUST_RELAY_TX_FEE)); // 600 >= 546
+
+        // P2WPKH: OP_0 <20> (22 bytes).
+        let mut p2wpkh = vec![0x00, 0x14];
+        p2wpkh.extend_from_slice(&[0u8; 20]);
+        let p2wpkh_out = TxOut::new(Amount::from_sat(294), Script::from_bytes(p2wpkh));
+        // Witness discount gives Core's canonical P2WPKH dust threshold of 294.
+        assert_eq!(get_dust_threshold(&p2wpkh_out, DUST_RELAY_TX_FEE), 294);
+        assert!(!is_dust(&p2wpkh_out, DUST_RELAY_TX_FEE)); // 294 >= 294
+        assert!(is_dust(
+            &TxOut::new(Amount::from_sat(293), p2wpkh_out.script_pubkey.clone()),
+            DUST_RELAY_TX_FEE
+        ));
+
+        // OP_RETURN (unspendable) is never dust, regardless of value.
+        let op_return = TxOut::new(Amount::from_sat(0), Script::from_bytes(vec![0x6a, 0x00]));
+        assert_eq!(get_dust_threshold(&op_return, DUST_RELAY_TX_FEE), 0);
+        assert!(!is_dust(&op_return, DUST_RELAY_TX_FEE));
+    }
+
+    #[test]
+    fn test_accept_dust_output_rejected() {
+        let pool = TxMemPool::new();
+        // A tx whose only output is 1 sat to a P2PKH script (dust, threshold 546).
+        let mut p2pkh = vec![0x76, 0xa9, 0x14];
+        p2pkh.extend_from_slice(&[7u8; 20]);
+        p2pkh.extend_from_slice(&[0x88, 0xac]);
+        let tx = Arc::new(Transaction::new(
+            2,
+            vec![TxIn::new(dummy_outpoint(80), Script::new(), 0xffffffff)],
+            vec![TxOut::new(Amount::from_sat(1), Script::from_bytes(p2pkh))],
+            0,
+        ));
+        let result = accept_to_mempool(&pool, &tx, Amount::from_sat(1000), 200, 1);
+        match result {
+            MempoolAcceptResult::Rejected { reason } => {
+                assert!(reason.contains("dust"), "unexpected reason: {}", reason);
+            }
+            _ => panic!("expected dust rejection"),
+        }
     }
 
     // -- Ancestor/descendant limit tests --
