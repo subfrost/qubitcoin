@@ -91,17 +91,119 @@ mod http {
         error: Option<serde_json::Value>,
     }
 
+    // -- alkanes-side getstorageat protobuf shape ----------------------
+    //
+    // The remote `metashrew_view "getstorageat"` is the alkanes
+    // view-function in `alkanes-rs/src/view.rs:402`, NOT a generic
+    // raw-kv getter. It expects a prost-encoded `AlkaneStorageRequest`:
+    //
+    //   message AlkaneStorageRequest { AlkaneId id = 1; bytes path = 2; }
+    //   message AlkaneId { Uint128 block = 1; Uint128 tx = 2; }
+    //   message Uint128 { uint64 lo = 1; uint64 hi = 2; }
+    //
+    // Inside the view fn, `req.id.clone().unwrap()` panics whenever the
+    // input doesn't decode to `Some(id)`. Sending the raw IndexPointer
+    // key as the payload (as this fork did pre-fix) decodes to the
+    // default — id None, path [] — and triggers that unwrap. The bug
+    // shows up in the indexer's logs as
+    //   `unwrap_failed → getstorageat`
+    // and the trace stack ending at `alkanes.wasm!getstorageat`.
+    //
+    // We hand-inline the four message types here rather than depend on
+    // `alkanes-support` so this fork stays generic. The WASM ALWAYS
+    // composes storage keys as `/alkanes/{id_bytes}/storage/{path}`
+    // where `id_bytes` is 32 bytes (block_le16 + tx_le16) — see
+    // `AlkaneId: Into<Vec<u8>>` in alkanes-support. Keys that don't
+    // match this shape get `Ok(None)` (treated as absent), matching
+    // the pre-fix behaviour for genuine misses.
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct AlkanesViewUint128 {
+        #[prost(uint64, tag = "1")]
+        lo: u64,
+        #[prost(uint64, tag = "2")]
+        hi: u64,
+    }
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct AlkanesViewAlkaneId {
+        #[prost(message, optional, tag = "1")]
+        block: Option<AlkanesViewUint128>,
+        #[prost(message, optional, tag = "2")]
+        tx:    Option<AlkanesViewUint128>,
+    }
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct AlkanesViewStorageRequest {
+        #[prost(message, optional, tag = "1")]
+        id:   Option<AlkanesViewAlkaneId>,
+        #[prost(bytes = "vec", tag = "2")]
+        path: Vec<u8>,
+    }
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    struct AlkanesViewStorageResponse {
+        #[prost(bytes = "vec", tag = "1")]
+        value: Vec<u8>,
+    }
+
+    const ALKANES_KEY_PREFIX:    &[u8] = b"/alkanes/";
+    const ALKANES_STORAGE_INNER: &[u8] = b"/storage/";
+
+    /// Try to parse `key` as the IndexPointer-composed shape
+    /// `b"/alkanes/" ++ <32-byte id> ++ b"/storage/" ++ <path>`. Returns
+    /// `(block, tx, path_bytes)` on a match.
+    fn parse_alkane_storage_key(key: &[u8]) -> Option<(u128, u128, Vec<u8>)> {
+        if !key.starts_with(ALKANES_KEY_PREFIX) {
+            return None;
+        }
+        let after_prefix = &key[ALKANES_KEY_PREFIX.len()..];
+        if after_prefix.len() < 32 {
+            return None;
+        }
+        let id_bytes = &after_prefix[..32];
+        let rest     = &after_prefix[32..];
+        if !rest.starts_with(ALKANES_STORAGE_INNER) {
+            return None;
+        }
+        let path = rest[ALKANES_STORAGE_INNER.len()..].to_vec();
+        let mut block_buf = [0u8; 16];
+        block_buf.copy_from_slice(&id_bytes[..16]);
+        let mut tx_buf = [0u8; 16];
+        tx_buf.copy_from_slice(&id_bytes[16..]);
+        let block = u128::from_le_bytes(block_buf);
+        let tx    = u128::from_le_bytes(tx_buf);
+        Some((block, tx, path))
+    }
+
+    fn split_u128_lo_hi(v: u128) -> (u64, u64) {
+        ((v as u64), ((v >> 64) as u64))
+    }
+
     #[async_trait]
     impl ForkUpstream for HttpForkUpstream {
         async fn fetch(&self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
-            let key_hex = format!("0x{}", hex::encode(key));
+            // Decode the IndexPointer key. If it doesn't match the
+            // alkanes shape we treat it as absent — the view function
+            // we proxy through has no notion of generic raw-kv keys.
+            let (block, tx, path) = match parse_alkane_storage_key(key) {
+                Some(p) => p,
+                None    => return Ok(None),
+            };
+            let (block_lo, block_hi) = split_u128_lo_hi(block);
+            let (tx_lo,    tx_hi)    = split_u128_lo_hi(tx);
+            let request = AlkanesViewStorageRequest {
+                id: Some(AlkanesViewAlkaneId {
+                    block: Some(AlkanesViewUint128 { lo: block_lo, hi: block_hi }),
+                    tx:    Some(AlkanesViewUint128 { lo: tx_lo,    hi: tx_hi    }),
+                }),
+                path,
+            };
+            use prost::Message;
+            let hex_input = format!("0x{}", hex::encode(request.encode_to_vec()));
             let req = JsonRpcReq {
                 jsonrpc: "2.0",
                 id: 0,
                 method: "metashrew_view",
                 params: vec![
                     serde_json::Value::String("getstorageat".into()),
-                    serde_json::Value::String(key_hex),
+                    serde_json::Value::String(hex_input),
                     serde_json::Value::String("latest".into()),
                 ],
             };
@@ -119,18 +221,31 @@ mod http {
             if let Some(err) = resp.error {
                 return Err(format!("upstream rpc error: {}", err));
             }
-            match resp.result {
-                None | Some(serde_json::Value::Null) => Ok(None),
-                Some(serde_json::Value::String(s)) => {
-                    let trimmed = s.trim_start_matches("0x");
-                    if trimmed.is_empty() {
-                        return Ok(Some(Vec::new()));
-                    }
-                    let bytes = hex::decode(trimmed)
-                        .map_err(|e| format!("upstream decode hex: {}", e))?;
-                    Ok(Some(bytes))
-                }
-                Some(other) => Err(format!("upstream unexpected result: {}", other)),
+            // `getstorageat` returns the prost-encoded
+            // `AlkaneStorageResponse { bytes value = 1 }` as hex. An
+            // empty response or a default-encoded one both correspond
+            // to "key absent" — we surface that as `Ok(None)` so the
+            // WASM's __get_len call returns 0 and the trace continues.
+            let hex_str = match resp.result {
+                None | Some(serde_json::Value::Null) => return Ok(None),
+                Some(serde_json::Value::String(s))   => s,
+                Some(other) => return Err(format!("upstream unexpected result: {}", other)),
+            };
+            let trimmed = hex_str.trim_start_matches("0x");
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            let bytes = hex::decode(trimmed)
+                .map_err(|e| format!("upstream decode hex: {}", e))?;
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            let decoded = AlkanesViewStorageResponse::decode(&*bytes)
+                .map_err(|e| format!("upstream decode response: {}", e))?;
+            if decoded.value.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(decoded.value))
             }
         }
 

@@ -2,7 +2,9 @@
 //!
 //! Presents the qubitcoind RPC API surface (no auth) and translates:
 //!   - secondaryview("alkanes", fn, hex)  → metashrew_view(fn, hex) on metashrew
-//!   - secondaryview("esplora", fn, hex)  → metashrew_view(fn, hex) on metashrew
+//!   - secondaryview("esplora", fn, hex)  → esplora REST API
+//!   - secondaryview("ord", fn, hex)      → ord REST API
+//!   - secondaryview("brc20", fn, hex)    → metashrew_view on brc20 rockshrew
 //!   - secondaryheight("alkanes")         → metashrew_height() on metashrew
 //!   - secondaryheight("esplora")         → metashrew_height() on metashrew
 //!   - Everything else                    → bitcoind (with Basic auth)
@@ -14,6 +16,9 @@
 //!   BITCOIND_PASS     (default: bitcoinrpc)
 //!   METASHREW_URL     (default: http://localhost:8080)
 //!   ESPLORA_URL       (default: http://localhost:50010)
+//!   ORD_URL           (default: http://localhost:8090)
+//!   ESPO_URL          (default: http://localhost:5778)   — OPI/brc20-prog
+//!   BRC20_URL         (default: http://localhost:8082)   — brc20 rockshrew
 
 use base64::Engine;
 use bytes::Bytes;
@@ -33,6 +38,9 @@ struct Config {
     bitcoind_auth: String, // "Basic <b64>"
     metashrew_url: String,
     esplora_url: String,
+    ord_url: String,
+    espo_url: String,
+    brc20_url: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -146,11 +154,32 @@ impl Proxy {
         }
     }
 
+    /// Forward a JSON-RPC request to a generic metashrew-compatible backend (no auth).
+    async fn forward_rockshrew(&self, url: &str, id: serde_json::Value, method: &str, params: serde_json::Value) -> JsonRpcResponse {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+
+        match self.client.post(url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send().await
+        {
+            Ok(resp) => self.parse_upstream(id, resp).await,
+            Err(e) => JsonRpcResponse::error(id, -32603, format!("rockshrew({url}): {e}")),
+        }
+    }
+
     /// Route a request.
     async fn handle(&self, req: JsonRpcRequest) -> JsonRpcResponse {
         match req.method.as_str() {
             "secondaryview" => self.handle_secondaryview(req).await,
             "secondaryheight" => self.handle_secondaryheight(req).await,
+            "tertiaryview" => self.handle_tertiaryview(req).await,
+            "tertiaryheight" => self.handle_tertiaryheight(req).await,
             _ => self.forward_bitcoind(&req).await,
         }
     }
@@ -177,7 +206,7 @@ impl Proxy {
 
         match label {
             "alkanes" => {
-                // Forward to metashrew_view
+                // Forward to metashrew_view on alkanes rockshrew
                 let ms_params = serde_json::json!([view_fn, input_hex]);
                 self.forward_metashrew(req.id, "metashrew_view", ms_params).await
             }
@@ -187,12 +216,104 @@ impl Proxy {
                 let hex_input = input_hex.as_str().unwrap_or("");
                 self.handle_esplora_view(req.id, fn_name, hex_input).await
             }
+            "ord" => {
+                // Forward to ord REST API
+                let fn_name = view_fn.as_str().unwrap_or("");
+                let hex_input = input_hex.as_str().unwrap_or("");
+                self.handle_ord_view(req.id, fn_name, hex_input).await
+            }
+            "brc20" => {
+                // Forward to brc20 rockshrew via metashrew_view
+                let ms_params = serde_json::json!([view_fn, input_hex]);
+                self.forward_rockshrew(&self.config.brc20_url, req.id, "metashrew_view", ms_params).await
+            }
             other => {
                 log::warn!("secondaryview: unknown label '{other}', forwarding to metashrew");
                 let ms_params = serde_json::json!([view_fn, input_hex]);
                 self.forward_metashrew(req.id, "metashrew_view", ms_params).await
             }
         }
+    }
+
+    /// Handle ord label view functions by translating to ord REST API.
+    async fn handle_ord_view(&self, id: serde_json::Value, fn_name: &str, hex_input: &str) -> JsonRpcResponse {
+        let clean_hex = hex_input.strip_prefix("0x").unwrap_or(hex_input);
+        let input_text = if clean_hex.is_empty() {
+            String::new()
+        } else {
+            match hex::decode(clean_hex) {
+                Ok(b) => String::from_utf8_lossy(&b).to_string(),
+                Err(e) => return JsonRpcResponse::error(id, -32602, format!("invalid hex: {e}")),
+            }
+        };
+
+        let path = match fn_name {
+            "inscription" => format!("/inscription/{}", input_text),
+            "inscriptions" => format!("/inscriptions/{}", input_text),
+            "content" => format!("/content/{}", input_text),
+            "sat" => format!("/sat/{}", input_text),
+            "output" => format!("/output/{}", input_text),
+            "block" => format!("/block/{}", input_text),
+            other => return JsonRpcResponse::error(id, -32601, format!("unknown ord view: {other}")),
+        };
+
+        let url = format!("{}{}", self.config.ord_url, path);
+        log::info!("ord GET {url}");
+
+        match self.client.get(&url).header("Accept", "application/json").send().await {
+            Ok(resp) => match resp.text().await {
+                Ok(body) => {
+                    let hex_body = format!("0x{}", hex::encode(body.as_bytes()));
+                    JsonRpcResponse::success(id, serde_json::Value::String(hex_body))
+                }
+                Err(e) => JsonRpcResponse::error(id, -32603, format!("ord read: {e}")),
+            },
+            Err(e) => JsonRpcResponse::error(id, -32603, format!("ord request: {e}")),
+        }
+    }
+
+    /// tertiaryview ["label", "view_fn", "input_hex"]
+    /// Routes to espo (OPI / brc20-prog) backend.
+    async fn handle_tertiaryview(&self, req: JsonRpcRequest) -> JsonRpcResponse {
+        let params = match req.params.as_array() {
+            Some(a) => a,
+            None => return JsonRpcResponse::error(req.id, -32602, "params must be an array".into()),
+        };
+
+        if params.len() < 3 {
+            return JsonRpcResponse::error(req.id, -32602,
+                format!("tertiaryview requires [label, view_fn, input_hex], got {} params", params.len()));
+        }
+
+        let label = params[0].as_str().unwrap_or("");
+        let view_fn = &params[1];
+        let input_hex = &params[2];
+
+        log::info!("tertiaryview label={label} fn={view_fn}");
+
+        match label {
+            "espo" | "brc20-prog" | "opi" => {
+                let ms_params = serde_json::json!([view_fn, input_hex]);
+                self.forward_rockshrew(&self.config.espo_url, req.id, "metashrew_view", ms_params).await
+            }
+            other => {
+                log::warn!("tertiaryview: unknown label '{other}', forwarding to espo");
+                let ms_params = serde_json::json!([view_fn, input_hex]);
+                self.forward_rockshrew(&self.config.espo_url, req.id, "metashrew_view", ms_params).await
+            }
+        }
+    }
+
+    /// tertiaryheight ["label"]
+    async fn handle_tertiaryheight(&self, req: JsonRpcRequest) -> JsonRpcResponse {
+        let label = req.params.as_array()
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+            .unwrap_or("espo");
+
+        log::info!("tertiaryheight label={label}");
+
+        self.forward_rockshrew(&self.config.espo_url, req.id, "metashrew_height", serde_json::json!([])).await
     }
 
     /// Handle esplora label view functions by translating to esplora REST API.
@@ -202,18 +323,40 @@ impl Proxy {
     ///
     /// Response: the JSON body is hex-encoded and returned as the RPC result string.
     async fn handle_esplora_view(&self, id: serde_json::Value, fn_name: &str, hex_input: &str) -> JsonRpcResponse {
+        // Strip 0x prefix if present, handle empty input for views like tipheight
+        let clean_hex = hex_input.strip_prefix("0x").unwrap_or(hex_input);
+        if clean_hex.is_empty() || fn_name == "tipheight" {
+            // No input needed — just fetch the endpoint
+            let path = match fn_name {
+                "tipheight" => "/blocks/tip/height".to_string(),
+                other => return JsonRpcResponse::error(id, -32601, format!("unknown esplora view: {other}")),
+            };
+            let url = format!("{}{}", self.config.esplora_url, path);
+            log::info!("esplora GET {url}");
+            return match self.client.get(&url).send().await {
+                Ok(resp) => match resp.text().await {
+                    Ok(body) => {
+                        let hex_body = format!("0x{}", hex::encode(body.as_bytes()));
+                        JsonRpcResponse::success(id, serde_json::Value::String(hex_body))
+                    }
+                    Err(e) => JsonRpcResponse::error(id, -32603, format!("esplora read: {e}")),
+                },
+                Err(e) => JsonRpcResponse::error(id, -32603, format!("esplora request: {e}")),
+            };
+        }
+
         // Decode the hex input to get the text parameter
-        let input_bytes = match hex::decode(hex_input) {
+        let input_bytes = match hex::decode(clean_hex) {
             Ok(b) => b,
             Err(e) => return JsonRpcResponse::error(id, -32602, format!("invalid hex input: {e}")),
         };
         let input_text = String::from_utf8_lossy(&input_bytes);
 
-        // esplorashrew stored scripthashes in reversed byte order (internal).
-        // Standard esplora uses forward byte order (display). Reverse if needed.
+        // The signal programs follow Electrum convention and pre-reverse the
+        // scripthash bytes (sha256(scriptPubKey) reversed). Modern esplora REST
+        // expects forward byte order, so reverse them back.
         let input_str = input_text.to_string();
         let scripthash = if input_str.len() == 64 && input_str.chars().all(|c| c.is_ascii_hexdigit()) {
-            // Reverse byte order: swap pairs of hex chars
             let bytes: Vec<u8> = (0..32).map(|i| {
                 u8::from_str_radix(&input_str[i*2..i*2+2], 16).unwrap_or(0)
             }).collect();
@@ -227,6 +370,7 @@ impl Proxy {
             "utxosbyscripthash" => format!("/scripthash/{}/utxo", scripthash),
             "txsbyscripthash" => format!("/scripthash/{}/txs", scripthash),
             "scripthashbalance" => format!("/scripthash/{}", scripthash),
+            "tipheight" => "/blocks/tip/height".to_string(),
             other => {
                 return JsonRpcResponse::error(id, -32601, format!("unknown esplora view: {other}"));
             }
@@ -308,6 +452,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bitcoind_pass = env::var("BITCOIND_PASS").unwrap_or_else(|_| "bitcoinrpc".into());
     let metashrew_url = env::var("METASHREW_URL").unwrap_or_else(|_| "http://localhost:8080".into());
     let esplora_url = env::var("ESPLORA_URL").unwrap_or_else(|_| "http://localhost:50010".into());
+    let ord_url = env::var("ORD_URL").unwrap_or_else(|_| "http://localhost:8090".into());
+    let espo_url = env::var("ESPO_URL").unwrap_or_else(|_| "http://localhost:5778".into());
+    let brc20_url = env::var("BRC20_URL").unwrap_or_else(|_| "http://localhost:8082".into());
 
     let auth_b64 = base64::engine::general_purpose::STANDARD
         .encode(format!("{bitcoind_user}:{bitcoind_pass}"));
@@ -317,12 +464,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bitcoind_auth: format!("Basic {auth_b64}"),
         metashrew_url,
         esplora_url,
+        ord_url,
+        espo_url,
+        brc20_url,
     };
 
     log::info!("qubitcoin-jsonrpc starting on {listen_addr}");
-    log::info!("  bitcoind → {}", config.bitcoind_url);
+    log::info!("  bitcoind  → {}", config.bitcoind_url);
     log::info!("  metashrew → {}", config.metashrew_url);
-    log::info!("  esplora → {}", config.esplora_url);
+    log::info!("  esplora   → {}", config.esplora_url);
+    log::info!("  ord       → {}", config.ord_url);
+    log::info!("  espo      → {}", config.espo_url);
+    log::info!("  brc20     → {}", config.brc20_url);
 
     let proxy = Arc::new(Proxy::new(config));
     let listener = TcpListener::bind(listen_addr).await?;

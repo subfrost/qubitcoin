@@ -1,3 +1,5 @@
+[workspace]
+
 [package]
 name = "qubitcoin-compat-jsonrpc"
 version = "0.1.0"
