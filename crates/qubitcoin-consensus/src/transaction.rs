@@ -8,7 +8,7 @@ use qubitcoin_crypto::hash::hash256;
 use qubitcoin_primitives::{Amount, Txid, Uint256, Wtxid};
 use qubitcoin_script::Script;
 use qubitcoin_serialize::{
-    decode_vec, encode_vec, read_compact_size, write_compact_size, Decodable, Encodable,
+    decode_vec, write_compact_size, Decodable, Encodable,
     Error as SerError,
 };
 use std::io::{Read, Write};
@@ -465,12 +465,11 @@ pub fn deserialize_transaction<R: Read>(
     if (flags & 1) != 0 && allow_witness {
         flags ^= 1;
         for input in &mut vin {
-            let stack_count = read_compact_size(r)? as usize;
-            let mut stack = Vec::with_capacity(stack_count);
-            for _ in 0..stack_count {
-                let item = Vec::<u8>::decode(r)?;
-                stack.push(item);
-            }
+            // Reuse the length-guarded `decode_vec` helper rather than a
+            // hand-rolled loop: it clamps the pre-allocation to
+            // MAX_VECTOR_ALLOCATE so a malicious `stack_count` (up to
+            // MAX_SIZE) cannot trigger a huge speculative allocation.
+            let stack: Vec<Vec<u8>> = decode_vec(r)?;
             input.witness = Witness { stack };
         }
 
@@ -510,6 +509,38 @@ impl Decodable for Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_witness_decode_huge_count_does_not_oom() {
+        // A transaction advertising a witness stack of ~33M items (MAX_SIZE)
+        // in a tiny message must not trigger a multi-hundred-MB speculative
+        // allocation. Because the actual bytes run out immediately, decode
+        // should fail cleanly (UnexpectedEof) rather than pre-reserving.
+        //
+        // Segwit layout: version | 0x00 marker | 0x01 flag | 1 vin | 1 vout
+        // | locktime, with the witness stack-count set to a huge CompactSize.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes()); // version
+        buf.push(0x00); // segwit marker (empty vin => witness format)
+        buf.push(0x01); // flag
+        buf.push(0x01); // vin count = 1
+        buf.extend_from_slice(&[0u8; 32]); // prevout txid
+        buf.extend_from_slice(&0u32.to_le_bytes()); // prevout vout
+        buf.push(0x00); // scriptSig length = 0
+        buf.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // sequence
+        buf.push(0x01); // vout count = 1
+        buf.extend_from_slice(&0u64.to_le_bytes()); // value
+        buf.push(0x00); // scriptPubKey length = 0
+        // Witness for input 0: stack count = 0x01FF_FFFF (just under MAX_SIZE),
+        // encoded as CompactSize 0xFE + u32. No stack bytes follow.
+        buf.push(0xFE);
+        buf.extend_from_slice(&0x01FF_FFFFu32.to_le_bytes());
+
+        let mut cursor = std::io::Cursor::new(buf);
+        // Must return an error (ran out of input), not abort/OOM.
+        let result = deserialize_transaction(&mut cursor, true);
+        assert!(result.is_err());
+    }
 
     #[test]
     fn test_outpoint_null() {

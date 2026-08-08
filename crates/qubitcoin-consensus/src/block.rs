@@ -8,6 +8,7 @@ use qubitcoin_crypto::hash::hash256;
 use qubitcoin_primitives::{BlockHash, Uint256};
 use qubitcoin_serialize::{
     read_compact_size, write_compact_size, Decodable, Encodable, Error as SerError,
+    MAX_VECTOR_ALLOCATE,
 };
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -147,7 +148,11 @@ impl Decodable for Block {
     fn decode<R: Read>(r: &mut R) -> Result<Self, SerError> {
         let header = BlockHeader::decode(r)?;
         let tx_count = read_compact_size(r)? as usize;
-        let mut vtx = Vec::with_capacity(tx_count);
+        // Clamp the speculative pre-allocation: `tx_count` is attacker-chosen
+        // (up to MAX_SIZE) and each entry would otherwise reserve space before
+        // any transaction bytes are read. The loop still appends up to the true
+        // count; only the initial reservation is bounded.
+        let mut vtx = Vec::with_capacity(tx_count.min(MAX_VECTOR_ALLOCATE));
         for _ in 0..tx_count {
             let tx = deserialize_transaction(r, true)?;
             vtx.push(Arc::new(tx));
