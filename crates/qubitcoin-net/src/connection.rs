@@ -11,8 +11,8 @@
 use crate::peer::{PeerManager, PeerState};
 use crate::protocol::{
     InvType, InvVect, MessageHeader, NetAddress, NetMessage, NetworkMagic, ServiceFlags,
-    VersionMessage, MAX_PAYLOAD_SIZE, MIN_PEER_PROTO_VERSION, PROTOCOL_VERSION,
-    WTXID_RELAY_VERSION,
+    VersionMessage, MAX_PAYLOAD_SIZE, MIN_PEER_PROTO_VERSION, PING_INTERVAL, PROTOCOL_VERSION,
+    TIMEOUT_INTERVAL, WTXID_RELAY_VERSION,
 };
 use qubitcoin_primitives::BlockHash;
 use std::collections::HashMap;
@@ -123,6 +123,13 @@ pub struct ConnManager {
     shutdown_tx: broadcast::Sender<()>,
     /// Per-peer send channels for outbound messages.
     peer_senders: Arc<parking_lot::RwLock<HashMap<u64, mpsc::UnboundedSender<(String, Vec<u8>)>>>>,
+    /// Abort handle for each peer's `handle_connection` task.
+    ///
+    /// Required because dropping the peer's SENDER does not end the connection:
+    /// the read loop holds its own clone of `write_tx` for the whole session, so
+    /// `write_rx` stays open and the socket stays up. Aborting the task drops
+    /// both halves of the split stream, which is what actually closes it.
+    peer_tasks: Arc<parking_lot::RwLock<HashMap<u64, tokio::task::AbortHandle>>>,
     /// Our local nonce, used for self-connection detection.
     local_nonce: u64,
 }
@@ -137,6 +144,7 @@ impl ConnManager {
 
         ConnManager {
             config,
+            peer_tasks: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             peer_manager,
             event_tx,
             event_rx: Some(event_rx),
@@ -176,6 +184,7 @@ impl ConnManager {
         let config = self.config.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let peer_senders = self.peer_senders.clone();
+        let peer_tasks = self.peer_tasks.clone();
         let local_nonce = self.local_nonce;
 
         tokio::spawn(async move {
@@ -201,12 +210,13 @@ impl ConnManager {
                                 let mut srx = shutdown_rx.resubscribe();
                                 let ps = peer_senders.clone();
 
-                                tokio::spawn(async move {
+                                let task = tokio::spawn(async move {
                                     handle_connection(
                                         stream, peer_id, true, magic, pm, etx, cfg, &mut srx, ps, local_nonce,
                                     )
                                     .await;
                                 });
+                                peer_tasks.write().insert(peer_id, task.abort_handle());
                             }
                             Err(e) => {
                                 tracing::error!(error = %e, "accept error");
@@ -247,7 +257,7 @@ impl ConnManager {
         let ps = self.peer_senders.clone();
         let local_nonce = self.local_nonce;
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             handle_connection(
                 stream,
                 peer_id,
@@ -262,6 +272,7 @@ impl ConnManager {
             )
             .await;
         });
+        self.peer_tasks.write().insert(peer_id, task.abort_handle());
 
         Ok(peer_id)
     }
@@ -279,12 +290,29 @@ impl ConnManager {
         }
     }
 
-    /// Disconnect a specific peer by dropping its send channel.
+    /// Disconnect a specific peer, for real.
     ///
-    /// When the sender is dropped the per-peer writer task exits, which
-    /// in turn closes the TCP connection.
+    /// 🔴 THIS USED TO DO NOTHING. The old body removed the peer from
+    /// `peer_senders` and the doc comment claimed that dropping the sender ended
+    /// the writer task and closed the connection. It does not: the map holds a
+    /// CLONE, while the original `write_tx` is captured by the read loop's
+    /// `enqueue` closure and lives as long as the session. `write_rx` therefore
+    /// never closed, the writer task kept running, and the peer kept being
+    /// served exactly as before.
+    ///
+    /// The consequence was that every mitigation phrased as "we disconnect on
+    /// this" was inert — including all of `misbehaving()`'s call sites, which is
+    /// the entire ban/discourage path.
+    ///
+    /// Aborting the connection task drops both halves of the split stream, which
+    /// closes the socket. The abort skips the task's own cleanup, so the map
+    /// removals are done here instead.
     pub fn disconnect_peer(&self, peer_id: u64) {
+        if let Some(task) = self.peer_tasks.write().remove(&peer_id) {
+            task.abort();
+        }
         self.peer_senders.write().remove(&peer_id);
+        self.peer_manager.remove_peer(peer_id);
     }
 
     /// Shutdown all connections.
@@ -386,14 +414,58 @@ async fn handle_connection(
     peer_manager.update_peer(peer_id, |p| p.state = PeerState::Handshaking);
 
     // ── Read loop ──────────────────────────────────────────────────
+    //
+    // 🔴 KEEPALIVE AND INACTIVITY TIMEOUT. This driver used to only ANSWER
+    // pings; it never sent one, and never timed a peer out. `PING_INTERVAL` and
+    // `TIMEOUT_INTERVAL` were defined in protocol.rs and referenced nowhere, and
+    // `PeerSyncState::ping_outstanding` was initialised and never read.
+    //
+    // The effect is that a silently-wedged connection — a half-open socket where
+    // the peer is gone but no FIN or RST ever arrives — parks this loop on
+    // `read_exact` forever. Nothing detects it, nothing reports it, and no
+    // reconnect logic anywhere upstream can fire, because from the socket's
+    // point of view nothing has happened. That is the exact shape of the stall
+    // that froze subvh-mempool's ingest for two days.
+    //
+    // Core's answer is a liveness probe, not a smarter socket: send a ping when
+    // the link goes quiet, and drop the peer if nothing at all arrives within
+    // TIMEOUT_INTERVAL. Any inbound traffic counts as proof of life — the peer
+    // does not have to answer our ping specifically, which is what makes this
+    // safe against peers that deprioritise pings under load.
     let mut reader = reader;
+    let mut last_recv = std::time::Instant::now();
+    let mut last_ping_sent = std::time::Instant::now();
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(30));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let mut header_buf = [0u8; 24];
 
         tokio::select! {
+            _ = keepalive.tick() => {
+                if last_recv.elapsed() >= std::time::Duration::from_secs(TIMEOUT_INTERVAL) {
+                    peer_senders.write().remove(&peer_id);
+                    cleanup_peer(
+                        peer_id,
+                        &peer_manager,
+                        &event_tx,
+                        format!("inactivity: nothing received for {}s", TIMEOUT_INTERVAL),
+                    );
+                    drop(write_tx);
+                    writer_handle.abort();
+                    return;
+                }
+                if last_ping_sent.elapsed() >= std::time::Duration::from_secs(PING_INTERVAL) {
+                    let nonce = rand::random::<u64>();
+                    // A failed enqueue means the writer is gone; the read side
+                    // will notice on its own, so do not tear down from here.
+                    let _ = enqueue("ping", nonce.to_le_bytes().to_vec());
+                    last_ping_sent = std::time::Instant::now();
+                }
+                continue;
+            }
             result = AsyncReadExt::read_exact(&mut reader, &mut header_buf) => {
                 match result {
-                    Ok(_) => {}
+                    Ok(_) => { last_recv = std::time::Instant::now(); }
                     Err(e) => {
                         peer_senders.write().remove(&peer_id);
                         cleanup_peer(
@@ -664,7 +736,10 @@ pub fn deserialize_version(data: &[u8]) -> Option<VersionMessage> {
     // user_agent at 80
     let (ua_len, varint_size) = read_varint(&data[80..])?;
     let ua_start = 80 + varint_size;
-    let ua_end = ua_start + ua_len as usize;
+    // checked_add even though read_varint now bounds ua_len: this is the site
+    // that panicked, and it should not silently depend on a guard living in
+    // another function for its memory safety.
+    let ua_end = ua_start.checked_add(ua_len as usize)?;
     if data.len() < ua_end {
         return None;
     }
@@ -757,31 +832,52 @@ pub fn write_varint(val: u64, buf: &mut Vec<u8>) {
 
 /// Read a Bitcoin-style variable-length integer.
 /// Returns `(value, bytes_consumed)`.
+///
+/// 🔴 THE RETURNED VALUE IS BOUNDED BY `MAX_PAYLOAD_SIZE`, and that bound is
+/// load-bearing for memory safety, not just for policy.
+///
+/// Callers throughout `parse_message` do `start + len as usize` and then test
+/// `data.len() < end`. An unbounded `u64` makes that addition WRAP — the release
+/// profile sets no `overflow-checks` — so a `0xff` varint of `u64::MAX` yields an
+/// `end` *below* `start`, the length test passes, and the following slice index
+/// panics with `start > end`.
+///
+/// That panic is not a clean rejection. `handle_connection` runs in a spawned
+/// task, so unwinding skips the cleanup that removes the peer from
+/// `peer_senders` and `peer_manager` — the writer task and its socket half leak,
+/// and because `can_accept_inbound` counts map entries, inbound capacity is
+/// consumed permanently. A few hundred malformed 20-byte packets exhaust it,
+/// from an UNAUTHENTICATED peer before any handshake.
+///
+/// Core enforces the same ceiling inside `ReadCompactSize` for exactly this
+/// reason, rather than trusting every call site to check.
 pub fn read_varint(data: &[u8]) -> Option<(u64, usize)> {
     if data.is_empty() {
         return None;
+    }
+    // Applied to every wide arm. A single-byte varint cannot exceed 0xfc, so it
+    // is always in range and needs no check.
+    fn bounded(v: u64, n: usize) -> Option<(u64, usize)> {
+        (v <= MAX_PAYLOAD_SIZE as u64).then_some((v, n))
     }
     match data[0] {
         0xff => {
             if data.len() < 9 {
                 return None;
             }
-            let val = u64::from_le_bytes(data[1..9].try_into().ok()?);
-            Some((val, 9))
+            bounded(u64::from_le_bytes(data[1..9].try_into().ok()?), 9)
         }
         0xfe => {
             if data.len() < 5 {
                 return None;
             }
-            let val = u32::from_le_bytes(data[1..5].try_into().ok()?) as u64;
-            Some((val, 5))
+            bounded(u32::from_le_bytes(data[1..5].try_into().ok()?) as u64, 5)
         }
         0xfd => {
             if data.len() < 3 {
                 return None;
             }
-            let val = u16::from_le_bytes(data[1..3].try_into().ok()?) as u64;
-            Some((val, 3))
+            bounded(u16::from_le_bytes(data[1..3].try_into().ok()?) as u64, 3)
         }
         v => Some((v as u64, 1)),
     }
@@ -1000,14 +1096,27 @@ pub fn parse_message(command: &str, payload: &[u8]) -> NetMessage {
             // Parse reject: varint message_len + message + code(1) + varint reason_len + reason
             if let Some((msg_len, offset)) = read_varint(payload) {
                 let msg_start = offset;
-                let msg_end = msg_start + msg_len as usize;
+                // Was `msg_start + msg_len`, which wrapped: a 20-byte packet
+                // carrying 0xff + u64::MAX produced msg_end < msg_start, passed
+                // the bound test below, and panicked on the slice.
+                let msg_end = match msg_start.checked_add(msg_len as usize) {
+                    Some(e) => e,
+                    None => usize::MAX,
+                };
                 if msg_end < payload.len() {
                     let message = String::from_utf8_lossy(&payload[msg_start..msg_end]).to_string();
                     let code = payload[msg_end];
                     let reason = if msg_end + 1 < payload.len() {
                         if let Some((reason_len, r_offset)) = read_varint(&payload[msg_end + 1..]) {
                             let r_start = msg_end + 1 + r_offset;
-                            let r_end = (r_start + reason_len as usize).min(payload.len());
+                            // `.min(len)` did not save this: a wrapped sum can
+                            // land BELOW r_start, and `&payload[r_start..r_end]`
+                            // panics whenever start > end.
+                            let r_end = r_start
+                                .checked_add(reason_len as usize)
+                                .unwrap_or(usize::MAX)
+                                .min(payload.len())
+                                .max(r_start);
                             String::from_utf8_lossy(&payload[r_start..r_end]).to_string()
                         } else {
                             String::new()
@@ -1290,6 +1399,79 @@ pub async fn send_raw_message(
 
 #[cfg(test)]
 mod tests {
+
+    // ---- D1: the pre-handshake panic class --------------------------------
+    //
+    // Every one of these is a payload an UNAUTHENTICATED peer can send before
+    // any handshake. Before the fix each panicked inside a spawned task, and the
+    // unwind skipped the cleanup that frees the peer slot — so the damage was
+    // permanent, not per-connection.
+
+    #[test]
+    fn an_oversized_varint_is_refused_rather_than_wrapping() {
+        // 0xff + u64::MAX. Callers do `start + len as usize`; unbounded, that
+        // wraps to a value BELOW start, slips past the `len < end` guard, and
+        // panics on the slice.
+        let mut v = vec![0xffu8];
+        v.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(read_varint(&v), None, "u64::MAX must not survive as a length");
+
+        let mut big = vec![0xfeu8];
+        big.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(read_varint(&big), None, "4GB length must not survive either");
+    }
+
+    #[test]
+    fn ordinary_varints_still_decode() {
+        assert_eq!(read_varint(&[0x05]), Some((5, 1)));
+        assert_eq!(read_varint(&[0xfd, 0x00, 0x01]), Some((256, 3)));
+        // Exactly at the ceiling is legal; one above is not.
+        let mut ok = vec![0xfeu8];
+        ok.extend_from_slice(&MAX_PAYLOAD_SIZE.to_le_bytes());
+        assert_eq!(read_varint(&ok), Some((MAX_PAYLOAD_SIZE as u64, 5)));
+        let mut over = vec![0xfeu8];
+        over.extend_from_slice(&(MAX_PAYLOAD_SIZE + 1).to_le_bytes());
+        assert_eq!(read_varint(&over), None);
+    }
+
+    #[test]
+    fn a_version_with_a_lying_user_agent_length_does_not_panic() {
+        // 80 bytes of plausible version fields, then a user-agent varint that
+        // claims u64::MAX.
+        let mut data = vec![0u8; 80];
+        data[0..4].copy_from_slice(&70016u32.to_le_bytes());
+        data.push(0xff);
+        data.extend_from_slice(&u64::MAX.to_le_bytes());
+        // Must return None, not unwind.
+        assert!(deserialize_version(&data).is_none());
+    }
+
+    #[test]
+    fn a_reject_message_with_a_lying_length_does_not_panic() {
+        // The 20-byte trigger. parse_message must produce SOMETHING (Unknown or
+        // a Reject with empty fields) and must not panic.
+        let mut payload = vec![0xffu8];
+        payload.extend_from_slice(&u64::MAX.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 11]);
+        let _ = parse_message("reject", &payload);
+
+        // And the reason-length field, which the old `.min(len)` did not save
+        // because a wrapped sum can land below r_start.
+        let mut p2 = vec![0x02u8, b'h', b'i', 0x01, 0xff];
+        p2.extend_from_slice(&u64::MAX.to_le_bytes());
+        let _ = parse_message("reject", &p2);
+    }
+
+    #[test]
+    fn parse_message_survives_arbitrary_short_payloads() {
+        // Cheap breadth: no command/length combination should unwind.
+        for cmd in ["version", "reject", "addr", "inv", "headers", "ping", "tx", "block"] {
+            for len in 0..40usize {
+                let payload = vec![0xffu8; len];
+                let _ = parse_message(cmd, &payload);
+            }
+        }
+    }
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -1456,9 +1638,13 @@ mod tests {
 
     #[test]
     fn test_varint_eight_bytes() {
+        // A 9-byte varint is still DECODED as a 9-byte varint; it is the VALUE
+        // that must be in range. Use the largest legal length so this keeps
+        // exercising the 0xff width path.
         let mut buf = Vec::new();
-        let big = 0x1_0000_0000u64;
-        write_varint(big, &mut buf);
+        let big = MAX_PAYLOAD_SIZE as u64;
+        buf.push(0xff);
+        buf.extend_from_slice(&big.to_le_bytes());
         assert_eq!(buf.len(), 9);
         assert_eq!(buf[0], 0xff);
 
@@ -1469,12 +1655,31 @@ mod tests {
 
     #[test]
     fn test_varint_roundtrip() {
-        for val in [0, 1, 252, 253, 0xffff, 0x10000, 0xffff_ffff, 0x1_0000_0000] {
+        // Bounded by MAX_PAYLOAD_SIZE deliberately: in this crate `read_varint`
+        // decodes LENGTHS AND COUNTS, never values. The out-of-range cases that
+        // used to live in this list (0xffff_ffff, 0x1_0000_0000) are now the
+        // subject of `an_oversized_varint_is_refused_rather_than_wrapping` —
+        // they must be REJECTED, because accepting them is what let a wrapped
+        // `start + len` panic the parser.
+        //
+        // The general-purpose varint codecs in qubitcoin-serialize and
+        // qubitcoin-common are separate functions and are unaffected.
+        for val in [0, 1, 252, 253, 0xffff, 0x10000, MAX_PAYLOAD_SIZE as u64] {
             let mut buf = Vec::new();
             write_varint(val, &mut buf);
             let (decoded, _) = read_varint(&buf).unwrap();
             assert_eq!(decoded, val, "roundtrip failed for {}", val);
         }
+    }
+
+    #[test]
+    fn write_varint_still_encodes_wide_values() {
+        // The WRITER is unchanged and must stay able to emit every width; only
+        // the reader is bounded, and only because its results index slices.
+        let mut buf = Vec::new();
+        write_varint(0x1_0000_0000u64, &mut buf);
+        assert_eq!(buf.len(), 9);
+        assert_eq!(buf[0], 0xff);
     }
 
     #[test]

@@ -12,8 +12,21 @@ use std::time::Duration;
 use qubitcoin_net::connection::{serialize_message, ConnConfig, ConnManager, ConnectionEvent};
 use qubitcoin_net::protocol::{InvType, InvVect, NetMessage, NetworkMagic, ServiceFlags};
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // 3rd arg "ct" builds a current_thread runtime (reproduces espo's mempool
+    // service runtime); anything else -> multi_thread.
+    let ct = std::env::args().nth(3).as_deref() == Some("ct");
+    let rt = if ct {
+        println!("[probe] runtime=current_thread");
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    } else {
+        println!("[probe] runtime=multi_thread");
+        tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap()
+    };
+    rt.block_on(run());
+}
+
+async fn run() {
     let addr_s = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:18444".to_string());
     let net = std::env::args().nth(2).unwrap_or_else(|| "regtest".to_string());
     let addr: std::net::SocketAddr = addr_s.parse().expect("valid host:port");

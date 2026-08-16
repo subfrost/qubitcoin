@@ -143,9 +143,6 @@ impl QubitcoinStorageAdapter {
         format!("/__INTERNAL/height-to-hash/{}", height).into_bytes()
     }
 
-    fn state_root_key(height: u32) -> Vec<u8> {
-        format!("smt:root:{}", height).into_bytes()
-    }
 }
 
 #[async_trait]
@@ -177,19 +174,6 @@ impl StorageAdapter for QubitcoinStorageAdapter {
             .get(Self::block_hash_key(height))
             .map(|opt| opt.map(|v| v.to_vec()))
             .map_err(|e| SyncError::Storage(format!("get hash: {}", e)))
-    }
-
-    async fn store_state_root(&mut self, height: u32, root: &[u8]) -> SyncResult<()> {
-        self.db
-            .put(Self::state_root_key(height), root)
-            .map_err(|e| SyncError::Storage(format!("store root: {}", e)))
-    }
-
-    async fn get_state_root(&self, height: u32) -> SyncResult<Option<Vec<u8>>> {
-        self.db
-            .get(Self::state_root_key(height))
-            .map(|opt| opt.map(|v| v.to_vec()))
-            .map_err(|e| SyncError::Storage(format!("get root: {}", e)))
     }
 
     async fn rollback_to_height(&mut self, _height: u32) -> SyncResult<()> {

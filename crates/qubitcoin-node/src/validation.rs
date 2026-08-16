@@ -1282,7 +1282,32 @@ pub fn connect_block(
                 let locks =
                     calculate_sequence_locks(tx, locktime_flags, &mut prev_heights, height, mtp_at);
 
-                if locks.height >= height || locks.time >= block_time {
+                // 🔴 CONSENSUS. This compared against `block.header.time`, not the
+                // PARENT'S MEDIAN TIME PAST.
+                //
+                // Core's `SequenceLocks` evaluates against
+                // `pindexPrev->GetMedianTimePast()` (tx_verify.cpp). A block's
+                // header time is required to be strictly greater than its
+                // parent's MTP, so using it here is always a LOOSER threshold —
+                // never tighter. Every transaction whose relative time-lock
+                // falls in the window (prev_mtp, header_time] was accepted here
+                // and rejected by Core: qubitcoin ACCEPTS A BLOCK CORE REJECTS,
+                // and the miner controls header_time within the 2h future
+                // tolerance, so the window is theirs to widen.
+                //
+                // `evaluate_sequence_locks` was already correct and already took
+                // `prev_block_mtp`; it simply was not being called. Note the
+                // parameter is the MTP OF THE PARENT — `mtp_at_height(height-1)`,
+                // not `(height)`.
+                let prev_block_mtp = match mtp_at_height {
+                    Some(f) => f(height - 1),
+                    // Unit-test path only. Documented on `connect_block`: with no
+                    // block index there is nothing better to use, and the tests
+                    // that rely on it do not exercise relative time-locks.
+                    None => block_time,
+                };
+
+                if !evaluate_sequence_locks(height, prev_block_mtp, locks) {
                     let mut block_state = BlockValidationState::new();
                     block_state.invalid(
                         BlockValidationResult::Consensus,
@@ -1546,6 +1571,49 @@ pub fn disconnect_block(
 
 #[cfg(test)]
 mod tests {
+
+    /// 🔴 THE BIP68 SPLIT WINDOW.
+    ///
+    /// A block's header time must strictly exceed its parent's MTP, so the two
+    /// candidate thresholds are never equal — header time is always the looser
+    /// one. Every relative time-lock landing in `(prev_mtp, header_time]` was
+    /// accepted by the old code and rejected by Core.
+    ///
+    /// This pins `evaluate_sequence_locks` to the parent MTP directly, because
+    /// that is the value `connect_block` must pass; a test that went through
+    /// `connect_block` would need a whole block index to say the same thing.
+    #[test]
+    fn sequence_locks_evaluate_against_parent_mtp_not_header_time() {
+        let prev_mtp = 1_600_000_000i64;
+        let header_time = prev_mtp + 3600; // an hour ahead, well within tolerance
+        let height = 700_000i32;
+
+        // A lock that has matured against the header time but NOT against MTP.
+        let locks = SequenceLockPair {
+            height: height - 1,
+            time: prev_mtp + 1800,
+        };
+
+        assert!(
+            !evaluate_sequence_locks(height, prev_mtp, locks),
+            "must be non-final against the parent MTP — this is what Core does"
+        );
+        assert!(
+            evaluate_sequence_locks(height, header_time, locks),
+            "and final against header time, which is exactly why passing header \
+             time here accepted blocks Core rejects"
+        );
+    }
+
+    #[test]
+    fn a_matured_sequence_lock_is_still_final() {
+        // Guard against overcorrecting: tightening the threshold must not start
+        // rejecting locks Core accepts, which would split the other way.
+        let prev_mtp = 1_600_000_000i64;
+        let height = 700_000i32;
+        let locks = SequenceLockPair { height: height - 10, time: prev_mtp - 1 };
+        assert!(evaluate_sequence_locks(height, prev_mtp, locks));
+    }
     use super::*;
     use qubitcoin_common::coins::{Coin, CoinsViewCache, EmptyCoinsView};
     use qubitcoin_consensus::{

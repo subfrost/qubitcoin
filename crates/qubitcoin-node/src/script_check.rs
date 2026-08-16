@@ -336,8 +336,15 @@ fn ecdsa_signature_parse_der_lax(
 
     // Build 64-byte compact signature: R (32 bytes big-endian) || S (32 bytes big-endian)
     let mut compact = [0u8; 64];
-    copy_integer_to_32(&r_bytes, &mut compact[0..32]);
-    copy_integer_to_32(&s_bytes, &mut compact[32..64]);
+    // Overflow in EITHER integer means the signature cannot verify. Core keeps
+    // its invalid placeholder and reports a successful parse; we return None,
+    // and the single caller (`verify_ecdsa_signature`) turns that into `false`
+    // — the same observable result, which is what consensus is defined on.
+    if !copy_integer_to_32(&r_bytes, &mut compact[0..32])
+        || !copy_integer_to_32(&s_bytes, &mut compact[32..64])
+    {
+        return None;
+    }
 
     qubitcoin_crypto::secp256k1::ecdsa::Signature::from_compact(&compact).ok()
 }
@@ -388,7 +395,23 @@ fn parse_der_integer_lax(input: &[u8], pos: &mut usize) -> Option<Vec<u8>> {
 
 /// Copy a variable-length big-endian integer to a fixed 32-byte buffer,
 /// right-aligned and stripping leading zeros or sign bytes.
-fn copy_integer_to_32(src: &[u8], dst: &mut [u8]) {
+///
+/// Returns `false` if the value does not fit in 32 bytes after stripping
+/// leading zeroes — Core's `overflow` flag.
+///
+/// 🔴 CONSENSUS. This used to keep the LAST 32 BYTES of an oversized integer.
+/// Core does not: `ecdsa_signature_parse_der_lax`
+/// (src/secp256k1/contrib/lax_der_parsing.c) sets `overflow = 1`, and the
+/// closing `if (!overflow)` then leaves `sig` as the deliberately-invalid
+/// placeholder it was seeded with — so verification FAILS.
+///
+/// Truncating instead means a signature Core rejects can verify here, on a
+/// script that both implementations agree is well-formed: `lenR = 33` with
+/// `R = 0x01 ‖ <32 real bytes>` passes `IsValidSignatureEncoding` on both
+/// sides, and only the parser differs. That makes qubitcoin ACCEPT A BLOCK
+/// CORE REJECTS — the worst split direction there is, because the node then
+/// follows an invalid chain alone and cannot recover without a reindex.
+fn copy_integer_to_32(src: &[u8], dst: &mut [u8]) -> bool {
     // Strip leading zero bytes (padding)
     let mut start = 0;
     while start < src.len() && src[start] == 0 {
@@ -397,13 +420,12 @@ fn copy_integer_to_32(src: &[u8], dst: &mut [u8]) {
     let trimmed = &src[start..];
 
     if trimmed.len() > 32 {
-        // Too large; take last 32 bytes
-        dst.copy_from_slice(&trimmed[trimmed.len() - 32..]);
-    } else {
-        // Right-align in 32-byte buffer
-        let offset = 32 - trimmed.len();
-        dst[offset..].copy_from_slice(trimmed);
+        return false;
     }
+    // Right-align in 32-byte buffer
+    let offset = 32 - trimmed.len();
+    dst[offset..].copy_from_slice(trimmed);
+    true
 }
 
 /// Verify a Schnorr signature against a sighash using secp256k1.
@@ -1109,6 +1131,49 @@ mod tests {
         assert_eq!(checks.len(), 1);
         assert!(checks[0].tx.is_some());
         assert!(checks[0].precomputed.is_some());
+    }
+
+    #[test]
+    fn lax_der_rejects_oversized_r_rather_than_truncating_it() {
+        // 🔴 THE CHAIN-SPLIT REGRESSION TEST.
+        //
+        // R is 33 bytes with a NON-ZERO leading byte, so it does not strip down
+        // to 32. Core's lax parser sets `overflow = 1` and leaves the signature
+        // as its invalid placeholder, so verification fails. This parser used to
+        // keep the last 32 bytes instead, silently inventing a DIFFERENT,
+        // possibly valid signature — accepting a block Core rejects.
+        //
+        // Note this is not a malformed-encoding test: the DER framing is
+        // internally consistent and both implementations parse the same R and S
+        // bytes. Only the handling of the oversized value differs, which is why
+        // no encoding check catches it.
+        let mut sig_der = vec![0x30, 0x46, 0x02, 0x21, 0x01];
+        sig_der.extend_from_slice(&[0xAA; 32]); // R = 0x01 ‖ 32 bytes  (33 total)
+        sig_der.extend_from_slice(&[0x02, 0x21, 0x00]);
+        sig_der.extend_from_slice(&[0xBB; 32]); // S = 0x00 ‖ 32 bytes  -> strips to 32
+
+        assert!(
+            ecdsa_signature_parse_der_lax(&sig_der).is_none(),
+            "an R that does not fit in 32 bytes must not be truncated into a \
+             different signature — that is how this node ends up alone on an \
+             invalid chain"
+        );
+    }
+
+    #[test]
+    fn lax_der_still_strips_leading_zero_padding() {
+        // The other side of the same branch: an over-long-but-padded integer is
+        // legitimate and must still parse, or this fix would reject signatures
+        // Core accepts — a split in the opposite direction.
+        let mut sig_der = vec![0x30, 0x46, 0x02, 0x21, 0x00];
+        sig_der.extend_from_slice(&[0x7F; 32]); // R = 0x00 ‖ 32 bytes -> 32 after strip
+        sig_der.extend_from_slice(&[0x02, 0x21, 0x00]);
+        sig_der.extend_from_slice(&[0x7E; 32]);
+
+        assert!(
+            ecdsa_signature_parse_der_lax(&sig_der).is_some(),
+            "zero-padded 33-byte integers are ordinary and must keep parsing"
+        );
     }
 
     #[test]

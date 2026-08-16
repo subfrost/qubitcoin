@@ -158,7 +158,9 @@ impl IndexerManager {
             wasm_config.memory_guard_size(0x10000); // 64KB
             wasm_config.memory_init_cow(false); // deterministic init
             wasm_config.async_support(true);
-            let engine = wasmtime::Engine::new(&wasm_config)
+            // metashrew's MetashrewRuntime::new now builds its own wasmtime
+            // engine internally (v10); we only validate the config here.
+            let _engine = wasmtime::Engine::new(&wasm_config)
                 .map_err(|e| format!("wasmtime engine: {}", e))?;
 
             // Create MetashrewRuntime — the production-compatible WASM indexer engine.
@@ -169,7 +171,7 @@ impl IndexerManager {
                         .enable_all()
                         .build()
                         .expect("tokio for metashrew init");
-                    rt.block_on(MetashrewRuntime::new(&wasm_bytes, adapter, engine))
+                    rt.block_on(MetashrewRuntime::new(&wasm_bytes, adapter))
                 })
                 .join()
                 .expect("metashrew init thread panicked")
@@ -550,11 +552,12 @@ impl IndexerManager {
         let mut wasm_config = wasmtime::Config::default();
         wasm_config.async_support(true);
         wasm_config.cranelift_nan_canonicalization(true);
-        let engine = wasmtime::Engine::new(&wasm_config)
+        // metashrew builds its own engine internally (v10); validate only.
+        let _engine = wasmtime::Engine::new(&wasm_config)
             .map_err(|e| format!("wasmtime engine: {}", e))?;
         let runtime = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(
-                MetashrewRuntime::new(&wasm_bytes, adapter, engine)
+                MetashrewRuntime::new(&wasm_bytes, adapter)
             )
         }).map_err(|e| format!("metashrew runtime: {}", e))?;
         let tip_height = match db.get(metashrew_runtime::TIP_HEIGHT_KEY.as_bytes()) {
