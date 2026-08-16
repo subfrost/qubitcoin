@@ -27,5 +27,6 @@ pub use compact_size::{compact_size_len, read_compact_size, write_compact_size};
 pub use data_stream::DataStream;
 pub use encode::{
     decode_vec, deserialize, encode_vec, serialize, Decodable, Encodable, Error, MAX_SIZE,
+    MAX_VECTOR_ALLOCATE,
 };
 pub use varint::{read_varint, varint_len, write_varint};

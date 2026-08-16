@@ -68,8 +68,11 @@ pub fn check_transaction(tx: &Transaction, state: &mut TxValidationState) -> boo
         // locktime
         tx.lock_time.encode(&mut no_witness_buf).unwrap();
 
-        let stripped_size = no_witness_buf.len() as u32;
-        if stripped_size * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT {
+        // Compute in u64 to avoid a u32 multiply overflow: a sufficiently large
+        // stripped_size (~1 GiB) would wrap `stripped_size * WITNESS_SCALE_FACTOR`
+        // and could let an oversize transaction slip past this check.
+        let stripped_size = no_witness_buf.len() as u64;
+        if stripped_size * WITNESS_SCALE_FACTOR as u64 > MAX_BLOCK_WEIGHT as u64 {
             return state.invalid(TxValidationResult::Consensus, "bad-txns-oversize", "");
         }
     }

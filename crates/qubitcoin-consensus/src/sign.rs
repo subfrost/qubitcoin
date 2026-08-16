@@ -1013,7 +1013,7 @@ mod tests {
             .expect("valid hash_type");
 
         let msg = Message::from_digest_slice(sighash.as_bytes()).unwrap();
-        let schnorr_sig = secp.sign_schnorr(&msg, &keypair);
+        let schnorr_sig = secp.sign_schnorr_no_aux_rand(&msg, &keypair);
         let sig_bytes = schnorr_sig.as_ref().to_vec(); // 64 bytes = SIGHASH_DEFAULT
 
         // Verify using TransactionSignatureChecker
@@ -1083,7 +1083,7 @@ mod tests {
             .expect("valid hash_type");
 
         let msg = Message::from_digest_slice(sighash.as_bytes()).unwrap();
-        let schnorr_sig = secp.sign_schnorr(&msg, &keypair);
+        let schnorr_sig = secp.sign_schnorr_no_aux_rand(&msg, &keypair);
         let mut sig_bytes = schnorr_sig.as_ref().to_vec();
         sig_bytes.push(hash_type as u8); // 65 bytes with explicit hash_type
 
