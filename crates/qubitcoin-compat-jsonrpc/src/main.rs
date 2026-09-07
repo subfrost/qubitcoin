@@ -63,6 +63,44 @@ struct JsonRpcResponse {
 }
 
 impl JsonRpcResponse {
+    /// Coerce a HEIGHT result to a JSON number.
+    ///
+    /// qubitcoind returns a height as a number; metashrew returns it as a
+    /// decimal STRING, and this proxy used to forward that straight through.
+    /// The relay-proxy this endpoint replaces coerced it explicitly
+    /// (`Number(r.result)`, listed in its translation table as
+    /// "secondaryheight -> metashrew_height (coerce str->num)"), so a guest that
+    /// worked against the proxy could get a string here instead of a number —
+    /// a type change on the money path, which is exactly the kind of difference
+    /// that is invisible until something strict tries to deserialize it.
+    ///
+    /// Only the two HEIGHT calls use this. View results are hex strings and must
+    /// stay strings, which is why this is not in `parse_upstream`.
+    ///
+    /// An unparseable value is passed through UNCHANGED rather than zeroed: a
+    /// height of 0 reads as "genesis" to a caller and would be acted on, while
+    /// the original value at least fails loudly downstream.
+    fn coerce_height(mut self) -> Self {
+        if let Some(v) = self.result.take() {
+            self.result = Some(match &v {
+                serde_json::Value::String(s) => {
+                    let t = s.trim();
+                    let parsed = if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+                        u64::from_str_radix(hex, 16).ok()
+                    } else {
+                        t.parse::<u64>().ok()
+                    };
+                    match parsed {
+                        Some(n) => serde_json::Value::from(n),
+                        None => v,
+                    }
+                }
+                _ => v,
+            });
+        }
+        self
+    }
+
     fn success(id: serde_json::Value, result: serde_json::Value) -> Self {
         Self { jsonrpc: "2.0".into(), id, result: Some(result), error: None }
     }
@@ -313,7 +351,9 @@ impl Proxy {
 
         log::info!("tertiaryheight label={label}");
 
-        self.forward_rockshrew(&self.config.espo_url, req.id, "metashrew_height", serde_json::json!([])).await
+        self.forward_rockshrew(&self.config.espo_url, req.id, "metashrew_height", serde_json::json!([]))
+            .await
+            .coerce_height()
     }
 
     /// Handle esplora label view functions by translating to esplora REST API.
@@ -404,7 +444,9 @@ impl Proxy {
 
         log::debug!("secondaryheight label={label}");
 
-        self.forward_metashrew(req.id, "metashrew_height", serde_json::json!([])).await
+        self.forward_metashrew(req.id, "metashrew_height", serde_json::json!([]))
+            .await
+            .coerce_height()
     }
 }
 
@@ -499,5 +541,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 log::error!("Connection error from {addr}: {e}");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod height_coercion_tests {
+    use super::*;
+
+    fn resp(v: serde_json::Value) -> JsonRpcResponse {
+        JsonRpcResponse::success(serde_json::json!(1), v)
+    }
+
+    #[test]
+    fn decimal_string_becomes_a_number() {
+        // The actual observed divergence: metashrew answers "965917", the
+        // relay-proxy this endpoint replaces answered 965917.
+        let out = resp(serde_json::json!("965917")).coerce_height();
+        assert_eq!(out.result, Some(serde_json::json!(965917u64)));
+        assert!(out.result.as_ref().unwrap().is_number());
+    }
+
+    #[test]
+    fn a_number_is_left_alone() {
+        let out = resp(serde_json::json!(965917u64)).coerce_height();
+        assert_eq!(out.result, Some(serde_json::json!(965917u64)));
+    }
+
+    #[test]
+    fn hex_string_becomes_a_number() {
+        let out = resp(serde_json::json!("0xebd9d")).coerce_height();
+        assert_eq!(out.result, Some(serde_json::json!(0xebd9du64)));
+    }
+
+    #[test]
+    fn unparseable_passes_through_unchanged() {
+        // NOT zeroed. A height of 0 reads as genesis and would be acted on;
+        // the original at least fails loudly in the caller.
+        let out = resp(serde_json::json!("not-a-height")).coerce_height();
+        assert_eq!(out.result, Some(serde_json::json!("not-a-height")));
+    }
+
+    #[test]
+    fn an_error_response_is_untouched() {
+        let e = JsonRpcResponse::error(serde_json::json!(1), -32603, "boom".into()).coerce_height();
+        assert!(e.result.is_none());
+        assert!(e.error.is_some());
     }
 }
