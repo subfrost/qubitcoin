@@ -21,6 +21,9 @@ use qubitcoin_primitives::arith_uint256::{uint256_to_arith, ArithUint256};
 /// - `last_time`: timestamp of the current tip.
 /// - `first_time`: timestamp of the first block of the retarget period,
 ///   i.e. the block at height `last_height - (interval - 1)`.
+/// - `first_bits`: compact target (`nBits`) of that same first block of the
+///   retarget period. Only consulted when `params.enforce_bip94` is set
+///   (testnet4); on other networks the caller may pass `last_bits`.
 /// - `block_time`: timestamp of the *new* block being validated (used for
 ///   the testnet min-difficulty exception only).
 /// - `last_non_special_bits`: on testnet, the `nBits` of the most recent
@@ -45,6 +48,7 @@ pub fn get_next_work_required(
     last_bits: u32,
     last_time: u32,
     first_time: u32,
+    first_bits: u32,
     block_time: u32,
     last_non_special_bits: u32,
     params: &ConsensusParams,
@@ -72,7 +76,13 @@ pub fn get_next_work_required(
     }
 
     // Retarget.
-    calculate_next_work_required(last_bits, first_time as i64, last_time as i64, params)
+    calculate_next_work_required(
+        last_bits,
+        first_bits,
+        first_time as i64,
+        last_time as i64,
+        params,
+    )
 }
 
 /// Calculate the next work target given the actual timespan of the
@@ -82,6 +92,11 @@ pub fn get_next_work_required(
 ///
 /// Parameters:
 /// - `current_bits`: compact target of the last block in the period.
+/// - `first_bits`: compact target of the *first* block in the period. Used as
+///   the retarget base instead of `current_bits` when `params.enforce_bip94`
+///   is set (BIP94 / testnet4 block-storm mitigation): the first block of a
+///   period may not use the min-difficulty exception, so its `nBits` always
+///   carries the real difficulty.
 /// - `first_block_time`: timestamp (as `i64`) of the first block of the period.
 /// - `last_block_time`: timestamp (as `i64`) of the last block of the period.
 /// - `params`: consensus parameters.
@@ -90,13 +105,14 @@ pub fn get_next_work_required(
 /// before computing the new target:
 ///
 /// ```text
-///     new_target = old_target * clamped_timespan / target_timespan
+///     new_target = base_target * clamped_timespan / target_timespan
 /// ```
 ///
 /// If the result exceeds `pow_limit`, it is clamped to `pow_limit`.
 /// Returns the compact representation of the new target.
 pub fn calculate_next_work_required(
     current_bits: u32,
+    first_bits: u32,
     first_block_time: i64,
     last_block_time: i64,
     params: &ConsensusParams,
@@ -120,7 +136,15 @@ pub fn calculate_next_work_required(
     // Retarget.
     let pow_limit = uint256_to_arith(&params.pow_limit);
     let mut new_target = ArithUint256::zero();
-    new_target.set_compact(current_bits);
+    // Special difficulty rule for Testnet4 (BIP94). Here we use the first
+    // block of the difficulty period. This way the real difficulty is always
+    // preserved in the first block, as it is not allowed to use the
+    // min-difficulty exception.
+    if params.enforce_bip94 {
+        new_target.set_compact(first_bits);
+    } else {
+        new_target.set_compact(current_bits);
+    }
 
     new_target = new_target * ArithUint256::from(actual_timespan as u64);
     new_target = new_target / ArithUint256::from(target_timespan as u64);
@@ -252,6 +276,7 @@ mod tests {
             last_bits,
             last_time,
             first_time,
+            last_bits,
             block_time,
             last_bits,
             &params,
@@ -264,7 +289,7 @@ mod tests {
         let params = mainnet_params();
         // height 5000 => next block 5001, not multiple of 2016.
         let last_bits = 0x1c0fffff;
-        let result = get_next_work_required(5000, last_bits, 1_000_000, 0, 1_000_600, last_bits, &params);
+        let result = get_next_work_required(5000, last_bits, 1_000_000, 0, last_bits, 1_000_600, last_bits, &params);
         assert_eq!(result, last_bits);
     }
 
@@ -280,7 +305,7 @@ mod tests {
         let first_time: i64 = 1_000_000;
         let last_time: i64 = first_time + target_timespan;
 
-        let result = calculate_next_work_required(last_bits, first_time, last_time, &params);
+        let result = calculate_next_work_required(last_bits, last_bits, first_time, last_time, &params);
         // With an exact timespan, the difficulty should not change.
         assert_eq!(result, last_bits);
     }
@@ -296,7 +321,7 @@ mod tests {
         let first_time: i64 = 1_000_000;
         let last_time: i64 = first_time + target_timespan * 2;
 
-        let result = calculate_next_work_required(last_bits, first_time, last_time, &params);
+        let result = calculate_next_work_required(last_bits, last_bits, first_time, last_time, &params);
 
         // The new target should be twice the old target (difficulty halved).
         let mut old_target = ArithUint256::zero();
@@ -320,7 +345,7 @@ mod tests {
         let first_time: i64 = 1_000_000;
         let last_time: i64 = first_time + target_timespan / 2;
 
-        let result = calculate_next_work_required(last_bits, first_time, last_time, &params);
+        let result = calculate_next_work_required(last_bits, last_bits, first_time, last_time, &params);
 
         // Actual timespan = target/2 => new_target = old * (target/2) / target = old/2
         let mut old_target = ArithUint256::zero();
@@ -341,7 +366,7 @@ mod tests {
         let first_time: i64 = 1_000_000;
         let last_time: i64 = first_time + target_timespan * 10;
 
-        let result = calculate_next_work_required(last_bits, first_time, last_time, &params);
+        let result = calculate_next_work_required(last_bits, last_bits, first_time, last_time, &params);
 
         let mut old_target = ArithUint256::zero();
         old_target.set_compact(last_bits);
@@ -365,7 +390,7 @@ mod tests {
         let first_time: i64 = 1_000_000;
         let last_time: i64 = first_time + 1;
 
-        let result = calculate_next_work_required(last_bits, first_time, last_time, &params);
+        let result = calculate_next_work_required(last_bits, last_bits, first_time, last_time, &params);
 
         let mut old_target = ArithUint256::zero();
         old_target.set_compact(last_bits);
@@ -387,7 +412,7 @@ mod tests {
         let first_time: i64 = 1_000_000;
         let last_time: i64 = first_time + target_timespan * 2;
 
-        let result = calculate_next_work_required(pow_limit_bits, first_time, last_time, &params);
+        let result = calculate_next_work_required(pow_limit_bits, pow_limit_bits, first_time, last_time, &params);
 
         // Must be clamped to pow_limit.
         let mut result_target = ArithUint256::zero();
@@ -408,7 +433,7 @@ mod tests {
         let first_time: i64 = 1_000_000;
         let last_time: i64 = first_time + target_timespan * 10; // huge timespan
 
-        let result = calculate_next_work_required(last_bits, first_time, last_time, &params);
+        let result = calculate_next_work_required(last_bits, last_bits, first_time, last_time, &params);
         assert_eq!(result, last_bits);
     }
 
@@ -429,7 +454,7 @@ mod tests {
         let block_time = last_time + (params.pow_target_spacing as u32) * 2 + 1;
 
         let result =
-            get_next_work_required(last_height, last_bits, last_time, 0, block_time, last_bits, &params);
+            get_next_work_required(last_height, last_bits, last_time, 0, last_bits, block_time, last_bits, &params);
         assert_eq!(result, pow_limit_bits);
     }
 
@@ -445,7 +470,7 @@ mod tests {
         let block_time = last_time + (params.pow_target_spacing as u32) * 2 - 1;
 
         let result =
-            get_next_work_required(last_height, last_bits, last_time, 0, block_time, last_bits, &params);
+            get_next_work_required(last_height, last_bits, last_time, 0, last_bits, block_time, last_bits, &params);
         assert_eq!(result, last_bits);
     }
 
@@ -550,11 +575,97 @@ mod tests {
             last_bits,
             last_time,
             first_time,
+            last_bits,
             block_time,
             last_bits,
             &params,
         );
         // Exact timespan => no change.
         assert_eq!(result, last_bits);
+    }
+
+    // -- 9. BIP94 (testnet4 block-storm mitigation) ------------------------
+
+    /// On a BIP94 network the retarget base is the *first* block of the period,
+    /// not the last. A period whose last block used the min-difficulty
+    /// exception must therefore not drag the whole period's difficulty down.
+    #[test]
+    fn test_bip94_retarget_uses_first_block_bits() {
+        let params = ConsensusParams::testnet4();
+        assert!(params.enforce_bip94);
+
+        let first_bits = 0x1d00ffff; // real difficulty at the start of the period
+        let last_bits = 0x1d00ffff; // pretend the last block was min-difficulty
+        let first_time = 1_000_000i64;
+        let last_time = first_time + params.pow_target_timespan; // exact timespan
+
+        // Base = first_bits, exact timespan => unchanged.
+        let result =
+            calculate_next_work_required(last_bits, first_bits, first_time, last_time, &params);
+        assert_eq!(result, first_bits);
+
+        // Now make the last block's bits much easier than the first block's.
+        // Under BIP94 that must be ignored entirely.
+        let easy_bits = 0x1d00ffff;
+        let hard_first = 0x1c00ffff;
+        let with_bip94 =
+            calculate_next_work_required(easy_bits, hard_first, first_time, last_time, &params);
+        assert_eq!(
+            with_bip94, hard_first,
+            "BIP94 must retarget from the first block of the period"
+        );
+    }
+
+    /// A non-BIP94 network keeps the legacy behaviour: the base is the last
+    /// block's bits and first_bits is ignored.
+    #[test]
+    fn test_non_bip94_ignores_first_bits() {
+        let params = mainnet_params();
+        assert!(!params.enforce_bip94);
+
+        let first_time = 1_000_000i64;
+        let last_time = first_time + params.pow_target_timespan;
+        let last_bits = 0x1c00ffff;
+        let unrelated_first_bits = 0x1d00ffff;
+
+        let result = calculate_next_work_required(
+            last_bits,
+            unrelated_first_bits,
+            first_time,
+            last_time,
+            &params,
+        );
+        assert_eq!(result, last_bits);
+    }
+
+    /// End-to-end through `get_next_work_required` at a real testnet4 retarget
+    /// boundary: the difficulty halves when the period took twice as long, and
+    /// it is computed from the first block's bits.
+    #[test]
+    fn test_bip94_get_next_work_required_at_boundary() {
+        let params = ConsensusParams::testnet4();
+        let interval = params.difficulty_adjustment_interval() as i32;
+        let last_height = interval - 1; // next block is the first of a new period
+
+        let first_bits = 0x1c00ffff;
+        let first_time = 1_000_000u32;
+        // Period took exactly 2x the target timespan => target doubles.
+        let last_time = first_time + (params.pow_target_timespan as u32) * 2;
+
+        let result = get_next_work_required(
+            last_height,
+            0x1d00ffff, // last block mined under the min-difficulty exception
+            last_time,
+            first_time,
+            first_bits,
+            last_time + 600,
+            first_bits,
+            &params,
+        );
+
+        let mut expected = ArithUint256::zero();
+        expected.set_compact(first_bits);
+        expected = expected * ArithUint256::from(2u64);
+        assert_eq!(result, expected.get_compact(false));
     }
 }

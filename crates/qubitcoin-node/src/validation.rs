@@ -21,11 +21,13 @@ use qubitcoin_consensus::{
         MAX_BLOCK_WEIGHT, WITNESS_SCALE_FACTOR,
     },
     merkle::{block_merkle_root, block_witness_merkle_root},
+    signet::check_signet_block_solution,
     params::ConsensusParams,
     transaction::{OutPoint, Transaction},
     validation_state::{
         BlockValidationResult, BlockValidationState, TxValidationResult, TxValidationState,
     },
+    MAX_TIMEWARP,
 };
 use qubitcoin_primitives::{money_range, Amount, BlockHash};
 use qubitcoin_script::verify_flags::ScriptVerifyFlags;
@@ -485,7 +487,7 @@ pub fn check_block_header(
 /// Context-free block checks (do not require chain state).
 ///
 /// Validates:
-/// 1. The block header (proof of work).
+/// 1. The block header (proof of work), and on signet the block solution.
 /// 2. The merkle root matches (if `check_merkle_root` is true).
 /// 3. Block serialized size and weight limits.
 /// 4. The first transaction is a coinbase; all subsequent are not.
@@ -502,6 +504,17 @@ pub fn check_block(
     // 1. Check block header (PoW).
     if !check_block_header(&block.header, params, state) {
         return false;
+    }
+
+    // 1b. Signet only (BIP325): the block must also carry a valid solution
+    // signed by the network's signers. Without this, proof of work alone would
+    // make a block valid on signet, which is the whole point of the network.
+    if params.signet_blocks && !check_signet_block_solution(block, params) {
+        return state.invalid(
+            BlockValidationResult::Consensus,
+            "bad-signet-blksig",
+            "signet block signature validation failure",
+        );
     }
 
     // 2. Check the merkle root.
@@ -775,12 +788,32 @@ pub fn contextual_check_block_header_with_arena(
         }
     }
 
+    // 4c. BIP94 timewarp mitigation (testnet4, and regtest when enabled).
+    // The first block of each difficulty adjustment interval may not have a
+    // timestamp more than MAX_TIMEWARP seconds before its parent. Without this
+    // rule a miner majority can drag the period's start time backwards and
+    // ratchet the difficulty down indefinitely.
+    // Maps to: ContextualCheckBlockHeader() in Bitcoin Core's validation.cpp.
+    if params.enforce_bip94 {
+        let interval = params.difficulty_adjustment_interval() as i32;
+        if interval > 0 && height % interval == 0 {
+            if (header.time as i64) < prev_index.get_block_time() - MAX_TIMEWARP {
+                return state.invalid(
+                    BlockValidationResult::InvalidHeader,
+                    "time-timewarp-attack",
+                    "block's timestamp is too early on diff adjustment block",
+                );
+            }
+        }
+    }
+
     // 5. Check that nBits matches the expected difficulty.
     let interval = params.difficulty_adjustment_interval() as i32;
 
-    // Compute first_time: timestamp of the first block in the retarget period.
-    // At retarget boundaries, walk back interval-1 blocks using the arena.
-    let first_time = if interval > 0
+    // Compute first_time/first_bits: the timestamp and nBits of the first block
+    // in the retarget period. At retarget boundaries, walk back interval-1
+    // blocks using the arena. first_bits is the retarget base under BIP94.
+    let (first_time, first_bits) = if interval > 0
         && prev_index.height >= interval - 1
         && (prev_index.height + 1) % interval == 0
     {
@@ -788,15 +821,16 @@ pub fn contextual_check_block_header_with_arena(
             // Walk back interval-1 blocks to find the first block of the period.
             let first_height = prev_index.height - (interval - 1);
             if let Some(first_idx) = qubitcoin_common::chain::get_ancestor(a, idx, first_height) {
-                a[first_idx].time
+                (a[first_idx].time, a[first_idx].bits)
             } else {
-                prev_index.time // fallback
+                (prev_index.time, prev_index.bits) // fallback
             }
         } else {
-            prev_index.time // fallback when arena not available
+            // fallback when arena not available
+            (prev_index.time, prev_index.bits)
         }
     } else {
-        0u32 // unused for non-retarget boundaries
+        (0u32, prev_index.bits) // unused for non-retarget boundaries
     };
 
     // On testnet (pow_allow_min_difficulty_blocks), we must resolve the
@@ -833,6 +867,7 @@ pub fn contextual_check_block_header_with_arena(
         prev_index.bits,
         prev_index.time,
         first_time,
+        first_bits,
         header.time,
         last_non_special_bits,
         params,
@@ -2520,6 +2555,141 @@ mod tests {
         let result = contextual_check_block_header(&header, &prev, &params, &mut state);
         assert!(!result);
         assert_eq!(state.get_reject_reason(), "time-too-old");
+    }
+
+
+    // -- BIP94 timewarp tests -----------------------------------------------
+
+    /// Build an arena of `n` blocks (heights 0..n-1) linked by `prev`, with
+    /// slowly increasing timestamps, and the last block's time overridden.
+    fn timewarp_arena(n: usize, last_time: u32) -> Vec<BlockIndex> {
+        let mut arena: Vec<BlockIndex> = Vec::with_capacity(n);
+        for h in 0..n {
+            let mut bi = BlockIndex::new();
+            bi.height = h as i32;
+            bi.time = 1_700_000_000 + h as u32;
+            bi.bits = 0x207fffff;
+            bi.prev = if h == 0 { None } else { Some(h - 1) };
+            arena.push(bi);
+        }
+        arena[n - 1].time = last_time;
+        arena
+    }
+
+    fn timewarp_header(time: u32) -> BlockHeader {
+        BlockHeader {
+            version: 4,
+            prev_blockhash: qubitcoin_primitives::BlockHash::ZERO,
+            merkle_root: Uint256::ZERO,
+            time,
+            bits: 0x207fffff,
+            nonce: 0,
+        }
+    }
+
+    #[test]
+    fn test_bip94_rejects_timewarp_at_retarget_boundary() {
+        let mut params = ConsensusParams::regtest();
+        params.enforce_bip94 = true;
+        let interval = params.difficulty_adjustment_interval() as usize;
+
+        // Arena of a full period; the last block's timestamp is far ahead of
+        // its neighbours so that MTP stays low and only the BIP94 rule can fire.
+        let prev_time = 1_700_100_000u32;
+        let arena = timewarp_arena(interval, prev_time);
+        let prev_idx = interval - 1;
+        let prev = &arena[prev_idx];
+        assert_eq!(prev.height + 1, interval as i32); // next block is a boundary
+
+        // More than MAX_TIMEWARP seconds before the parent: rejected.
+        let header = timewarp_header(prev_time - (MAX_TIMEWARP as u32) - 1);
+        let mut state = BlockValidationState::new();
+        let ok = contextual_check_block_header_with_arena(
+            &header,
+            &prev,
+            &params,
+            &mut state,
+            Some(&arena),
+            Some(prev_idx),
+        );
+        assert!(!ok);
+        assert_eq!(state.get_reject_reason(), "time-timewarp-attack");
+    }
+
+    #[test]
+    fn test_bip94_allows_timestamp_within_max_timewarp() {
+        let mut params = ConsensusParams::regtest();
+        params.enforce_bip94 = true;
+        let interval = params.difficulty_adjustment_interval() as usize;
+
+        let prev_time = 1_700_100_000u32;
+        let arena = timewarp_arena(interval, prev_time);
+        let prev_idx = interval - 1;
+        let prev = &arena[prev_idx];
+
+        // Exactly MAX_TIMEWARP seconds before the parent is still allowed.
+        let header = timewarp_header(prev_time - MAX_TIMEWARP as u32);
+        let mut state = BlockValidationState::new();
+        let ok = contextual_check_block_header_with_arena(
+            &header,
+            &prev,
+            &params,
+            &mut state,
+            Some(&arena),
+            Some(prev_idx),
+        );
+        assert!(ok, "rejected with {}", state.get_reject_reason());
+    }
+
+    #[test]
+    fn test_no_timewarp_rule_without_bip94() {
+        // Same block, on a network that does not enforce BIP94: accepted.
+        let params = ConsensusParams::regtest();
+        assert!(!params.enforce_bip94);
+        let interval = params.difficulty_adjustment_interval() as usize;
+
+        let prev_time = 1_700_100_000u32;
+        let arena = timewarp_arena(interval, prev_time);
+        let prev_idx = interval - 1;
+        let prev = &arena[prev_idx];
+
+        let header = timewarp_header(prev_time - (MAX_TIMEWARP as u32) - 1);
+        let mut state = BlockValidationState::new();
+        let ok = contextual_check_block_header_with_arena(
+            &header,
+            &prev,
+            &params,
+            &mut state,
+            Some(&arena),
+            Some(prev_idx),
+        );
+        assert!(ok, "rejected with {}", state.get_reject_reason());
+    }
+
+    #[test]
+    fn test_bip94_only_applies_at_retarget_boundary() {
+        let mut params = ConsensusParams::regtest();
+        params.enforce_bip94 = true;
+        let interval = params.difficulty_adjustment_interval() as usize;
+
+        // One block short of a boundary: the rule must not fire.
+        let prev_time = 1_700_100_000u32;
+        let arena = timewarp_arena(interval - 1, prev_time);
+        let prev_idx = interval - 2;
+        let prev = &arena[prev_idx];
+        assert_ne!((prev.height + 1) % interval as i32, 0);
+
+        let header = timewarp_header(prev_time - (MAX_TIMEWARP as u32) - 1);
+        let mut state = BlockValidationState::new();
+        let ok = contextual_check_block_header_with_arena(
+            &header,
+            &prev,
+            &params,
+            &mut state,
+            Some(&arena),
+            Some(prev_idx),
+        );
+        assert!(ok, "rejected with {}", state.get_reject_reason());
     }
 
     // -- get_block_script_flags tests ------------------------------------------

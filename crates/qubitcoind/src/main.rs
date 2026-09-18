@@ -1010,7 +1010,21 @@ async fn main() {
                     arith.get_compact(false)
                 };
 
-                let mut header = BlockHeader { version: 4, prev_blockhash: prev_hash, merkle_root, time, bits, nonce: 0 };
+                // Block version: BIP9. Signals for any deployment currently in
+                // STARTED or LOCKED_IN, and otherwise is just VERSIONBITS_TOP_BITS.
+                //
+                // Maps to: `BlockAssembler::CreateNewBlock`'s
+                // `pblock->nVersion = m_chainman.m_versionbitscache.ComputeBlockVersion(...)`.
+                let version = {
+                    let mut vb_cache = qubitcoin_common::versionbits::VersionBitsCache::new();
+                    vb_cache.compute_block_version(
+                        cs.block_index().as_slice(),
+                        cs.tip(),
+                        &params_gen.consensus,
+                    )
+                };
+
+                let mut header = BlockHeader { version, prev_blockhash: prev_hash, merkle_root, time, bits, nonce: 0 };
 
                 // Solve PoW (trivial on regtest).
                 let mut target = ArithUint256::zero();

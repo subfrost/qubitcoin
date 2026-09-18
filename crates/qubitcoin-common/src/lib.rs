@@ -18,3 +18,5 @@ pub mod coins;
 pub mod keys;
 /// Proof-of-work difficulty adjustment logic. Equivalent to `src/pow.cpp` in Bitcoin Core.
 pub mod pow;
+/// BIP9 versionbits soft-fork deployment state machine. Equivalent to `src/versionbits.cpp` in Bitcoin Core.
+pub mod versionbits;

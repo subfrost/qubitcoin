@@ -109,6 +109,16 @@ impl Script {
         self
     }
 
+    /// Push a raw opcode byte.
+    ///
+    /// Unlike [`Script::push_opcode`] this accepts bytes with no named
+    /// [`Opcode`] variant (invalid or upgradeable opcodes), which is needed
+    /// when rebuilding a script op by op without altering unknown bytes.
+    pub fn push_opcode_byte(&mut self, opcode: u8) -> &mut Self {
+        self.data.push(opcode);
+        self
+    }
+
     /// Push an integer value using the most compact encoding.
     /// Uses OP_0 for 0, OP_1NEGATE for -1, OP_1..OP_16 for 1..16,
     /// and minimal byte push for other values.

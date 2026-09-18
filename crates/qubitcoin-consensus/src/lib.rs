@@ -32,6 +32,8 @@ pub mod params;
 pub mod sighash;
 /// Transaction signature verification (ECDSA and Schnorr).
 pub mod sign;
+/// Signet (BIP325) block solution validation.
+pub mod signet;
 /// Transaction primitive types: [`OutPoint`], [`TxIn`], [`TxOut`], [`Transaction`].
 pub mod transaction;
 /// Validation state types for structured error reporting.
@@ -44,12 +46,13 @@ pub use check::{
     WITNESS_SCALE_FACTOR,
 };
 pub use merkle::{block_merkle_root, block_witness_merkle_root};
-pub use params::ConsensusParams;
+pub use params::{ConsensusParams, MAX_TIMEWARP, SIGNET_DEFAULT_CHALLENGE};
 pub use sighash::{
     remove_codeseparators, signature_hash, taproot_signature_hash, witness_v0_signature_hash,
     PrecomputedTransactionData, SIGHASH_ALL, SIGHASH_ANYONECANPAY, SIGHASH_NONE, SIGHASH_SINGLE,
 };
 pub use sign::TransactionSignatureChecker;
+pub use signet::{check_signet_block_solution, SignetTxs, SIGNET_HEADER};
 pub use transaction::{
     OutPoint, Transaction, TransactionRef, TxIn, TxOut, Witness, MAX_SEQUENCE_NONFINAL,
     SEQUENCE_FINAL, SEQUENCE_LOCKTIME_DISABLE_FLAG, SEQUENCE_LOCKTIME_GRANULARITY,
