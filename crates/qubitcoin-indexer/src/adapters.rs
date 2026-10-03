@@ -5,9 +5,11 @@
 //! the consensus engine rather than over RPC.
 
 use async_trait::async_trait;
+use metashrew_runtime::KeyValueStoreLike;
 use metashrew_sync::{
     BitcoinNodeAdapter, BlockInfo, ChainTip, StorageAdapter, StorageStats, SyncError, SyncResult,
 };
+use rockshrew_runtime::RocksDBRuntimeAdapter;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -143,6 +145,14 @@ impl QubitcoinStorageAdapter {
         format!("/__INTERNAL/height-to-hash/{}", height).into_bytes()
     }
 
+    /// Key under which the SMT state root for `height` is stored.
+    ///
+    /// Uses metashrew's own `SMT_ROOT_PREFIX` rather than a hardcoded
+    /// string, so the key cannot drift from what the runtime reads.
+    fn state_root_key(height: u32) -> Vec<u8> {
+        format!("{}{}", metashrew_runtime::smt::SMT_ROOT_PREFIX, height).into_bytes()
+    }
+
 }
 
 #[async_trait]
@@ -176,6 +186,30 @@ impl StorageAdapter for QubitcoinStorageAdapter {
             .map_err(|e| SyncError::Storage(format!("get hash: {}", e)))
     }
 
+    async fn store_state_root(&mut self, height: u32, root: &[u8]) -> SyncResult<()> {
+        // Go through RocksDBRuntimeAdapter rather than writing to `self.db`
+        // directly: its `put` applies metashrew's key labelling, so a raw
+        // write would land under a different key whenever a label is
+        // configured, and the runtime would never find the root again.
+        let adapter = RocksDBRuntimeAdapter::new(self.db.clone());
+        let mut smt_helper = metashrew_runtime::smt::SMTHelper::new(adapter);
+        smt_helper
+            .storage
+            .put(&Self::state_root_key(height), root)
+            .map_err(|e| SyncError::Storage(format!("store state root: {:?}", e)))
+    }
+
+    async fn get_state_root(&self, height: u32) -> SyncResult<Option<Vec<u8>>> {
+        // Delegates to the runtime's own lookup, which falls back to the
+        // closest previous height when `height` itself has no root stored.
+        let adapter = RocksDBRuntimeAdapter::new(self.db.clone());
+        let smt_helper = metashrew_runtime::smt::SMTHelper::new(adapter);
+        match smt_helper.get_smt_root_at_height(height) {
+            Ok(root) => Ok(Some(root.to_vec())),
+            Err(_) => Ok(None),
+        }
+    }
+
     async fn rollback_to_height(&mut self, _height: u32) -> SyncResult<()> {
         // TODO: Implement rollback using metashrew's manifest-based approach
         tracing::warn!("rollback_to_height not yet implemented");
@@ -197,5 +231,57 @@ impl StorageAdapter for QubitcoinStorageAdapter {
 
     async fn get_db_handle(&self) -> SyncResult<Arc<rocksdb::DB>> {
         Ok(self.db.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_adapter() -> (QubitcoinStorageAdapter, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = rocksdb::Options::default();
+        opts.create_if_missing(true);
+        let db = rocksdb::DB::open(&opts, dir.path()).unwrap();
+        (QubitcoinStorageAdapter::new(Arc::new(db)), dir)
+    }
+
+    /// A stored root must come back byte-for-byte at the same height.
+    /// This also proves the write goes through to RocksDB rather than
+    /// being buffered in an uncommitted batch.
+    #[tokio::test]
+    async fn test_state_root_round_trip() {
+        let (mut adapter, _dir) = temp_adapter();
+        let root = [0xabu8; 32];
+        adapter.store_state_root(5, &root).await.unwrap();
+        assert_eq!(adapter.get_state_root(5).await.unwrap(), Some(root.to_vec()));
+    }
+
+    /// With nothing stored, the lookup must report absence rather than
+    /// surfacing the runtime's "no state root found" error.
+    #[tokio::test]
+    async fn test_state_root_absent_is_none() {
+        let (adapter, _dir) = temp_adapter();
+        assert_eq!(adapter.get_state_root(0).await.unwrap(), None);
+    }
+
+    /// Documents inherited metashrew semantics: a height with no root of
+    /// its own resolves to the closest *previous* height that has one.
+    /// This is deliberate upstream behaviour, not a bug in this adapter.
+    #[tokio::test]
+    async fn test_state_root_falls_back_to_previous_height() {
+        let (mut adapter, _dir) = temp_adapter();
+        let root = [0x11u8; 32];
+        adapter.store_state_root(10, &root).await.unwrap();
+        assert_eq!(
+            adapter.get_state_root(12).await.unwrap(),
+            Some(root.to_vec()),
+            "height 12 should resolve to the root stored at height 10"
+        );
+        assert_eq!(
+            adapter.get_state_root(9).await.unwrap(),
+            None,
+            "a height below the earliest stored root has nothing to fall back to"
+        );
     }
 }

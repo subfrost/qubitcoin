@@ -23,7 +23,7 @@ members = [
     # is intentionally NOT a member of this workspace (it carries its own
     # [workspace] table). The former librocksdb-sys conflict is resolved:
     # the workspace now pins rocksdb 0.21, matching the kungfuflex/metashrew
-    # develop git dep (metashrew-sync/rockshrew-runtime) — single -sys crate.
+    # master git dep (metashrew-sync/rockshrew-runtime) — single -sys crate.
     "crates/qubitcoin-web-sys",
     "crates/qubitcoin-tertiary-web",
     "crates/qubitcoin-tertiary-support",
@@ -87,7 +87,7 @@ log = "0.4" # kept for backward compat; prefer tracing for new code
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 tokio = { version = "1", features = ["full"] }
-rocksdb = "0.21.0" # aligned with kungfuflex/metashrew develop (rockshrew/metashrew-sync pin 0.21) to keep a single librocksdb-sys
+rocksdb = "0.21.0" # aligned with kungfuflex/metashrew master (rockshrew/metashrew-sync pin 0.21) to keep a single librocksdb-sys
 bitflags = "2"
 rayon = "1.10"
 sha2 = "0.10"

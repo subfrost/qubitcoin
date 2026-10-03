@@ -2270,7 +2270,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 dependencies = [
  "ahash",
- "allocator-api2",
 ]
 
 [[package]]
@@ -2937,15 +2936,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
-name = "lru-mem"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf5c8c26d903a41c80d4cc171940a57a4d1bc51139ebd6aad87e2f9ae3774780"
-dependencies = [
- "hashbrown 0.14.5",
-]
-
-[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3005,14 +2995,13 @@ dependencies = [
 
 [[package]]
 name = "metashrew-runtime"
-version = "10.0.0-alpha.1"
-source = "git+https://github.com/kungfuflex/metashrew?branch=develop#eca790ca1eeddc7cdac201b741637b8f18234924"
+version = "9.0.5-rc.14"
+source = "git+https://github.com/kungfuflex/metashrew?branch=master#3404d506ccc7517f733a566a9b9ad76d98bcbcb4"
 dependencies = [
  "anyhow",
  "hex",
  "itertools 0.12.1",
  "log",
- "lru-mem",
  "prost",
  "prost-build",
  "sha2",
@@ -3037,8 +3026,8 @@ dependencies = [
 
 [[package]]
 name = "metashrew-sync"
-version = "10.0.0-alpha.1"
-source = "git+https://github.com/kungfuflex/metashrew?branch=develop#eca790ca1eeddc7cdac201b741637b8f18234924"
+version = "9.0.5-rc.14"
+source = "git+https://github.com/kungfuflex/metashrew?branch=master#3404d506ccc7517f733a566a9b9ad76d98bcbcb4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3046,6 +3035,7 @@ dependencies = [
  "hex",
  "log",
  "metashrew-runtime",
+ "metashrew-validator-core",
  "num_cpus",
  "rocksdb",
  "serde",
@@ -3053,6 +3043,16 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "metashrew-validator-core"
+version = "9.0.5-rc.14"
+source = "git+https://github.com/kungfuflex/metashrew?branch=master#3404d506ccc7517f733a566a9b9ad76d98bcbcb4"
+dependencies = [
+ "bitcoin 0.32.102",
+ "hex",
+ "sha2",
 ]
 
 [[package]]
@@ -4358,8 +4358,8 @@ dependencies = [
 
 [[package]]
 name = "rockshrew-runtime"
-version = "10.0.0-alpha.1"
-source = "git+https://github.com/kungfuflex/metashrew?branch=develop#eca790ca1eeddc7cdac201b741637b8f18234924"
+version = "9.0.5-rc.14"
+source = "git+https://github.com/kungfuflex/metashrew?branch=master#3404d506ccc7517f733a566a9b9ad76d98bcbcb4"
 dependencies = [
  "anyhow",
  "async-trait",
