@@ -286,16 +286,65 @@ impl NodeInterface for LiveNodeInterface {
             deserialize(data).map_err(|e| format!("tx deserialize: {}", e))?;
         let txid = tx.txid().clone();
 
-        // Basic validation: compute vsize and fee.
         let vsize = tx.get_virtual_size() as u32;
-
-        // Accept to mempool with zero fee (fee validation is done inside).
         let tx_ref = std::sync::Arc::new(tx);
-        let height = self.chainstate.lock().height();
+
+        // Resolve the outputs each input spends, from the confirmed UTXO set or
+        // from unconfirmed mempool parents, in input order. Mirrors the
+        // resolution done by the `sendrawtransaction` RPC. Unknown inputs are
+        // rejected: this node keeps no orphan pool, and admitting a transaction
+        // whose inputs cannot be found (or whose scripts cannot be checked
+        // against them) is what let unsigned transactions reach the mempool.
+        let cs_guard = self.chainstate.lock();
+        let height = cs_guard.height();
+        let mut total_in: i64 = 0;
+        let mut spent_outputs: Vec<qubitcoin_consensus::TxOut> =
+            Vec::with_capacity(tx_ref.vin.len());
+        let mut missing_inputs = 0usize;
+        for input in &tx_ref.vin {
+            if input.prevout.is_null() { continue; } // coinbase
+            if let Some(coin) = cs_guard.coins_tip().get_coin(&input.prevout) {
+                total_in += coin.tx_out.value.to_sat();
+                spent_outputs.push(coin.tx_out.clone());
+            } else if let Some(parent_tx) = self.mempool.get(&input.prevout.hash) {
+                if let Some(output) = parent_tx.vout.get(input.prevout.n as usize) {
+                    total_in += output.value.to_sat();
+                    spent_outputs.push(output.clone());
+                } else {
+                    missing_inputs += 1;
+                }
+            } else {
+                missing_inputs += 1;
+            }
+        }
+        drop(cs_guard);
+
+        if missing_inputs > 0 {
+            let reason = format!(
+                "bad-txns-inputs-missingorspent: {} input(s) not found in UTXO set or mempool",
+                missing_inputs
+            );
+            tracing::debug!(txid = %txid.to_hex(), reason = %reason, "transaction rejected");
+            return Err(reason);
+        }
+
+        // Verify input scripts under standard mempool policy before acceptance,
+        // so an unsigned or script-invalid transaction cannot enter the mempool
+        // and later stall block assembly.
+        if let Err(e) =
+            qubitcoin_node::script_check::verify_tx_scripts_standard(&tx_ref, &spent_outputs)
+        {
+            let reason = format!("mandatory-script-verify-flag-failed ({})", e);
+            tracing::debug!(txid = %txid.to_hex(), reason = %reason, "transaction rejected");
+            return Err(reason);
+        }
+
+        let total_out: i64 = tx_ref.vout.iter().map(|o| o.value.to_sat()).sum();
+        let fee = qubitcoin_primitives::Amount::from_sat(std::cmp::max(0, total_in - total_out));
         let result = mempool::accept_to_mempool(
             &self.mempool,
             &tx_ref,
-            qubitcoin_primitives::Amount::from_sat(0),
+            fee,
             vsize,
             height,
         );
@@ -1729,14 +1778,19 @@ fn register_live_rpcs(
         let height = cs_guard.height();
         let mut total_in: i64 = 0;
         let mut missing_inputs = Vec::new();
+        // Spent outputs in input order, reused below for script verification.
+        let mut spent_outputs: Vec<qubitcoin_consensus::TxOut> =
+            Vec::with_capacity(tx.vin.len());
         for input in &tx.vin {
             if input.prevout.is_null() { continue; } // coinbase
             if let Some(coin) = cs_guard.coins_tip().get_coin(&input.prevout) {
                 total_in += coin.tx_out.value.to_sat();
+                spent_outputs.push(coin.tx_out.clone());
             } else if let Some(parent_tx) = mp.get(&input.prevout.hash) {
                 // Check mempool for unconfirmed parent output
                 if let Some(output) = parent_tx.vout.get(input.prevout.n as usize) {
                     total_in += output.value.to_sat();
+                    spent_outputs.push(output.clone());
                 } else {
                     missing_inputs.push(input.prevout.clone());
                 }
@@ -1754,6 +1808,21 @@ fn register_live_rpcs(
                     "bad-txns-inputs-missingorspent: {} input(s) not found in UTXO set or mempool",
                     missing_inputs.len()
                 ),
+            );
+        }
+
+        // Verify input scripts under standard mempool policy BEFORE admitting
+        // the transaction. Without this an unsigned or otherwise script-invalid
+        // transaction would enter the mempool and later stall block assembly,
+        // since no valid block can include it.
+        if let Err(e) = qubitcoin_node::script_check::verify_tx_scripts_standard(
+            &tx_ref,
+            &spent_outputs,
+        ) {
+            return RpcResponse::error(
+                req.id.clone(),
+                RPC_MISC_ERROR,
+                format!("mandatory-script-verify-flag-failed ({})", e),
             );
         }
 

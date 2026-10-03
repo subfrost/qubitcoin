@@ -12,7 +12,7 @@ use qubitcoin_common::coins::Coin;
 use qubitcoin_consensus::sighash::{
     signature_hash, witness_v0_signature_hash, PrecomputedTransactionData, SIGHASH_ALL,
 };
-use qubitcoin_consensus::transaction::{Transaction, TransactionRef, SEQUENCE_FINAL};
+use qubitcoin_consensus::transaction::{Transaction, TransactionRef, TxOut, SEQUENCE_FINAL};
 use qubitcoin_primitives::Uint256;
 use qubitcoin_script::interpreter::{
     verify_script, BaseSignatureChecker, ScriptExecutionData, ScriptWitness, SigVersion,
@@ -21,7 +21,7 @@ use qubitcoin_script::interpreter::{
 use qubitcoin_script::script::Script;
 use qubitcoin_script::script_error::ScriptError;
 use qubitcoin_script::script_num::ScriptNum;
-use qubitcoin_script::verify_flags::ScriptVerifyFlags;
+use qubitcoin_script::verify_flags::{ScriptVerifyFlags, STANDARD_SCRIPT_VERIFY_FLAGS};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -650,6 +650,74 @@ pub fn collect_block_script_checks(
     checks
 }
 
+/// Verify every input script of a single transaction against its spent outputs.
+///
+/// This is the mempool-acceptance analogue of [`collect_block_script_checks`]:
+/// where that function validates a whole block's inputs at connect time, this
+/// validates one candidate transaction *before* it is admitted to the mempool.
+/// Callers that admit transactions to the mempool (the `sendrawtransaction` RPC
+/// and P2P transaction relay) must call it; otherwise an unsigned or otherwise
+/// script-invalid transaction can enter the mempool and later stall block
+/// assembly, since the miner cannot produce a valid block that includes it.
+///
+/// `spent_outputs` are the outputs being spent, in input order, one per input.
+/// A coinbase transaction has no scripts to verify and returns `Ok(())`.
+///
+/// Returns `Ok(())` if every input verifies, otherwise the first failure.
+pub fn verify_tx_scripts(
+    tx: &TransactionRef,
+    spent_outputs: &[TxOut],
+    flags: ScriptVerifyFlags,
+) -> Result<(), ScriptCheckError> {
+    if tx.is_coinbase() {
+        return Ok(());
+    }
+
+    if spent_outputs.len() != tx.vin.len() {
+        return Err(ScriptCheckError {
+            tx_index: 0,
+            input_index: 0,
+            error: format!(
+                "spent output count {} does not match input count {}",
+                spent_outputs.len(),
+                tx.vin.len()
+            ),
+        });
+    }
+
+    let precomputed = Arc::new(PrecomputedTransactionData::new(tx, spent_outputs));
+    let checks: Vec<ScriptCheck> = tx
+        .vin
+        .iter()
+        .enumerate()
+        .map(|(input_index, input)| ScriptCheck {
+            script_pubkey: spent_outputs[input_index]
+                .script_pubkey
+                .as_bytes()
+                .to_vec(),
+            script_sig: input.script_sig.as_bytes().to_vec(),
+            witness: input.witness.stack.clone(),
+            flags,
+            amount: spent_outputs[input_index].value.to_sat(),
+            tx_index: 0,
+            input_index,
+            tx: Some(Arc::clone(tx)),
+            precomputed: Some(Arc::clone(&precomputed)),
+        })
+        .collect();
+
+    verify_scripts_parallel(&checks)
+}
+
+/// Convenience wrapper over [`verify_tx_scripts`] using the standard mempool
+/// relay policy flags ([`STANDARD_SCRIPT_VERIFY_FLAGS`]).
+pub fn verify_tx_scripts_standard(
+    tx: &TransactionRef,
+    spent_outputs: &[TxOut],
+) -> Result<(), ScriptCheckError> {
+    verify_tx_scripts(tx, spent_outputs, STANDARD_SCRIPT_VERIFY_FLAGS)
+}
+
 /// Configuration for the parallel script verification engine.
 pub struct ScriptCheckConfig {
     /// Maximum number of threads to use. 0 = use Rayon default (num CPUs).
@@ -843,6 +911,66 @@ mod tests {
         assert_eq!(checks[0].tx_index, 1);
         assert_eq!(checks[0].input_index, 0);
         assert_eq!(checks[0].script_pubkey, vec![0x51]);
+    }
+
+    // -- verify_tx_scripts (mempool-acceptance path) ------------------------
+
+    fn spend_of(spk: Vec<u8>) -> (Arc<qubitcoin_consensus::Transaction>, Vec<qubitcoin_consensus::TxOut>) {
+        use qubitcoin_consensus::transaction::{Transaction, TxIn, TxOut, SEQUENCE_FINAL};
+        use qubitcoin_consensus::OutPoint;
+        use qubitcoin_primitives::Amount;
+
+        let tx = Arc::new(Transaction::new(
+            1,
+            vec![TxIn::new(
+                OutPoint::new(Default::default(), 0),
+                Script::new(), // empty scriptSig (and no witness) == "unsigned"
+                SEQUENCE_FINAL,
+            )],
+            vec![TxOut::new(Amount::from_sat(100), Script::new())],
+            0,
+        ));
+        let spent = vec![TxOut::new(Amount::from_sat(200), Script::from_bytes(spk))];
+        (tx, spent)
+    }
+
+    #[test]
+    fn test_verify_tx_scripts_accepts_satisfied_script() {
+        // scriptPubKey OP_1 leaves a true value with an empty scriptSig.
+        let (tx, spent) = spend_of(vec![0x51]);
+        assert!(verify_tx_scripts(&tx, &spent, ScriptVerifyFlags::NONE).is_ok());
+    }
+
+    #[test]
+    fn test_verify_tx_scripts_rejects_unsigned() {
+        // scriptPubKey OP_0 leaves a false value: an empty scriptSig cannot
+        // satisfy it, so an "unsigned" spend must be rejected. This is the
+        // case that previously slipped into the mempool.
+        let (tx, spent) = spend_of(vec![0x00]);
+        assert!(verify_tx_scripts(&tx, &spent, ScriptVerifyFlags::NONE).is_err());
+        assert!(verify_tx_scripts_standard(&tx, &spent).is_err());
+    }
+
+    #[test]
+    fn test_verify_tx_scripts_length_mismatch_rejected() {
+        let (tx, _spent) = spend_of(vec![0x51]);
+        // One input but zero spent outputs provided.
+        let err = verify_tx_scripts(&tx, &[], ScriptVerifyFlags::NONE).unwrap_err();
+        assert!(err.error.contains("does not match input count"));
+    }
+
+    #[test]
+    fn test_verify_tx_scripts_coinbase_ok() {
+        use qubitcoin_consensus::transaction::{Transaction, TxIn, TxOut};
+        use qubitcoin_primitives::Amount;
+        let coinbase = Arc::new(Transaction::new(
+            1,
+            vec![TxIn::coinbase(Script::from_bytes(vec![0x01, 0x01]))],
+            vec![TxOut::new(Amount::from_sat(5_000_000_000), Script::new())],
+            0,
+        ));
+        // No spent outputs for a coinbase; must be accepted.
+        assert!(verify_tx_scripts_standard(&coinbase, &[]).is_ok());
     }
 
     #[test]
