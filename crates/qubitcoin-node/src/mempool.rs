@@ -804,7 +804,7 @@ impl TxMemPool {
     /// Estimate the current fee rate from mempool entries.
     ///
     /// Returns the median fee rate of all mempool entries, or
-    /// `DEFAULT_MIN_RELAY_TX_FEE` (1 sat/vB) if the mempool is empty.
+    /// `DEFAULT_MIN_RELAY_TX_FEE` if the mempool is empty.
     pub fn estimate_fee_rate(&self) -> FeeRate {
         let entries = self.entries.read();
         if entries.is_empty() {
@@ -1160,6 +1160,74 @@ pub fn accept_to_mempool(
     }
 
     MempoolAcceptResult::Accepted { txid }
+}
+
+// ---------------------------------------------------------------------------
+// Script verification for mempool acceptance
+// ---------------------------------------------------------------------------
+
+/// Verify the input scripts (i.e. the signatures) of a transaction that is
+/// being considered for mempool acceptance.
+///
+/// Maps to the `CheckInputScripts` call inside Bitcoin Core's
+/// `MemPoolAccept::PolicyScriptChecks` / `ConsensusScriptChecks`
+/// (`src/validation.cpp`). `accept_to_mempool` deliberately knows nothing
+/// about the UTXO set, so prevout resolution is the caller's job: pass the
+/// output spent by each input of `tx`, in input order.
+///
+/// Verification uses `STANDARD_SCRIPT_VERIFY_FLAGS`, matching Core's relay
+/// policy for unconfirmed transactions.
+///
+/// Returns `Err` with a Core-style reject reason if any input fails.
+pub fn verify_mempool_tx_scripts(
+    tx: &TransactionRef,
+    spent_outputs: &[TxOut],
+) -> Result<(), String> {
+    use crate::script_check::{verify_scripts_parallel, ScriptCheck};
+    use qubitcoin_consensus::sighash::PrecomputedTransactionData;
+    use qubitcoin_script::verify_flags::STANDARD_SCRIPT_VERIFY_FLAGS;
+    use std::sync::Arc;
+
+    // A coinbase can never be relayed on its own.
+    if tx.is_coinbase() {
+        return Err("coinbase".to_string());
+    }
+
+    // Refuse to verify a transaction whose inputs were not all resolved:
+    // a short `spent_outputs` would otherwise leave later inputs unchecked.
+    if spent_outputs.len() != tx.vin.len() {
+        return Err(format!(
+            "bad-txns-inputs-missingorspent: resolved {} of {} input(s)",
+            spent_outputs.len(),
+            tx.vin.len()
+        ));
+    }
+
+    let precomputed = Arc::new(PrecomputedTransactionData::new(tx, spent_outputs));
+
+    let checks: Vec<ScriptCheck> = tx
+        .vin
+        .iter()
+        .enumerate()
+        .map(|(input_idx, input)| ScriptCheck {
+            script_pubkey: spent_outputs[input_idx].script_pubkey.as_bytes().to_vec(),
+            script_sig: input.script_sig.as_bytes().to_vec(),
+            witness: input.witness.stack.clone(),
+            flags: STANDARD_SCRIPT_VERIFY_FLAGS,
+            amount: spent_outputs[input_idx].value.to_sat(),
+            tx_index: 0,
+            input_index: input_idx,
+            tx: Some(Arc::clone(tx)),
+            precomputed: Some(Arc::clone(&precomputed)),
+        })
+        .collect();
+
+    verify_scripts_parallel(&checks).map_err(|e| {
+        format!(
+            "mandatory-script-verify-flag-failed (input {}: {})",
+            e.input_index, e.error
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1923,5 +1991,83 @@ mod tests {
         let removed = pool.expire_old(10100, 1);
         assert_eq!(removed, 0);
         assert_eq!(pool.size(), 1);
+    }
+
+    // -- Script verification on mempool entry ------------------------------
+
+    /// A standard 25-byte P2PKH scriptPubKey:
+    /// OP_DUP OP_HASH160 <20-byte hash> OP_EQUALVERIFY OP_CHECKSIG
+    fn p2pkh_script_pubkey(seed: u8) -> Script {
+        let mut raw = vec![0x76, 0xa9, 0x14];
+        raw.extend_from_slice(&[seed; 20]);
+        raw.extend_from_slice(&[0x88, 0xac]);
+        Script::from_bytes(raw)
+    }
+
+    /// An unsigned transaction must not pass script verification.
+    ///
+    /// Regression test: both the `sendrawtransaction` RPC and the P2P `tx`
+    /// handler previously went straight from deserialize to
+    /// `accept_to_mempool`, so a transaction with an empty scriptSig spending
+    /// any known UTXO was accepted, relayed and then mined.
+    #[test]
+    fn test_unsigned_tx_fails_script_verification() {
+        // make_tx builds every input with an empty scriptSig and no witness.
+        let tx = make_tx(10, vec![dummy_outpoint(10)], 1);
+        let spent = vec![TxOut::new(
+            Amount::from_sat(100_000),
+            p2pkh_script_pubkey(0xab),
+        )];
+
+        let result = verify_mempool_tx_scripts(&tx, &spent);
+        assert!(
+            result.is_err(),
+            "an unsigned P2PKH spend must be rejected, got {:?}",
+            result
+        );
+        let reason = result.unwrap_err();
+        assert!(
+            reason.starts_with("mandatory-script-verify-flag-failed"),
+            "unexpected reject reason: {}",
+            reason
+        );
+    }
+
+    /// Positive control: a spend that genuinely satisfies its scriptPubKey
+    /// passes. Without this, a `verify_mempool_tx_scripts` that rejected
+    /// everything would still satisfy the test above.
+    #[test]
+    fn test_satisfied_script_passes_verification() {
+        let tx = make_tx(11, vec![dummy_outpoint(11)], 1);
+        // OP_TRUE: an anyone-can-spend output, satisfied by an empty scriptSig.
+        let spent = vec![TxOut::new(
+            Amount::from_sat(100_000),
+            Script::from_bytes(vec![0x51]),
+        )];
+
+        assert!(
+            verify_mempool_tx_scripts(&tx, &spent).is_ok(),
+            "an anyone-can-spend output should verify with an empty scriptSig"
+        );
+    }
+
+    /// A short `spent_outputs` must be refused rather than silently leaving
+    /// the unresolved inputs unverified.
+    #[test]
+    fn test_unresolved_inputs_rejected() {
+        let tx = make_tx(12, vec![dummy_outpoint(12), dummy_outpoint(13)], 1);
+        // Only one of the two inputs resolved.
+        let spent = vec![TxOut::new(
+            Amount::from_sat(100_000),
+            Script::from_bytes(vec![0x51]),
+        )];
+
+        let reason = verify_mempool_tx_scripts(&tx, &spent)
+            .expect_err("a partially resolved transaction must be rejected");
+        assert!(
+            reason.starts_with("bad-txns-inputs-missingorspent"),
+            "unexpected reject reason: {}",
+            reason
+        );
     }
 }

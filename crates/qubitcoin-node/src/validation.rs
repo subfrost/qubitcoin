@@ -1427,7 +1427,11 @@ pub fn connect_block(
             let mut state = BlockValidationState::new();
             state.invalid(
                 BlockValidationResult::Consensus,
-                "bad-blk-sigops",
+                // This is a script/signature verification failure, not a sigop
+                // count failure. Reporting it as "bad-blk-sigops" sends anyone
+                // debugging a rejected block -- or correlating reject reasons
+                // against Bitcoin Core -- after the wrong cause.
+                "mandatory-script-verify-flag-failed",
                 &format!("{}", script_err),
             );
             return Err(state);

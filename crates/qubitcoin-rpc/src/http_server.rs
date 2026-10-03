@@ -10,8 +10,16 @@
 use crate::server::{parse_rpc_request, process_request, AuthTier, RpcRegistry, RpcResponse};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+/// How long a single socket read may stall before the connection is dropped.
+///
+/// Without this, a client that connects and sends nothing (or announces a
+/// `Content-Length` and then stalls) keeps its task and its 128 KiB of buffers
+/// alive forever, so a handful of idle sockets can exhaust the server.
+const RPC_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -77,10 +85,19 @@ impl RpcServer {
 
                 // Phase 1: Read headers (until \r\n\r\n).
                 loop {
-                    let n = match stream.read(&mut tmp).await {
-                        Ok(0) => break,
-                        Ok(n) => n,
-                        Err(_) => break,
+                    let n = match tokio::time::timeout(
+                        RPC_READ_TIMEOUT,
+                        stream.read(&mut tmp),
+                    )
+                    .await
+                    {
+                        // Timed out: the peer opened a connection and then
+                        // stopped sending. Drop it rather than holding the
+                        // task (and its 64 KiB buffers) open indefinitely.
+                        Err(_) => return,
+                        Ok(Ok(0)) => break,
+                        Ok(Ok(n)) => n,
+                        Ok(Err(_)) => break,
                     };
                     buf.extend_from_slice(&tmp[..n]);
                     if buf.len() >= max_size { break; }
@@ -111,10 +128,19 @@ impl RpcServer {
                         let mut left = remaining;
                         while left > 0 {
                             let to_read = left.min(tmp.len());
-                            let n = match stream.read(&mut tmp[..to_read]).await {
-                                Ok(0) => break,
-                                Ok(n) => n,
-                                Err(_) => break,
+                            let n = match tokio::time::timeout(
+                                RPC_READ_TIMEOUT,
+                                stream.read(&mut tmp[..to_read]),
+                            )
+                            .await
+                            {
+                                // Timed out mid-body: a peer that announces a
+                                // Content-Length and then stalls must not pin
+                                // this task open.
+                                Err(_) => return,
+                                Ok(Ok(0)) => break,
+                                Ok(Ok(n)) => n,
+                                Ok(Err(_)) => break,
                             };
                             buf.extend_from_slice(&tmp[..n]);
                             left -= n;
@@ -147,12 +173,26 @@ impl RpcServer {
                 let result = match parse_rpc_request(&body) {
                     Err(err_json) => err_json,
                     Ok(request) => {
+                        // Methods above the Public tier require authentication.
+                        // An unregistered method is treated as Admin so that a
+                        // typo or a future registration can never fail open.
                         let tier = registry
                             .auth_tier_for(&request.method)
-                            .unwrap_or(AuthTier::Public);
+                            .unwrap_or(AuthTier::Admin);
 
-                        // Admin methods require auth.
-                        if tier == AuthTier::Admin && auth_configured {
+                        if tier == AuthTier::Admin {
+                            // Fail closed: if no credentials are configured
+                            // there is no way to authorise an admin method, so
+                            // refuse it rather than serving it to anyone.
+                            if !auth_configured {
+                                let response = http_response(
+                                    401,
+                                    "Unauthorized: this method requires authentication, \
+                                     but no rpcuser/rpcpassword is configured",
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                return;
+                            }
                             if !check_auth(
                                 &headers,
                                 auth_user.as_deref().unwrap(),
@@ -226,10 +266,27 @@ fn check_auth(headers: &str, user: &str, pass: &str) -> bool {
         if lower.starts_with("authorization: basic ") {
             let value = &line[21..]; // "authorization: basic " is 21 chars
             let expected = base64_encode(&format!("{}:{}", user, pass));
-            return value.trim() == expected;
+            return constant_time_eq(value.trim().as_bytes(), expected.as_bytes());
         }
     }
     false
+}
+
+/// Compare two byte strings without leaking their contents through timing.
+///
+/// `==` on `str`/`[u8]` short-circuits at the first differing byte, which lets
+/// a network client recover a credential byte by byte from response timing.
+/// This folds every byte into the result instead, so the running time depends
+/// only on the lengths.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Extract the username from an HTTP Basic Auth header.

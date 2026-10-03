@@ -225,8 +225,14 @@ pub struct ChainstateManager {
     /// Hash of the assumed-valid block. Blocks at or below this height
     /// skip script verification during IBD, dramatically speeding up sync.
     assume_valid: Option<BlockHash>,
-    /// Height of the assumed-valid block. Used as a fast-path fallback
-    /// when the assume-valid header hasn't been synced yet (early IBD).
+    /// Height of the assumed-valid block, as configured.
+    ///
+    /// Retained for diagnostics only. It is deliberately NOT used to decide
+    /// whether to skip script verification: see `should_skip_scripts`, where a
+    /// height-only test was removed because it disabled signature checking for
+    /// every block below this height on any chain, not just the externally
+    /// verified one.
+    #[allow(dead_code)]
     assume_valid_height: Option<i32>,
     /// Tracked best fully-validated tip (arena index + chain_work).
     /// Avoids O(N) linear scan of the entire block index on every block.
@@ -1040,14 +1046,23 @@ impl ChainstateManager {
         let assume_idx = match self.block_index.find_by_hash(&assume_hash) {
             Some(idx) => idx,
             None => {
-                // Haven't seen the assume-valid header yet (early IBD,
-                // header sync hasn't reached that height).  Fall back to
-                // a height-based check so we can skip scripts immediately
-                // rather than waiting for header sync to catch up.
-                if let Some(av_height) = self.assume_valid_height {
-                    let block_height = self.block_index.get(arena_idx).height;
-                    return block_height < av_height;
-                }
+                // We have not seen the assume-valid header yet, so we cannot
+                // know whether this block is on the chain that leads to it.
+                //
+                // Do NOT fall back to a bare `height < assume_valid_height`
+                // comparison here. The configured height is static, while the
+                // anchor hash is the only thing that actually ties a block to
+                // the externally verified chain -- so a height-only test
+                // disables script verification for every block below that
+                // height on *any* chain the node is fed, including one whose
+                // transactions carry no valid signatures at all. Bitcoin Core
+                // likewise only skips scripts for a block it can prove is an
+                // ancestor of the configured assume-valid block.
+                //
+                // Verifying scripts until the anchor header arrives is the
+                // safe direction: header sync normally reaches the anchor well
+                // before block validation does, so the cost is small and
+                // transient.
                 return false;
             }
         };

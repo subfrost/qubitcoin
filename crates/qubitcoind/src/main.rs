@@ -286,19 +286,68 @@ impl NodeInterface for LiveNodeInterface {
             deserialize(data).map_err(|e| format!("tx deserialize: {}", e))?;
         let txid = tx.txid().clone();
 
-        // Basic validation: compute vsize and fee.
+        // Basic validation: compute vsize.
         let vsize = tx.get_virtual_size() as u32;
-
-        // Accept to mempool with zero fee (fee validation is done inside).
         let tx_ref = std::sync::Arc::new(tx);
-        let height = self.chainstate.lock().height();
-        let result = mempool::accept_to_mempool(
-            &self.mempool,
-            &tx_ref,
-            qubitcoin_primitives::Amount::from_sat(0),
-            vsize,
-            height,
-        );
+
+        // Resolve the output spent by each input -- first from the confirmed
+        // UTXO set, then from the mempool (for unconfirmed parents). This is
+        // needed both to compute the real fee and to verify the input scripts.
+        let (height, total_in, spent_outputs, missing) = {
+            let cs_guard = self.chainstate.lock();
+            let height = cs_guard.height();
+            let mut total_in: i64 = 0;
+            let mut spent_outputs: Vec<qubitcoin_consensus::transaction::TxOut> =
+                Vec::with_capacity(tx_ref.vin.len());
+            let mut missing = 0usize;
+            for input in &tx_ref.vin {
+                if input.prevout.is_null() {
+                    continue; // coinbase
+                }
+                if let Some(coin) = cs_guard.coins_tip().get_coin(&input.prevout) {
+                    total_in += coin.tx_out.value.to_sat();
+                    spent_outputs.push(coin.tx_out.clone());
+                } else if let Some(parent_tx) = self.mempool.get(&input.prevout.hash) {
+                    if let Some(output) = parent_tx.vout.get(input.prevout.n as usize) {
+                        total_in += output.value.to_sat();
+                        spent_outputs.push(output.clone());
+                    } else {
+                        missing += 1;
+                    }
+                } else {
+                    missing += 1;
+                }
+            }
+            (height, total_in, spent_outputs, missing)
+        };
+
+        if missing > 0 {
+            let reason = format!(
+                "bad-txns-inputs-missingorspent: {} input(s) not found in UTXO set or mempool",
+                missing
+            );
+            tracing::debug!(txid = %txid.to_hex(), reason = %reason, "transaction rejected");
+            return Err(reason);
+        }
+
+        // Verify the input scripts (signatures) before mempool acceptance.
+        // A peer can send a `tx` message at any time, so without this check an
+        // unsigned transaction spending any known UTXO enters the mempool and
+        // is then picked up by block assembly.
+        if let Err(reason) = mempool::verify_mempool_tx_scripts(&tx_ref, &spent_outputs) {
+            tracing::debug!(
+                txid = %txid.to_hex(),
+                reason = %reason,
+                "transaction rejected: script verification failed"
+            );
+            return Err(reason);
+        }
+
+        // Accept to mempool with the fee implied by the resolved inputs.
+        let total_out: i64 = tx_ref.vout.iter().map(|o| o.value.to_sat()).sum();
+        let fee = qubitcoin_primitives::Amount::from_sat(std::cmp::max(0, total_in - total_out));
+
+        let result = mempool::accept_to_mempool(&self.mempool, &tx_ref, fee, vsize, height);
 
         match result {
             mempool::MempoolAcceptResult::Accepted { .. } => {
@@ -1347,6 +1396,58 @@ fn register_live_rpcs(
 ) {
     use qubitcoin_rpc::server::{RpcRequest, RpcResponse, RPC_INVALID_PARAMS, RPC_MISC_ERROR};
 
+    // -- getrawmempool (live) ----------------------------------------------
+    // Overrides the stub registered by `register_node_rpcs`, which reads a
+    // `NodeState` mirror (`mempool_txids` / `mempool_entries`) that nothing
+    // in the daemon ever writes -- so it always reported an empty mempool.
+    // This reads the real `TxMemPool`.
+    let mp_raw = mempool.clone();
+    registry.register("getrawmempool", move |req: &RpcRequest| {
+        let verbose = req
+            .params
+            .as_ref()
+            .and_then(|p| p.get(0))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let txids = mp_raw.get_txids();
+
+        if !verbose {
+            let hexes: Vec<String> = txids.iter().map(|t| t.to_hex()).collect();
+            return RpcResponse::success(req.id.clone(), serde_json::json!(hexes));
+        }
+
+        let mut result = serde_json::Map::new();
+        for txid in &txids {
+            if let Some(entry) = mp_raw.get_entry(txid) {
+                let vsize = entry.vsize();
+                result.insert(
+                    txid.to_hex(),
+                    serde_json::json!({
+                        "vsize": vsize,
+                        "weight": (vsize as u64) * 4,
+                        "fee": entry.fee().to_sat() as f64 / 100_000_000.0,
+                        "time": entry.time(),
+                        "height": entry.entry_height(),
+                        "descendantcount": entry.descendant_count(),
+                        "descendantsize": entry.descendant_size(),
+                        "ancestorcount": entry.ancestor_count(),
+                        "ancestorsize": entry.ancestor_size(),
+                        "depends": entry
+                            .tx()
+                            .vin
+                            .iter()
+                            .filter(|i| !i.prevout.is_null())
+                            .filter(|i| mp_raw.exists(&i.prevout.hash))
+                            .map(|i| i.prevout.hash.to_hex())
+                            .collect::<Vec<String>>(),
+                    }),
+                );
+            }
+        }
+        RpcResponse::success(req.id.clone(), serde_json::Value::Object(result))
+    });
+
     // -- getblockhash (live, uses chainstate arena) -------------------------
     let cs_hash = chainstate.clone();
     registry.register("getblockhash", move |req: &RpcRequest| {
@@ -1565,7 +1666,7 @@ fn register_live_rpcs(
     // Bitcoin Core compatible: scantxoutset "start" [descriptors...]
     let cs_scan = chainstate.clone();
     let coins_db_scan = coins_db.clone();
-    registry.register("scantxoutset", move |req: &RpcRequest| {
+    registry.register_admin("scantxoutset", move |req: &RpcRequest| {
         let params = match req.params.as_ref() {
             Some(p) => p,
             None => {
@@ -1729,14 +1830,20 @@ fn register_live_rpcs(
         let height = cs_guard.height();
         let mut total_in: i64 = 0;
         let mut missing_inputs = Vec::new();
+        // The output spent by each input, in input order. Needed both for the
+        // fee calculation and for script verification below.
+        let mut spent_outputs: Vec<qubitcoin_consensus::transaction::TxOut> =
+            Vec::with_capacity(tx.vin.len());
         for input in &tx.vin {
             if input.prevout.is_null() { continue; } // coinbase
             if let Some(coin) = cs_guard.coins_tip().get_coin(&input.prevout) {
                 total_in += coin.tx_out.value.to_sat();
+                spent_outputs.push(coin.tx_out.clone());
             } else if let Some(parent_tx) = mp.get(&input.prevout.hash) {
                 // Check mempool for unconfirmed parent output
                 if let Some(output) = parent_tx.vout.get(input.prevout.n as usize) {
                     total_in += output.value.to_sat();
+                    spent_outputs.push(output.clone());
                 } else {
                     missing_inputs.push(input.prevout.clone());
                 }
@@ -1755,6 +1862,14 @@ fn register_live_rpcs(
                     missing_inputs.len()
                 ),
             );
+        }
+
+        // Verify the input scripts (signatures) before the transaction is
+        // allowed into the mempool. Without this an unsigned transaction
+        // spending any known UTXO is accepted and relayed, and is then picked
+        // up by block assembly.
+        if let Err(reason) = mempool::verify_mempool_tx_scripts(&tx_ref, &spent_outputs) {
+            return RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, reason);
         }
 
         let total_out: i64 = tx.vout.iter().map(|o| o.value.to_sat()).sum();
@@ -1991,7 +2106,7 @@ fn register_wallet_rpcs(
 
     // -- getnewaddress ------------------------------------------------------
     let w = wallet.clone();
-    registry.register("getnewaddress", move |req: &RpcRequest| {
+    registry.register_admin("getnewaddress", move |req: &RpcRequest| {
         let mut w = w.lock();
         let addr = w.get_new_address();
         RpcResponse::success(req.id.clone(), serde_json::json!(addr.address))
@@ -1999,7 +2114,7 @@ fn register_wallet_rpcs(
 
     // -- getbalance ---------------------------------------------------------
     let w = wallet.clone();
-    registry.register("getbalance", move |req: &RpcRequest| {
+    registry.register_admin("getbalance", move |req: &RpcRequest| {
         let w = w.lock();
         let balance = w.get_balance();
         let btc = balance.to_sat() as f64 / 100_000_000.0;
@@ -2008,7 +2123,7 @@ fn register_wallet_rpcs(
 
     // -- listunspent --------------------------------------------------------
     let w = wallet.clone();
-    registry.register("listunspent", move |req: &RpcRequest| {
+    registry.register_admin("listunspent", move |req: &RpcRequest| {
         let w = w.lock();
         let utxos: Vec<serde_json::Value> = w
             .list_unspent()
@@ -2034,7 +2149,7 @@ fn register_wallet_rpcs(
     let cs = chainstate.clone();
     let mp = mempool.clone();
     let wdb = wallet_db.clone();
-    registry.register("sendtoaddress", move |req: &RpcRequest| {
+    registry.register_admin("sendtoaddress", move |req: &RpcRequest| {
         let params = match req.params.as_ref() {
             Some(p) => p,
             None => {

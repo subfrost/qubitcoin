@@ -271,14 +271,19 @@ impl RpcRegistry {
 
     /// Check if a user is allowed to call a method per `rpcwhitelist`.
     ///
-    /// Returns `true` if no whitelist is configured, or if the user is not
-    /// in the whitelist map (unrestricted), or if the method is in their
-    /// allowed set.
+    /// Returns `true` if no whitelist is configured at all. Once a whitelist
+    /// *is* configured, a user with no entry is denied every method.
+    ///
+    /// This matches Bitcoin Core's `rpcwhitelist` semantics
+    /// (`src/httprpc.cpp`): the presence of any `-rpcwhitelist` makes the
+    /// whitelist authoritative. Returning `true` for an unlisted user would
+    /// invert the control -- adding a restrictive entry for one user would
+    /// leave every other user unrestricted.
     pub fn user_allowed(&self, user: &str, method: &str) -> bool {
         match &self.rpcwhitelist {
             None => true,
             Some(whitelist) => match whitelist.get(user) {
-                None => true, // user not in whitelist → unrestricted
+                None => false, // whitelist configured but user unlisted → deny
                 Some(allowed) => allowed.contains(method),
             },
         }
@@ -633,8 +638,15 @@ mod tests {
             HashSet::from(["getblockcount".to_string()]),
         );
         reg.rpcwhitelist = Some(wl);
-        // User "other" is not in the whitelist → unrestricted.
-        assert!(reg.user_allowed("other", "stop"));
+        // Once a whitelist is configured it is authoritative, so a user with
+        // no entry is denied -- matching Bitcoin Core's `-rpcwhitelist`.
+        // The previous behaviour (unlisted => unrestricted) inverted the
+        // control: restricting one user left every other user unrestricted.
+        assert!(!reg.user_allowed("other", "stop"));
+        assert!(!reg.user_allowed("other", "getblockcount"));
+        // The listed user keeps exactly the methods they were granted.
+        assert!(reg.user_allowed("restricted_user", "getblockcount"));
+        assert!(!reg.user_allowed("restricted_user", "stop"));
     }
 
     #[test]
