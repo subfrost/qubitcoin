@@ -8,6 +8,16 @@ services:
       - "8332:8332"   # RPC
     volumes:
       - qbc-data:/home/qubitcoin/.qubitcoin
+    # SECURITY: this binds the RPC to 0.0.0.0 and publishes port 8332. Admin
+    # methods (wallet, stop) now require the credentials below for any non-
+    # loopback caller, but:
+    #   * `-rpcuser=qubitcoin -rpcpassword=qubitcoin` are EXAMPLE credentials.
+    #     Change them before exposing this container to any untrusted network.
+    #   * `-rpcallowip` is NOT enforced by qubitcoind (unlike Bitcoin Core); the
+    #     only network-level control is the bind address. Restrict exposure with
+    #     the firewall / published-port mapping, or bind to 127.0.0.1.
+    #   * Public (read-only) methods and sendrawtransaction remain reachable
+    #     without credentials by design.
     command:
       - qubitcoind
       - -dbcache=2048

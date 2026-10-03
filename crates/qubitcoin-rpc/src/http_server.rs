@@ -64,7 +64,11 @@ impl RpcServer {
         tracing::info!(bind_addr = %self.config.bind_addr, "RPC server listening");
 
         loop {
-            let (mut stream, _addr) = listener.accept().await?;
+            let (mut stream, peer_addr) = listener.accept().await?;
+            // A loopback caller is trusted for Admin methods (matching Bitcoin
+            // Core's auth-cookie model for local access); any remote caller must
+            // present valid credentials.
+            let peer_is_loopback = peer_addr.ip().is_loopback();
             let registry = self.registry.clone();
             let auth_user = self.config.rpc_user.clone();
             let auth_pass = self.config.rpc_password.clone();
@@ -147,21 +151,29 @@ impl RpcServer {
                 let result = match parse_rpc_request(&body) {
                     Err(err_json) => err_json,
                     Ok(request) => {
+                        // Unregistered methods default to Admin: unknown traffic
+                        // is treated as privileged rather than served openly.
                         let tier = registry
                             .auth_tier_for(&request.method)
-                            .unwrap_or(AuthTier::Public);
+                            .unwrap_or(AuthTier::Admin);
 
-                        // Admin methods require auth.
-                        if tier == AuthTier::Admin && auth_configured {
-                            if !check_auth(
+                        // Admin methods require either a loopback caller or valid
+                        // credentials. Previously the credential check was gated
+                        // on `auth_configured`, so Admin methods were served
+                        // unauthenticated whenever no rpcuser/rpcpassword was set
+                        // (and, because no method was ever registered as Admin,
+                        // every method including wallet spends was effectively
+                        // Public regardless).
+                        let creds_ok = auth_configured
+                            && check_auth(
                                 &headers,
                                 auth_user.as_deref().unwrap(),
                                 auth_pass.as_deref().unwrap(),
-                            ) {
-                                let response = http_response(401, "Unauthorized");
-                                let _ = stream.write_all(response.as_bytes()).await;
-                                return;
-                            }
+                            );
+                        if !authorize(tier, creds_ok, peer_is_loopback) {
+                            let response = http_response(401, "Unauthorized");
+                            let _ = stream.write_all(response.as_bytes()).await;
+                            return;
                         }
 
                         // Optional per-user method whitelist.
@@ -217,6 +229,19 @@ fn parse_http_request(raw: &str) -> Option<(String, String)> {
         return None;
     }
     Some((parts[0].to_string(), parts[1].to_string()))
+}
+
+/// Decide whether a request for `tier` may proceed.
+///
+/// - `Public` methods are always allowed (safe for public reverse-proxy exposure).
+/// - `Admin` methods require either a loopback caller (trusted local access, akin
+///   to Bitcoin Core's auth cookie) or correct credentials. A remote caller with
+///   no credentials configured, or with wrong credentials, is denied.
+fn authorize(tier: AuthTier, creds_ok: bool, peer_is_loopback: bool) -> bool {
+    match tier {
+        AuthTier::Public => true,
+        AuthTier::Admin => peer_is_loopback || creds_ok,
+    }
 }
 
 /// Validate HTTP Basic Auth credentials against the `Authorization` header.
@@ -332,6 +357,32 @@ mod tests {
     use super::*;
     use crate::server::{RpcRegistry, RpcRequest, RpcResponse};
     use serde_json::json;
+
+    // -- authorize ----------------------------------------------------------
+
+    #[test]
+    fn test_authorize_public_always_allowed() {
+        // Public methods are allowed regardless of creds or origin.
+        for &creds in &[false, true] {
+            for &loopback in &[false, true] {
+                assert!(authorize(AuthTier::Public, creds, loopback));
+            }
+        }
+    }
+
+    #[test]
+    fn test_authorize_admin_remote_requires_creds() {
+        // Remote (non-loopback) caller: denied without valid creds, allowed with.
+        assert!(!authorize(AuthTier::Admin, false, false));
+        assert!(authorize(AuthTier::Admin, true, false));
+    }
+
+    #[test]
+    fn test_authorize_admin_loopback_trusted() {
+        // Loopback caller is trusted for Admin even without creds.
+        assert!(authorize(AuthTier::Admin, false, true));
+        assert!(authorize(AuthTier::Admin, true, true));
+    }
 
     // -- RpcServerConfig defaults -------------------------------------------
 

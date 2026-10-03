@@ -1991,7 +1991,7 @@ fn register_wallet_rpcs(
 
     // -- getnewaddress ------------------------------------------------------
     let w = wallet.clone();
-    registry.register("getnewaddress", move |req: &RpcRequest| {
+    registry.register_admin("getnewaddress", move |req: &RpcRequest| {
         let mut w = w.lock();
         let addr = w.get_new_address();
         RpcResponse::success(req.id.clone(), serde_json::json!(addr.address))
@@ -1999,7 +1999,7 @@ fn register_wallet_rpcs(
 
     // -- getbalance ---------------------------------------------------------
     let w = wallet.clone();
-    registry.register("getbalance", move |req: &RpcRequest| {
+    registry.register_admin("getbalance", move |req: &RpcRequest| {
         let w = w.lock();
         let balance = w.get_balance();
         let btc = balance.to_sat() as f64 / 100_000_000.0;
@@ -2008,7 +2008,7 @@ fn register_wallet_rpcs(
 
     // -- listunspent --------------------------------------------------------
     let w = wallet.clone();
-    registry.register("listunspent", move |req: &RpcRequest| {
+    registry.register_admin("listunspent", move |req: &RpcRequest| {
         let w = w.lock();
         let utxos: Vec<serde_json::Value> = w
             .list_unspent()
@@ -2034,7 +2034,7 @@ fn register_wallet_rpcs(
     let cs = chainstate.clone();
     let mp = mempool.clone();
     let wdb = wallet_db.clone();
-    registry.register("sendtoaddress", move |req: &RpcRequest| {
+    registry.register_admin("sendtoaddress", move |req: &RpcRequest| {
         let params = match req.params.as_ref() {
             Some(p) => p,
             None => {

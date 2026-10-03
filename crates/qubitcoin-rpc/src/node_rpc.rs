@@ -454,8 +454,8 @@ pub fn register_node_rpcs(registry: &mut RpcRegistry, state: Arc<NodeState>) {
         RpcResponse::success(req.id.clone(), serde_json::json!(uptime))
     });
 
-    // -- stop ---------------------------------------------------------------
-    registry.register("stop", move |req: &RpcRequest| {
+    // -- stop (Admin: node control / shutdown DoS) --------------------------
+    registry.register_admin("stop", move |req: &RpcRequest| {
         RpcResponse::success(
             req.id.clone(),
             serde_json::json!("Qubitcoin server stopping"),
