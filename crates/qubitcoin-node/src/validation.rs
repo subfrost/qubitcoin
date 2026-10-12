@@ -501,15 +501,32 @@ pub fn check_block(
     state: &mut BlockValidationState,
     check_merkle_root: bool,
 ) -> bool {
+    check_block_with_options(block, params, state, true, check_merkle_root)
+}
+
+/// [`check_block`] with Core's `fCheckPOW` switch exposed.
+///
+/// Port of Bitcoin Core's `CheckBlock(block, state, params, fCheckPOW,
+/// fCheckMerkleRoot)`. With `check_pow = false` both the proof-of-work check
+/// and the signet solution check are skipped (Core gates the signet check on
+/// `fCheckPOW` too); this is what `TestBlockValidity` uses for block
+/// templates and BIP23 proposals.
+pub fn check_block_with_options(
+    block: &Block,
+    params: &ConsensusParams,
+    state: &mut BlockValidationState,
+    check_pow: bool,
+    check_merkle_root: bool,
+) -> bool {
     // 1. Check block header (PoW).
-    if !check_block_header(&block.header, params, state) {
+    if check_pow && !check_block_header(&block.header, params, state) {
         return false;
     }
 
     // 1b. Signet only (BIP325): the block must also carry a valid solution
     // signed by the network's signers. Without this, proof of work alone would
     // make a block valid on signet, which is the whole point of the network.
-    if params.signet_blocks && !check_signet_block_solution(block, params) {
+    if check_pow && params.signet_blocks && !check_signet_block_solution(block, params) {
         return state.invalid(
             BlockValidationResult::Consensus,
             "bad-signet-blksig",
@@ -808,6 +825,42 @@ pub fn contextual_check_block_header_with_arena(
     }
 
     // 5. Check that nBits matches the expected difficulty.
+    let expected_bits =
+        get_next_work_required_with_arena(prev_index, header.time, params, arena, prev_arena_idx);
+
+    if header.bits != expected_bits {
+        // On regtest or when we cannot fully validate the retarget (because
+        // we lack the full ancestor chain), skip this check.
+        if !params.pow_no_retargeting {
+            return state.invalid(
+                BlockValidationResult::InvalidHeader,
+                "bad-diffbits",
+                &format!(
+                    "incorrect proof of work: expected 0x{:08x}, got 0x{:08x}",
+                    expected_bits, header.bits
+                ),
+            );
+        }
+    }
+
+    true
+}
+
+/// Compute the `nBits` required for the block that follows `prev_index`.
+///
+/// Port of Bitcoin Core's `GetNextWorkRequired()` (src/pow.cpp), resolving
+/// the retarget-period start block and (on min-difficulty networks) the last
+/// non-special-difficulty block through the block-index arena.
+/// `block_time` is the candidate block's timestamp (it matters only for the
+/// testnet 20-minute min-difficulty rule). Shared by header validation and
+/// the block assembler (`node/miner.cpp` calls the same function).
+pub fn get_next_work_required_with_arena(
+    prev_index: &BlockIndex,
+    block_time: u32,
+    params: &ConsensusParams,
+    arena: Option<&[BlockIndex]>,
+    prev_arena_idx: Option<usize>,
+) -> u32 {
     let interval = params.difficulty_adjustment_interval() as i32;
 
     // Compute first_time/first_bits: the timestamp and nBits of the first block
@@ -862,33 +915,16 @@ pub fn contextual_check_block_header_with_arena(
         prev_index.bits
     };
 
-    let expected_bits = get_next_work_required(
+    get_next_work_required(
         prev_index.height,
         prev_index.bits,
         prev_index.time,
         first_time,
         first_bits,
-        header.time,
+        block_time,
         last_non_special_bits,
         params,
-    );
-
-    if header.bits != expected_bits {
-        // On regtest or when we cannot fully validate the retarget (because
-        // we lack the full ancestor chain), skip this check.
-        if !params.pow_no_retargeting {
-            return state.invalid(
-                BlockValidationResult::InvalidHeader,
-                "bad-diffbits",
-                &format!(
-                    "incorrect proof of work: expected 0x{:08x}, got 0x{:08x}",
-                    expected_bits, header.bits
-                ),
-            );
-        }
-    }
-
-    true
+    )
 }
 
 // ---------------------------------------------------------------------------

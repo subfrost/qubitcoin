@@ -239,6 +239,38 @@ pub struct ChainstateManager {
     best_valid_tip: Option<(usize, ArithUint256)>,
     /// Arena indices of block index entries modified since the last flush.
     dirty_indices: HashSet<usize>,
+    /// Latch for [`ChainstateManager::is_initial_block_download`]: once IBD
+    /// has been observed to finish it never restarts (Core's
+    /// `m_cached_finished_ibd`).
+    finished_ibd: std::sync::atomic::AtomicBool,
+}
+
+/// Maximum age of the tip before the node considers itself in initial block
+/// download. Port of Bitcoin Core's `DEFAULT_MAX_TIP_AGE` (validation.h).
+pub const DEFAULT_MAX_TIP_AGE: i64 = 24 * 60 * 60;
+
+/// A fixed, owned snapshot of the coins a single block touches.
+///
+/// Used as the base of a throwaway [`CoinsViewCache`] so that
+/// [`ChainstateManager::test_block_validity`] can run `connect_block` without
+/// mutating the live UTXO cache (Core builds a `CCoinsViewCache` on top of
+/// `CoinsTip()` for the same purpose).
+struct SnapshotCoinsView {
+    coins: HashMap<qubitcoin_consensus::transaction::OutPoint, qubitcoin_common::coins::Coin>,
+    best_block: BlockHash,
+}
+
+impl CoinsView for SnapshotCoinsView {
+    fn get_coin(
+        &self,
+        outpoint: &qubitcoin_consensus::transaction::OutPoint,
+    ) -> Option<qubitcoin_common::coins::Coin> {
+        self.coins.get(outpoint).cloned()
+    }
+
+    fn get_best_block(&self) -> BlockHash {
+        self.best_block
+    }
 }
 
 impl ChainstateManager {
@@ -259,6 +291,7 @@ impl ChainstateManager {
             assume_valid_height: None,
             best_valid_tip: None,
             dirty_indices: HashSet::new(),
+            finished_ibd: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -802,6 +835,165 @@ impl ChainstateManager {
 
         let on_active = self.active_chainstate.chain.tip() == Some(arena_idx);
         Ok((on_active, Some(block_undo)))
+    }
+
+    // -- Mining support ------------------------------------------------------
+
+    /// Median time past of the block at `arena_idx`.
+    ///
+    /// Port of Bitcoin Core's `CBlockIndex::GetMedianTimePast()`.
+    pub fn median_time_past(&self, arena_idx: usize) -> i64 {
+        qubitcoin_common::chain::compute_mtp(self.block_index.as_slice(), arena_idx)
+    }
+
+    /// `nBits` required for a block built on `prev_idx` with timestamp
+    /// `block_time`.
+    ///
+    /// Port of Bitcoin Core's `GetNextWorkRequired()` (src/pow.cpp), resolved
+    /// against this manager's block index.
+    pub fn next_work_required(&self, prev_idx: usize, block_time: u32) -> u32 {
+        crate::validation::get_next_work_required_with_arena(
+            self.block_index.get(prev_idx),
+            block_time,
+            &self.params.consensus,
+            Some(self.block_index.as_slice()),
+            Some(prev_idx),
+        )
+    }
+
+    /// Whether the node is still in initial block download.
+    ///
+    /// Port of Bitcoin Core's `ChainstateManager::IsInitialBlockDownload()`:
+    /// true while there is no tip, the tip has less work than
+    /// `nMinimumChainWork`, or the tip is older than [`DEFAULT_MAX_TIP_AGE`].
+    /// Once it has returned `false` it latches and keeps returning `false`.
+    pub fn is_initial_block_download(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        if self.finished_ibd.load(Ordering::Relaxed) {
+            return false;
+        }
+        let tip = match self.tip() {
+            Some(t) => self.block_index.get(t),
+            None => return true,
+        };
+        let min_work =
+            qubitcoin_primitives::arith_uint256::uint256_to_arith(&self.params.consensus.minimum_chain_work);
+        if tip.chain_work < min_work {
+            return true;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if tip.get_block_time() < now - DEFAULT_MAX_TIP_AGE {
+            return true;
+        }
+        self.finished_ibd.store(true, Ordering::Relaxed);
+        false
+    }
+
+    /// Check that `block` would be valid if connected on top of the current
+    /// tip, without changing any chain or UTXO state.
+    ///
+    /// Port of Bitcoin Core's `TestBlockValidity()` (validation.cpp):
+    /// `ContextualCheckBlockHeader`, `CheckBlock(fCheckPOW,
+    /// fCheckMerkleRoot)`, `ContextualCheckBlock`, then `ConnectBlock` with
+    /// `fJustCheck=true` against a throwaway coins view. Core asserts that
+    /// the block builds on the tip; here a mismatch is reported as the
+    /// `inconclusive-not-best-prevblk` rejection that the BIP23 proposal
+    /// path uses.
+    pub fn test_block_validity(
+        &self,
+        block: &Block,
+        check_pow: bool,
+        check_merkle_root: bool,
+    ) -> Result<(), BlockValidationState> {
+        let mut state = BlockValidationState::new();
+        let tip = match self.tip() {
+            Some(t) => t,
+            None => {
+                state.invalid(BlockValidationResult::InvalidHeader, "bad-prevblk", "no chain tip");
+                return Err(state);
+            }
+        };
+        let prev = self.block_index.get(tip);
+        if block.header.prev_blockhash != prev.block_hash {
+            state.invalid(
+                BlockValidationResult::InvalidHeader,
+                "inconclusive-not-best-prevblk",
+                "block does not build on the current tip",
+            );
+            return Err(state);
+        }
+        let consensus = &self.params.consensus;
+        let arena = self.block_index.as_slice();
+
+        if !crate::validation::contextual_check_block_header_with_arena(
+            &block.header,
+            prev,
+            consensus,
+            &mut state,
+            Some(arena),
+            Some(tip),
+        ) {
+            return Err(state);
+        }
+        if !crate::validation::check_block_with_options(
+            block,
+            consensus,
+            &mut state,
+            check_pow,
+            check_merkle_root,
+        ) {
+            return Err(state);
+        }
+        let prev_mtp = qubitcoin_common::chain::compute_mtp(arena, tip);
+        if !crate::validation::contextual_check_block(block, prev.height, prev_mtp, consensus, &mut state) {
+            return Err(state);
+        }
+
+        // ConnectBlock(fJustCheck=true): run on a throwaway cache whose base
+        // is a snapshot of exactly the coins this block reads, so the live
+        // UTXO cache is never touched.
+        let mut coins = HashMap::new();
+        let tip_view = &self.active_chainstate.coins_tip;
+        for tx in &block.vtx {
+            for input in &tx.vin {
+                if input.prevout.is_null() {
+                    continue;
+                }
+                if let Some(c) = tip_view.get_coin(&input.prevout) {
+                    coins.insert(input.prevout.clone(), c);
+                }
+            }
+            // Outputs too, so the BIP30 overwrite check sees existing coins.
+            for n in 0..tx.vout.len() {
+                let op = qubitcoin_consensus::transaction::OutPoint::new(*tx.txid(), n as u32);
+                if let Some(c) = tip_view.get_coin(&op) {
+                    coins.insert(op, c);
+                }
+            }
+        }
+        let scratch = CoinsViewCache::new(Box::new(SnapshotCoinsView {
+            coins,
+            best_block: prev.block_hash,
+        }));
+        let chain = &self.active_chainstate.chain;
+        let mtp_lookup = |h: i32| -> i64 {
+            match chain.get_block_index(h) {
+                Some(ai) => qubitcoin_common::chain::compute_mtp(arena, ai),
+                None => block.header.time as i64,
+            }
+        };
+        crate::validation::connect_block(
+            block,
+            prev.height + 1,
+            &scratch,
+            consensus,
+            Some(&mtp_lookup),
+            false,
+        )?;
+        Ok(())
     }
 
     // -- Internal helpers ---------------------------------------------------
