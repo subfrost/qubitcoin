@@ -761,6 +761,51 @@ async fn main() {
         }),
     });
 
+    // 8d. User-registered DAG nodes (off unless -dagmaxusernodes > 0 or a
+    // per-owner quota is set with setdagquota).
+    let user_dag: Option<Arc<qubitcoin_indexer::usernodes::UserDag>> = indexer_manager.as_ref().and_then(|im| {
+        use qubitcoin_indexer::usernodes::{Quota, UserDag, UserDagConfig};
+        let d = UserDagConfig::default();
+        let dq = Quota::default();
+        let cfg = UserDagConfig {
+            workers: args.get_int_arg("dagworkers").map(|v| v.max(1) as usize).unwrap_or(d.workers),
+            default_quota: Quota {
+                max_nodes: args.get_int_arg("dagmaxusernodes").map(|v| v.max(0) as u32).unwrap_or(dq.max_nodes),
+                fuel_per_block: args.get_int_arg("dagfuelperblock").map(|v| v.max(1) as u64).unwrap_or(dq.fuel_per_block),
+                storage_bytes: args
+                    .get_int_arg("dagmaxstoragemb")
+                    .map(|v| (v.max(0) as u64) << 20)
+                    .unwrap_or(dq.storage_bytes),
+            },
+            ..d
+        };
+        let cs = chainstate.clone();
+        let bf = block_files.clone();
+        let read_block = Arc::new(move |h: u32| {
+            let block = {
+                let c = cs.lock();
+                let idx = c.active_chain().get_block_index(h as i32)?;
+                let e = c.block_index().get(idx);
+                if e.file < 0 {
+                    return None;
+                }
+                DiskBlockPos { file: e.file, pos: e.data_pos }
+            };
+            serialize(&bf.read_block(&block).ok()?).ok()
+        });
+        let tip = chainstate.lock().height().max(0) as u32;
+        match UserDag::open(im.shared(), &datadir, cfg, read_block, tip) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to open user DAG nodes");
+                None
+            }
+        }
+    });
+    if let (Some(e), Some(d)) = (&simulation, &user_dag) {
+        e.add_provider(d.clone());
+    }
+
     let block_processor = Arc::new(chain_events::BlockProcessor {
         chainstate: chainstate.clone(),
         block_files: block_files.clone(),
@@ -768,6 +813,7 @@ async fn main() {
         block_index_db: block_index_db.clone(),
         tx_index_db: tx_index_db.clone(),
         indexer_manager: indexer_manager.clone(),
+        user_dag: user_dag.clone(),
         magic_bytes,
         events: chain_events.clone(),
         dbcache_limit: (dbcache_mb as u64) * 1024 * 1024,
@@ -872,6 +918,25 @@ async fn main() {
             engine.clone(),
         );
         tracing::info!("indexer simulation RPCs registered");
+    }
+    if let Some(ref d) = user_dag {
+        use qubitcoin_rpc::server::{RpcRequest, RpcResponse, RPC_MISC_ERROR};
+        qubitcoin_indexer::dag_rpc::register_user_dag_rpcs(
+            &mut |name: &str, handler: Box<dyn Fn(&serde_json::Value) -> serde_json::Value + Send + Sync>| {
+                registry.register_admin(name, move |req: &RpcRequest| {
+                    let params = req.params.clone().unwrap_or(serde_json::Value::Array(vec![]));
+                    let result = tokio::task::block_in_place(|| handler(&params));
+                    match result.get("error") {
+                        Some(err) if result.as_object().map(|o| o.len() == 1).unwrap_or(false) => {
+                            RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, err.as_str().unwrap_or("unknown error").to_string())
+                        }
+                        _ => RpcResponse::success(req.id.clone(), result),
+                    }
+                });
+            },
+            d.clone(),
+        );
+        tracing::info!("user DAG node RPCs registered");
     }
 
     // Mining RPCs: getblocktemplate, submitblock, submitheader,
@@ -2047,4 +2112,8 @@ fn print_usage() {
     println!("  -simfuel=<n>       Fuel cap per indexer per simulation (default: 20000000000)");
     println!("  -simmaxmemorymb=<n> Wasm memory cap per simulated indexer in MB (default: 4096)");
     println!("  -simdeadlinems=<n> Wall-clock cap per indexer per simulation (default: 30000)");
+    println!("  -dagmaxusernodes=<n> User DAG nodes per owner by default (default: 0 = off)");
+    println!("  -dagfuelperblock=<n> Default per-owner fuel cap per block (default: 1000000000)");
+    println!("  -dagmaxstoragemb=<n> Default per-owner store cap in MB (default: 1024)");
+    println!("  -dagworkers=<n>    Worker threads for user DAG nodes (default: 2)");
 }

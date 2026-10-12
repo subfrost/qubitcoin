@@ -111,6 +111,8 @@ pub struct BlockProcessor {
     pub block_index_db: Arc<BlockIndexDB<RocksDatabase>>,
     pub tx_index_db: Arc<TxIndexDB<RocksDatabase>>,
     pub indexer_manager: Option<Arc<IndexerManager>>,
+    /// User-registered DAG nodes; run after the standard indexers.
+    pub user_dag: Option<Arc<qubitcoin_indexer::usernodes::UserDag>>,
     pub magic_bytes: [u8; 4],
     pub events: Arc<ChainEvents>,
     /// Flush the UTXO cache once it exceeds this many bytes (`-dbcache`).
@@ -237,12 +239,19 @@ impl BlockProcessor {
         if let Some(ref im) = self.indexer_manager {
             if let Some(h) = fork_height {
                 im.on_reorg(h as u32);
+                if let Some(ref d) = self.user_dag {
+                    d.on_reorg(h as u32);
+                }
             }
             for c in &update.connected {
                 match serialize(&*c.block) {
                     Ok(bytes) => im.on_block_connected(c.height as u32, &bytes),
                     Err(e) => tracing::error!(error = %e, "serialize block for indexers"),
                 }
+            }
+            // Standard indexers first; user nodes follow on their own pool.
+            if let (Some(d), Some(last)) = (&self.user_dag, update.connected.last()) {
+                d.notify_block(last.height as u32);
             }
         }
         Ok(SinkOutcome {
@@ -362,6 +371,7 @@ mod tests {
             block_index_db,
             tx_index_db,
             indexer_manager,
+            user_dag: None,
             magic_bytes: MAGIC,
             events,
             dbcache_limit: 1 << 30,
