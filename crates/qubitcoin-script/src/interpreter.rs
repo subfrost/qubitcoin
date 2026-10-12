@@ -2153,6 +2153,12 @@ fn verify_witness_program(
             *error = ScriptError::Ok;
             return true;
         }
+    } else if !is_p2sh && Script::is_pay_to_anchor_program(wit_version, wit_program) {
+        // Pay-to-Anchor: anyone can spend, and spending it is standard
+        // (Core v28 VerifyWitnessProgram exempts it from
+        // DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM).
+        *error = ScriptError::Ok;
+        return true;
     } else {
         if flags.contains(ScriptVerifyFlags::DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM) {
             *error = ScriptError::DiscourageUpgradableWitnessProgram;
