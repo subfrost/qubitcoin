@@ -22,6 +22,7 @@ pub mod state;
 pub mod storage;
 pub mod store;
 pub mod transform;
+pub mod usernodes;
 
 use config::{IndexerConfig, TransformConfig};
 use dag::{DagAccess, DagBackend};

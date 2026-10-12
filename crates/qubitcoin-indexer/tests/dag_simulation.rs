@@ -755,3 +755,201 @@ fn real_alkanes_wasm_simulation() {
     assert_eq!(mgr.call_view("alkanes", "traceblock", vec![]).unwrap(), tip_tb);
     assert_eq!(before, dump_all(&mgr));
 }
+
+// ---------------------------------------------------------------------------
+// User-registered DAG nodes
+// ---------------------------------------------------------------------------
+
+use qubitcoin_indexer::usernodes::{Quota, UserDag, UserDagConfig, UserNodeSpec};
+
+fn sha_hex(b: &[u8]) -> String {
+    hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b))
+}
+
+fn spec(owner: &str, name: &str, prog: &[u8], ups: &[&str], start: u32) -> UserNodeSpec {
+    UserNodeSpec {
+        owner: owner.into(),
+        name: name.into(),
+        kind: "wasm".into(),
+        sha256: sha_hex(prog),
+        upstreams: ups.iter().map(|s| s.to_string()).collect(),
+        start_height: start,
+        fuel_per_block: None,
+    }
+}
+
+fn wait_until(what: &str, f: impl Fn() -> bool) {
+    let t0 = Instant::now();
+    while !f() {
+        assert!(t0.elapsed() < Duration::from_secs(30), "timed out waiting for {}", what);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn open_dag(dir: &Path, mgr: &IndexerManager, blocks: Arc<parking_lot::Mutex<Vec<Vec<u8>>>>, tip: u32) -> Arc<UserDag> {
+    let src = blocks.clone();
+    UserDag::open(
+        mgr.shared(),
+        dir,
+        UserDagConfig::default(),
+        Arc::new(move |h: u32| src.lock().get(h.checked_sub(1)? as usize).cloned()),
+        tip,
+    )
+    .unwrap()
+}
+
+#[test]
+fn user_nodes_index_isolate_meter_and_roll_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = sec_ter(dir.path());
+    let mut chain = Chain::new();
+    for n in [2, 0, 4] {
+        chain.connect(&mgr, n);
+    }
+    let blocks = Arc::new(parking_lot::Mutex::new(chain.blocks.clone()));
+    let dag = open_dag(dir.path(), &mgr, blocks.clone(), 3);
+    let ter = wat::parse_str(TER_WAT).unwrap();
+    let sec = wat::parse_str(SEC_WAT).unwrap();
+    let burn = wat::parse_str(BURN_WAT).unwrap();
+
+    // Off by default: zero user nodes allowed.
+    assert!(dag.register(spec("alice", "u1", &ter, &["sec"], 1), &ter).unwrap_err().contains("quota"));
+    dag.set_quota("alice", Quota { max_nodes: 3, fuel_per_block: 50_000_000, storage_bytes: 1 << 30 }).unwrap();
+    assert!(dag.register(spec("alice", "u1", &ter, &["sec"], 1), b"x").unwrap_err().contains("sha256"));
+    assert!(dag.register(spec("alice", "u1", &ter, &["nope"], 1), &ter).unwrap_err().contains("unknown upstream"));
+    let mut b = spec("alice", "b1", &ter, &[], 1);
+    b.kind = "bpf".into();
+    assert!(dag.register(b, &ter).unwrap_err().contains("not implemented"));
+
+    // A tertiary-shaped user node, backfilled from height 1.
+    let before_std = dump_all(&mgr);
+    dag.register(spec("alice", "u1", &ter, &["sec"], 1), &ter).unwrap();
+    // Same keys as the standard `sec` (/txs, /len): they land in its own store only.
+    dag.register(spec("alice", "copy", &sec, &[], 2), &sec).unwrap();
+    // Reads `sec` without declaring it: errors and pauses, without stalling others.
+    dag.register(spec("alice", "bad", &ter, &[], 1), &ter).unwrap();
+    assert!(dag.register(spec("alice", "four", &sec, &[], 1), &sec).unwrap_err().contains("quota"));
+
+    wait_until("u1 and copy to reach 3", || {
+        dag.node("alice", "u1").unwrap().height() == Some(3) && dag.node("alice", "copy").unwrap().height() == Some(3)
+    });
+    assert_eq!(le32(&dag.view("alice", "u1", "dbl", vec![], None).unwrap()), 18);
+    assert_eq!(le32(&dag.view("alice", "u1", "dbl", vec![], Some(1)).unwrap()), 6);
+    assert_eq!(le32(&dag.view("alice", "copy", "txs", vec![], None).unwrap()), 1 + 5);
+    assert!(dag.view("alice", "u1", "dbl", vec![], Some(9)).is_err());
+    assert_eq!(before_std, dump_all(&mgr), "user nodes wrote into a standard store");
+
+    wait_until("bad to error", || dag.status("alice", "bad").unwrap()["state"] == "errored");
+    let st = dag.status("alice", "bad").unwrap();
+    assert!(st["error"].as_str().unwrap().contains("access denied"), "{}", st);
+    assert_eq!(st["height"], serde_json::Value::Null);
+    assert_eq!(st["lag"], 3);
+
+    // Fuel cap: a looping program errors with out_of_fuel; quota on storage.
+    dag.set_quota("bob", Quota { max_nodes: 1, fuel_per_block: 1_000_000, storage_bytes: 1 << 30 }).unwrap();
+    dag.register(spec("bob", "burn", &burn, &[], 3), &burn).unwrap();
+    dag.set_quota("carol", Quota { max_nodes: 1, fuel_per_block: 50_000_000, storage_bytes: 1 }).unwrap();
+    dag.register(spec("carol", "big", &sec, &[], 1), &sec).unwrap();
+    wait_until("burn/big to error", || {
+        dag.status("bob", "burn").unwrap()["state"] == "errored" && dag.status("carol", "big").unwrap()["state"] == "errored"
+    });
+    assert!(dag.status("bob", "burn").unwrap()["error"].as_str().unwrap().contains("out_of_fuel"));
+    assert!(dag.status("carol", "big").unwrap()["error"].as_str().unwrap().contains("storage quota"));
+
+    // A new block: standard first, then user nodes; errored nodes stay put.
+    let b4 = chain.connect(&mgr, 1);
+    blocks.lock().push(b4);
+    dag.notify_block(4);
+    wait_until("u1 at 4", || dag.node("alice", "u1").unwrap().height() == Some(4));
+    assert_eq!(le32(&dag.view("alice", "u1", "dbl", vec![], None).unwrap()), 2 * (9 + 2));
+    assert_eq!(dag.status("alice", "bad").unwrap()["state"], "errored");
+    assert_eq!(dag.list(Some("alice")).as_array().unwrap().len(), 3);
+    assert_eq!(dag.list(None).as_array().unwrap().len(), 5);
+
+    // Usage ledger.
+    let u = dag.usage("alice", 0, 100);
+    let u1 = &u["nodes"]["u1"];
+    assert_eq!(u1["blocks"], 4, "{}", u);
+    assert!(u1["fuel"].as_u64().unwrap() > 0);
+    assert_eq!(u1["kv_writes"], 4);
+    assert_eq!(u1["kv_bytes_written"], 4 * 8);
+    assert_eq!(u1["view_calls"], 3, "{}", u); // the out-of-range view is refused before it runs
+    assert!(u1["storage_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(u["nodes"]["bad"]["errors"], 1);
+    let only3 = dag.usage("alice", 3, 3);
+    assert!(only3["rows"].as_array().unwrap().iter().all(|r| r["height"] == 3 || r["height"] == 4 && r["usage"]["blocks"] == 0));
+    assert_eq!(dag.usage("bob", 0, 100)["nodes"]["burn"]["fuel"], 1_000_000);
+
+    // Simulation sees user nodes as @owner/name.
+    let e = chain.engine(&mgr, SimConfig::default());
+    e.add_provider(dag.clone());
+    let r = e
+        .simulate(SimRequest { txs: txs(2, 60), indexers: Some(vec!["@alice/u1".into()]), ..Default::default() })
+        .unwrap();
+    assert_eq!(r["per_indexer"]["@alice/u1"]["ok"], true, "{}", r);
+    assert_eq!(sim_u32(&e, r["overlay_id"].as_str().unwrap(), "@alice/u1", "dbl"), 2 * (11 + 3));
+
+    // Reorg to 2, then a different block 3.
+    mgr.on_reorg(2);
+    dag.on_reorg(2);
+    assert_eq!(dag.node("alice", "u1").unwrap().height(), Some(2));
+    assert_eq!(le32(&dag.view("alice", "u1", "dbl", vec![], None).unwrap()), 2 * 4);
+    {
+        let mut t = chain.tip.lock();
+        t.height = 2;
+        t.hash = qubitcoin_crypto::hash::hash256(&chain.blocks[1][..80]);
+    }
+    let alt3 = chain.connect(&mgr, 6);
+    {
+        let mut bl = blocks.lock();
+        bl.truncate(2);
+        bl.push(alt3);
+    }
+    dag.notify_block(3);
+    wait_until("u1 back at 3", || dag.node("alice", "u1").unwrap().height() == Some(3));
+    assert_eq!(le32(&dag.view("alice", "u1", "dbl", vec![], None).unwrap()), 2 * (4 + 7));
+    assert_eq!(le32(&mgr.call_view("ter", "dbl", vec![]).unwrap()), 2 * (4 + 7));
+
+    // Resume clears the error (it errors again: still undeclared).
+    dag.resume("alice", "bad").unwrap();
+    assert!(dag.unregister("alice", "copy").unwrap());
+    assert!(!dag.unregister("alice", "copy").unwrap());
+
+    // Registrations survive a restart.
+    dag.shutdown();
+    drop(e);
+    drop(dag);
+    std::thread::sleep(Duration::from_millis(300));
+    let dag = open_dag(dir.path(), &mgr, blocks.clone(), 3);
+    assert_eq!(dag.list(Some("alice")).as_array().unwrap().len(), 2);
+    assert_eq!(dag.node("alice", "u1").unwrap().height(), Some(3));
+    assert_eq!(dag.quota("carol").storage_bytes, 1);
+}
+
+#[test]
+fn user_dag_rpc_shapes() {
+    use qubitcoin_indexer::dag_rpc::register_user_dag_rpcs;
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let mgr = sec_ter(dir.path());
+    let mut chain = Chain::new();
+    chain.connect(&mgr, 1);
+    let blocks = Arc::new(parking_lot::Mutex::new(chain.blocks.clone()));
+    let dag = open_dag(dir.path(), &mgr, blocks, 1);
+    let mut rpcs = std::collections::HashMap::new();
+    register_user_dag_rpcs(&mut |n: &str, h| { rpcs.insert(n.to_string(), h); }, dag.clone());
+    let ter = wat::parse_str(TER_WAT).unwrap();
+    let q = rpcs["setdagquota"](&json!(["o", {"max_nodes": 1}]));
+    assert_eq!(q["quota"]["max_nodes"], 1);
+    let r = rpcs["registerdagnode"](&json!(["o", "n", "wasm", format!("0x{}", hex::encode(&ter)), sha_hex(&ter), ["sec"], 1, {"fuel_per_block": 1000000}]));
+    assert_eq!(r["id"], "@o/n", "{}", r);
+    wait_until("n at 1", || dag.node("o", "n").unwrap().height() == Some(1));
+    let s = rpcs["getdagnodestatus"](&json!(["o", "n"]));
+    assert_eq!(s["state"], "running");
+    assert_eq!(s["lag"], 0);
+    assert_eq!(rpcs["dagview"](&json!(["o", "n", "dbl", "0x"])), json!(format!("0x{}", hex::encode(4u32.to_le_bytes()))));
+    assert_eq!(rpcs["listdagnodes"](&json!(["o"])).as_array().unwrap().len(), 1);
+    assert_eq!(rpcs["getdagusage"](&json!(["o", 0, 10]))["nodes"]["n"]["blocks"], 1);
+    assert_eq!(rpcs["unregisterdagnode"](&json!(["o", "n"])), json!({"unregistered": true}));
+    assert!(rpcs["resumedagnode"](&json!(["o", "n"])).get("error").is_some());
+}

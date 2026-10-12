@@ -266,12 +266,75 @@ Returns cache usage, the configured caps, and counters (`simulations`,
   block-connect indexing proceeds while a simulation runs. A test connects
   blocks while a simulation is spinning until its deadline.
 
+## User-registered nodes (searcher programs)
+
+An owner can register a program as a persistent DAG node. The owner is an
+opaque string the caller supplies. Authentication is the caller's job, which
+is why these RPCs are admin-tier. The node indexes forward from its start
+height on the owner's behalf. A start height in the past is backfilled from
+the block files.
+
+* **Program kinds.** `wasm` is a metashrew-ABI indexer with `_start`,
+  `__flush`, views, and `__secondary_get` / `__upstream_view` on its
+  upstreams. `bpf` is accepted by the API but refused as not implemented yet.
+* **Upstreams** are standard indexers. The node reads them at the same
+  height, and any read of an undeclared node fails it with `access denied`.
+* **Isolation.** Each node has its own store at
+  `<datadir>/dag/users/<sha256(owner)[..8]>/<name>/db`, in the same metashrew
+  layout. Its `__flush` can only land there, so it cannot write another
+  node's KV.
+* **Scheduling.** On block connect the standard indexers run first. Then the
+  user nodes are queued to a bounded worker pool (`-dagworkers`, default 2),
+  which processes each node in batches of up to 16 blocks. A node may lag;
+  `lag` in its status shows by how much.
+* **Failures.** Each block runs under the node's fuel cap (bounded by the
+  owner's quota), a 512 MiB memory cap and a 10 s deadline. A trap, a refused
+  read, an exhausted cap or an exceeded store quota marks the node `errored`
+  and stops it. Nothing else waits on a user node. `resumedagnode` retries
+  it.
+* **Reorgs** roll user nodes back with the standard indexers, after waiting
+  for in-flight work.
+* **Persistence.** Registrations and quotas are kept in
+  `<datadir>/dag/registry.json`, and programs in
+  `<datadir>/dag/programs/<sha256>.wasm`. Nodes resume where they stopped
+  after a restart.
+* **Simulation.** A user node can be named in `simulateblock` as
+  `@owner/name` (it must be caught up to the tip).
+
+### Metering and quotas (no pricing)
+
+Every processed block and every `dagview` call is recorded in a usage ledger
+(`<datadir>/dag/ledger`, keyed by owner, height and node). Each entry holds
+`{fuel, kv_writes, kv_bytes_written, storage_bytes, view_calls, blocks,
+errors}`. View calls are recorded at the chain height of the call.
+
+Per-owner quotas are `{max_nodes, fuel_per_block, storage_bytes}`. The
+defaults come from `-dagmaxusernodes` (default **0**, so user nodes are off
+unless the operator enables them), `-dagfuelperblock` (default 1e9) and
+`-dagmaxstoragemb` (default 1024). `setdagquota` overrides them per owner.
+Quotas are enforced at registration (node count) and on every block (fuel
+cap, store size after commit).
+
+### RPCs
+
+| method | params | result |
+| --- | --- | --- |
+| `registerdagnode` | `owner, name, kind, program_hex\|path, sha256, [upstreams], start_height, {fuel_per_block?}` | node status |
+| `unregisterdagnode` | `owner, name` | `{"unregistered": bool}` (the store is deleted) |
+| `listdagnodes` | `[owner]` | `[status, ...]` |
+| `getdagnodestatus` | `owner, name` | `{owner, name, id, kind, sha256, upstreams, start_height, height, chain_height, lag, state, error, blocks_processed, last_block_fuel, storage_bytes, quota}` |
+| `dagview` | `owner, name, view_fn, input_hex, [height]` | `"0x..."` |
+| `getdagusage` | `owner, from, to` | `{owner, from, to, total, nodes: {name: usage}, rows: [{height, name, usage}] (≤1000), quota}` |
+| `setdagquota` | `owner, {max_nodes?, fuel_per_block?, storage_bytes?}` | `{owner, quota}` |
+| `resumedagnode` | `owner, name` | `{"resumed": true}` |
+
 ## Limitations
 
-* **User-registered DAG nodes, BPF programs, metering and quotas** are not
-  implemented yet (`registerdagnode` and the related RPCs). The only searcher
-  program supported today is the simulation-only wasm tertiary from
-  `loadsimulationindexer`.
+* **BPF programs** (`kind: "bpf"`) are not implemented. Registration
+  refuses them.
+* User nodes may read standard indexers only. They cannot read other user
+  nodes, and user transforms are not supported. The store-size quota uses
+  RocksDB's estimate (`estimate-live-data-size` plus memtables).
 * Nodes in one simulation run sequentially in topological order. Independent
   branches are not parallelised.
 * Stacked layers are incremental (see above).
