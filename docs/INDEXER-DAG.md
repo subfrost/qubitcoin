@@ -276,7 +276,9 @@ the block files.
 
 * **Program kinds.** `wasm` is a metashrew-ABI indexer with `_start`,
   `__flush`, views, and `__secondary_get` / `__upstream_view` on its
-  upstreams. `bpf` is accepted by the API but refused as not implemented yet.
+  upstreams. `bpf` is a userspace eBPF program with the helper ABI below
+  ([BPF programs](#bpf-programs)). Both kinds share everything else on this
+  page: isolation, scheduling, caps, metering, reorgs and simulation.
 * **Upstreams** are standard indexers. The node reads them at the same
   height, and any read of an undeclared node fails it with `access denied`.
 * **Isolation.** Each node has its own store at
@@ -296,10 +298,116 @@ the block files.
   for in-flight work.
 * **Persistence.** Registrations and quotas are kept in
   `<datadir>/dag/registry.json`, and programs in
-  `<datadir>/dag/programs/<sha256>.wasm`. Nodes resume where they stopped
+  `<datadir>/dag/programs/<sha256>.wasm` (or `.bpf`). Nodes resume where they stopped
   after a restart.
 * **Simulation.** A user node can be named in `simulateblock` as
   `@owner/name` (it must be caught up to the tip).
+
+### BPF programs
+
+A `bpf` node runs on [solana-sbpf](https://crates.io/crates/solana-sbpf)'s
+interpreter (0.25, built without its JIT). The kind is the eBPF twin of
+`wasm`: one invocation per block, its own namespaced store, reads only of
+declared upstreams, and views.
+
+**Format.** `program_hex|path` is raw **SBPF v3** bytecode: 8-byte
+little-endian eBPF instructions (the text section only, no ELF), entry at
+instruction 0, at most 65 536 instructions. SBPF v3 is classic eBPF
+(`lddw`, `neg`, `le`/`be`, 32- and 64-bit ALU and jumps) with static helper
+calls (`call` with `src = 0`, `imm = helper id`) and pc-relative internal
+calls (`call` with `src = 1`). `qubitcoin_indexer::bpf::assemble` turns
+solana-sbpf assembly into such bytecode (`syscall kv_get` names a helper).
+The sha256 is of these bytes.
+
+**Verification.** Registration runs solana-sbpf's `RequisiteVerifier`
+(known opcodes, valid registers, no writes to `r10`, jump targets inside the
+program and not into an `lddw`, valid shift amounts and endianness
+operands, no division by an immediate zero) and `LocalVerifier` (every
+helper call names a helper below, no unresolved internal call), plus the
+length and size checks. A rejected program returns `verifier: …` and is
+never stored or scheduled. The verifier does not prove termination; the
+instruction cap does.
+
+**Execution.** One entrypoint. On entry `r1` is the mode and `r2` the input
+length:
+
+| mode | `r1` | input (`get_input`) | result |
+| --- | --- | --- | --- |
+| block | 0 | `height_le32 ‖ block` (exactly the wasm `_start` input) | `kv_set` writes, committed atomically if the program exits with `r0 = 0` |
+| view | 1 | `height_le32 ‖ name_len_le32 ‖ view_name ‖ view_input` | the bytes passed to `emit` |
+
+So views are one `view` entry that dispatches on the view name in its
+input. `dagview owner name view_fn input_hex` and `simulatedview` call it.
+A non-zero `r0` fails the invocation (`program exited with r0 = N`), like a
+trap in wasm.
+
+**Memory.** The address space is the program (read-only, at 0), the stack
+(16 frames of 4 KiB at `0x2_0000_0000`, `r10` = frame pointer) and a zeroed
+heap at `0x3_0000_0000` of 1 MiB (or the node's memory cap if smaller).
+Every access is bounds-checked by the VM. Pending writes are capped at
+64 MiB per invocation, `emit` at 4 MiB.
+
+**Caps and metering.** The instruction meter is the node's fuel cap (the
+same `fuel_per_block` quota as wasm): one instruction is one unit of fuel,
+and each helper call costs 100 plus 1 per 8 bytes it moves
+(`upstream_view` adds 10 000). The total is what the ledger records as
+`fuel`. An exhausted cap is `out_of_fuel`. The wall-clock deadline is
+checked at every helper call.
+
+**Helpers.** Arguments go in `r1`–`r5` and the result comes back in `r0`.
+Each helper's id is the murmur3-32 hash of its name (solana-sbpf's
+static-syscall encoding). The ids are fixed by a unit test.
+
+| # | helper | id | arguments | returns |
+| --- | --- | --- | --- | --- |
+| 1 | `get_input` | `0x79b36278` | `buf, len, offset` | the input length. Copies input bytes `[offset, offset+len)` (clamped) to `buf`. `offset` lets a small heap stream a large block. |
+| 2 | `upstream_view` | `0x6b5d9eb8` | `upstream_idx, view_ptr, view_len, args_ptr` | the full result length. `args_ptr` points at four LE u64s `in_ptr, in_len, out_ptr, out_cap` (eBPF passes only five registers, so arguments 4 to 7 of `upstream_view(upstream_idx, view_ptr, view_len, in_ptr, in_len, out_ptr, out_cap)` travel in memory). Copies `min(len, out_cap)` bytes to `out_ptr`. |
+| 3 | `secondary_get` | `0x7528dfa6` | `upstream_idx, key_ptr, key_len, out_ptr, out_cap` | the value length, or `u64::MAX` if the key is absent. Copies `min(len, out_cap)` bytes. |
+| 4 | `kv_get` | `0x1c9fb127` | `key_ptr, key_len, out_ptr, out_cap` | as `secondary_get`, on the node's own store (its own pending writes first) |
+| 5 | `kv_set` | `0x8c33b6d3` | `key_ptr, key_len, val_ptr, val_len` | 0. Block mode only. Keys starting with `0xff` are reserved for the host. |
+| 6 | `emit` | `0x61390aef` | `ptr, len` | the total emitted so far. In a view this is the result. In a block it is the block's output, stored in the node's store and readable with the host view `__emitted` (`dagview owner name "__emitted" "" height`). |
+| 7 | `log` | `0x6bf5c3fe` | `ptr, len` | 0 if kept, 1 if dropped. At most 32 lines of 256 bytes per invocation. The last block's lines show as `logs` in `getdagnodestatus` and go to the daemon log at debug level. |
+
+`upstream_idx` indexes the node's declared `upstreams` list (0 is the first).
+Any other index, like any undeclared read in wasm, fails the node with
+`access denied`. Upstream reads are as of the block being indexed (or the
+view's height), and in a simulation they read the upstream's simulated
+state. Reads of the node's own store go through the same height-bounded
+store reader as wasm, so a node only ever sees its own namespace, and the
+store has the same metashrew layout and reorg rollback as wasm nodes.
+
+A tx counter, in solana-sbpf assembly (the test fixture `COUNT_ASM` in
+`crates/qubitcoin-indexer/tests/dag_simulation.rs` adds a view, an emit and
+a log):
+
+```
+    lddw r6, 0x300000000      ; heap
+    mov64 r1, r6              ; get_input(heap, 128, 0)
+    mov64 r2, 128
+    mov64 r3, 0
+    syscall get_input
+    ldxb r7, [r6+84]          ; height(4) + header(80): tx count varint (< 0xfd)
+    stw [r6+256], 0x7378742f  ; key "/txs"
+    mov64 r1, r6              ; kv_get("/txs", heap+264, 8)
+    add64 r1, 256
+    mov64 r2, 4
+    mov64 r3, r6
+    add64 r3, 264
+    mov64 r4, 8
+    syscall kv_get            ; absent → u64::MAX; the heap is zeroed
+    ldxdw r8, [r6+264]
+    add64 r8, r7
+    stxdw [r6+264], r8
+    mov64 r1, r6              ; kv_set("/txs", heap+264, 8)
+    add64 r1, 256
+    mov64 r2, 4
+    mov64 r3, r6
+    add64 r3, 264
+    mov64 r4, 8
+    syscall kv_set
+    mov64 r0, 0
+    exit
+```
 
 ### Metering and quotas (no pricing)
 
@@ -319,10 +427,10 @@ cap, store size after commit).
 
 | method | params | result |
 | --- | --- | --- |
-| `registerdagnode` | `owner, name, kind, program_hex\|path, sha256, [upstreams], start_height, {fuel_per_block?}` | node status |
+| `registerdagnode` | `owner, name, kind ("wasm"\|"bpf"), program_hex\|path, sha256, [upstreams], start_height, {fuel_per_block?}` | node status |
 | `unregisterdagnode` | `owner, name` | `{"unregistered": bool}` (the store is deleted) |
 | `listdagnodes` | `[owner]` | `[status, ...]` |
-| `getdagnodestatus` | `owner, name` | `{owner, name, id, kind, sha256, upstreams, start_height, height, chain_height, lag, state, error, blocks_processed, last_block_fuel, storage_bytes, quota}` |
+| `getdagnodestatus` | `owner, name` | `{owner, name, id, kind, sha256, upstreams, start_height, height, chain_height, lag, state, error, blocks_processed, last_block_fuel, logs, storage_bytes, quota}` |
 | `dagview` | `owner, name, view_fn, input_hex, [height]` | `"0x..."` |
 | `getdagusage` | `owner, from, to` | `{owner, from, to, total, nodes: {name: usage}, rows: [{height, name, usage}] (≤1000), quota}` |
 | `setdagquota` | `owner, {max_nodes?, fuel_per_block?, storage_bytes?}` | `{owner, quota}` |
@@ -330,8 +438,17 @@ cap, store size after commit).
 
 ## Limitations
 
-* **BPF programs** (`kind: "bpf"`) are not implemented. Registration
-  refuses them.
+* BPF programs are raw SBPF v3 bytecode. ELF objects (from `clang -target
+  bpf` or the Solana toolchain) are refused, so programs with a `.rodata`
+  section must be linked down to text first, or build their constants with
+  stores. Linux eBPF maps, tail calls, and Linux helper numbers do not
+  exist here; only the seven helpers above do.
+* A BPF block's deadline is checked only at helper calls. The instruction
+  cap is the hard bound on a run, so a loop with no helper calls runs until
+  the cap (about 1e9 instructions at the default quota) even after the
+  deadline has passed.
+* A BPF `emit` from a block is stored and viewable, but it does not feed
+  other nodes. User transforms are not supported (see below).
 * User nodes may read standard indexers only. They cannot read other user
   nodes, and user transforms are not supported. The store-size quota uses
   RocksDB's estimate (`estimate-live-data-size` plus memtables).

@@ -187,6 +187,13 @@ pub enum SimExec {
         start_height: u32,
     },
     Transform(Arc<TransformNode>),
+    /// A user BPF program (same base-state rules as `Wasm`).
+    Bpf {
+        program: Arc<crate::bpf::BpfProgram>,
+        base: Option<Arc<rocksdb::DB>>,
+        base_tip: Option<u32>,
+        start_height: u32,
+    },
 }
 
 /// One node as the simulation sees it.
@@ -212,7 +219,7 @@ impl SimNodeSpec {
     }
     fn kind(&self) -> &'static str {
         match self.exec {
-            SimExec::Wasm { .. } => "indexer",
+            SimExec::Wasm { .. } | SimExec::Bpf { .. } => "indexer",
             SimExec::Transform(_) => "transform",
         }
     }
@@ -279,7 +286,7 @@ impl OverlayBackend {
             layers.extend(p.chain(node));
         }
         let db = match &spec.exec {
-            SimExec::Wasm { base, .. } => base.clone(),
+            SimExec::Wasm { base, .. } | SimExec::Bpf { base, .. } => base.clone(),
             SimExec::Transform(_) => return Err(format!("'{}' is a transform and has no KV", node)),
         };
         Ok(LayeredReader { layers, db, base_height: self.tip_height })
@@ -309,6 +316,13 @@ impl OverlayBackend {
                 .await
                 .map(|o| (o.value, o.fuel_used))
                 .map_err(|e| format!("view '{}' failed: {}", view_fn, e))
+            }
+            SimExec::Bpf { program, .. } => {
+                let reader = self.reader(node)?;
+                program
+                    .view(view_fn, &input, self.height, reader, self.access(node), self.limits)
+                    .map(|o| (o.value, o.fuel_used))
+                    .map_err(|e| format!("view '{}' failed: {}", view_fn, e))
             }
             SimExec::Transform(_) => Err(format!("'{}' is a transform; it has no views", node)),
         }
@@ -799,19 +813,17 @@ impl SimulationEngine {
                 r.map(|o| NodeOut::Block(o.value, o.fuel_used))
                     .map_err(|e| (e.kind.as_str(), e.message, e.fuel_used))
             }
+            SimExec::Bpf { program, base, base_tip, start_height } => {
+                check_base(base.is_some(), *base_tip, *start_height, tip.height)?;
+                let reader = backend.reader(&spec.name).map_err(|e| ("host", e, 0))?;
+                let access = backend.access(&spec.name);
+                program
+                    .run_block(height, &input_block, reader, access, self.config.limits())
+                    .map(|o| NodeOut::Layer(Layer::from_pairs(o.value.pairs), o.fuel_used))
+                    .map_err(|e| (e.kind.as_str(), e.message, e.fuel_used))
+            }
             SimExec::Wasm { fork, base, base_tip, start_height } => {
-                if base.is_some() && height > *start_height {
-                    match base_tip {
-                        Some(h) if *h == tip.height => {}
-                        Some(h) => {
-                            return Err(("lagging", format!("indexer at height {} but the tip is {}", h, tip.height), 0))
-                        }
-                        None if tip.height >= *start_height => {
-                            return Err(("lagging", format!("indexer has no state yet; the tip is {}", tip.height), 0))
-                        }
-                        None => {}
-                    }
-                }
+                check_base(base.is_some(), *base_tip, *start_height, tip.height)?;
                 let reader = backend.reader(&spec.name).map_err(|e| ("host", e, 0))?;
                 let mut full = Vec::with_capacity(4 + input_block.len());
                 full.extend_from_slice(&height.to_le_bytes());
@@ -905,6 +917,21 @@ impl SimulationEngine {
             None => false,
         }
     }
+}
+
+/// A persistent node's confirmed state must be at the tip to be simulated.
+fn check_base(has_base: bool, base_tip: Option<u32>, start_height: u32, tip: u32) -> Result<(), (&'static str, String, u64)> {
+    if has_base && tip + 1 > start_height {
+        match base_tip {
+            Some(h) if h == tip => {}
+            Some(h) => return Err(("lagging", format!("indexer at height {} but the tip is {}", h, tip), 0)),
+            None if tip >= start_height => {
+                return Err(("lagging", format!("indexer has no state yet; the tip is {}", tip), 0))
+            }
+            None => {}
+        }
+    }
+    Ok(())
 }
 
 enum NodeOut {
