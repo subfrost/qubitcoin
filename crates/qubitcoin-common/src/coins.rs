@@ -952,6 +952,41 @@ impl CoinsViewCache {
         result
     }
 
+    /// The modifications this cache would push to its parent: one entry per
+    /// DIRTY coin, `Some(coin)` for an added/updated coin and `None` for a
+    /// spent one (FRESH+spent entries never reached the parent and are
+    /// skipped).
+    ///
+    /// Together with [`apply_changes`](Self::apply_changes) this is Core's
+    /// `CCoinsViewCache::Flush()` into a parent *cache* (`BatchWrite`), used
+    /// to validate a block on a child view and commit it only on success.
+    pub fn dirty_changes(&self) -> Vec<(OutPoint, Option<Coin>)> {
+        let cache = self.cache.read();
+        cache
+            .iter()
+            .filter(|(_, e)| e.flags.is_dirty() && !(e.flags.is_fresh() && e.coin.is_spent()))
+            .map(|(op, e)| {
+                (
+                    op.clone(),
+                    if e.coin.is_spent() { None } else { Some(e.coin.clone()) },
+                )
+            })
+            .collect()
+    }
+
+    /// Apply changes produced by a child cache's
+    /// [`dirty_changes`](Self::dirty_changes).
+    pub fn apply_changes(&self, changes: Vec<(OutPoint, Option<Coin>)>) {
+        for (op, coin) in changes {
+            match coin {
+                Some(c) => self.add_coin(&op, c, true),
+                None => {
+                    self.spend_coin(&op);
+                }
+            }
+        }
+    }
+
     /// Uncache a coin if it is not dirty.
     ///
     /// Removes the entry from the cache if it has no pending modifications,

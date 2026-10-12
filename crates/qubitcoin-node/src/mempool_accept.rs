@@ -296,6 +296,7 @@ impl<'a> MemPoolAccept<'a> {
         // Resolve inputs: package members, then mempool, then UTXO set.
         let coins = self.cs.coins_tip();
         let mut spent_outputs: Vec<TxOut> = Vec::with_capacity(tx.vin.len());
+        let mut prev_heights: Vec<i32> = Vec::with_capacity(tx.vin.len());
         let mut value_in: i64 = 0;
         let mut spends_coinbase = false;
         for input in &tx.vin {
@@ -303,10 +304,16 @@ impl<'a> MemPoolAccept<'a> {
                 .and_then(|(_, view)| view.get(&input.prevout.hash))
                 .and_then(|p| p.vout.get(input.prevout.n as usize).cloned());
             let out = match from_pkg {
-                Some(o) => o,
+                Some(o) => {
+                    prev_heights.push(next_height);
+                    o
+                }
                 None => match self.pool.get(&input.prevout.hash) {
                     Some(p) => match p.vout.get(input.prevout.n as usize) {
-                        Some(o) => o.clone(),
+                        Some(o) => {
+                            prev_heights.push(next_height);
+                            o.clone()
+                        }
                         None => {
                             return Err(TxRejection {
                                 missing_inputs: true,
@@ -328,6 +335,7 @@ impl<'a> MemPoolAccept<'a> {
                                     ));
                                 }
                             }
+                            prev_heights.push(coin.height as i32);
                             coin.tx_out.clone()
                         }
                         None => {
@@ -350,6 +358,11 @@ impl<'a> MemPoolAccept<'a> {
             ));
         }
         let fee = Amount::from_sat(value_in - value_out);
+
+        // BIP68 (CheckSequenceLocksAtTip).
+        if !sequence_locks_at_tip(self.cs, tx, &mut prev_heights) {
+            return Err(TxRejection::new("non-BIP68-final", ""));
+        }
         let mod_fee = fee.to_sat() + self.pool.get_fee_delta(&txid);
 
         let spk_of: HashMap<OutPoint, qubitcoin_script::Script> = tx
@@ -680,4 +693,130 @@ impl<'a> MemPoolAccept<'a> {
         }
         (package_error, results)
     }
+}
+
+/// Whether a mempool transaction is still valid on top of the current tip:
+/// every input exists (mempool or UTXO set), spent coinbases are mature,
+/// and the transaction is final for the next block. The per-transaction
+/// test of Core's `CTxMemPool::removeForReorg` (txmempool.cpp).
+fn still_valid_at_tip(cs: &ChainstateManager, pool: &TxMemPool, tx: &Transaction) -> bool {
+    let tip = match cs.tip() {
+        Some(t) => t,
+        None => return false,
+    };
+    let next_height = cs.height() + 1;
+    if !is_final_tx(tx, next_height, cs.median_time_past(tip)) {
+        return false;
+    }
+    for input in &tx.vin {
+        if let Some(p) = pool.get(&input.prevout.hash) {
+            if p.vout.len() <= input.prevout.n as usize {
+                return false;
+            }
+            continue;
+        }
+        match cs.coins_tip().get_coin(&input.prevout) {
+            Some(c) => {
+                if c.coinbase && next_height - (c.height as i32) < COINBASE_MATURITY {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
+    sequence_locks_ok(cs, pool, tx)
+}
+
+/// Bring the mempool in line with a chain update.
+///
+/// Port of the mempool half of Core's `ActivateBestChainStep` /
+/// `ConnectTip` (`removeForBlock`) and `MaybeUpdateMempoolForReorg`:
+/// transactions of newly connected blocks (and their conflicts) leave the
+/// pool; after a reorganisation, transactions of disconnected blocks that
+/// are not in the new branch are re-submitted (oldest block first, in block
+/// order), and then everything that is no longer valid on the new tip
+/// (missing inputs, immature coinbase spends, non-final, unmet sequence
+/// locks) is removed with reason `REORG` (`removeForReorg`).
+pub fn update_mempool_for_chain_update(
+    cs: &ChainstateManager,
+    pool: &TxMemPool,
+    update: &crate::chainstate::ChainUpdate,
+) {
+    for c in &update.connected {
+        pool.remove_for_block_txs(&c.block.vtx);
+    }
+    if update.disconnected.is_empty() {
+        return;
+    }
+    let in_new_chain: HashSet<Txid> = update
+        .connected
+        .iter()
+        .flat_map(|c| c.block.vtx.iter().map(|t| *t.txid()))
+        .collect();
+    let acc = MemPoolAccept::new(cs, pool);
+    for (_, block) in update.disconnected.iter().rev() {
+        for tx in block.vtx.iter().skip(1) {
+            if in_new_chain.contains(tx.txid()) || pool.exists(tx.txid()) {
+                continue;
+            }
+            if let Err(e) = acc.accept_single(tx, false) {
+                tracing::debug!(txid = %tx.txid().to_hex(), reason = %e.reason, "reorg: tx not re-added");
+            }
+        }
+    }
+    // removeForReorg.
+    let mut stale = Vec::new();
+    for e in pool.entries_snapshot() {
+        if !still_valid_at_tip(cs, pool, e.tx()) {
+            stale.push(e.txid());
+        }
+    }
+    for t in stale {
+        pool.remove_recursive_with_reason(&t, crate::mempool::MemPoolRemovalReason::Reorg);
+    }
+}
+
+/// BIP68 relative lock-times for the next block, with unconfirmed inputs
+/// (mempool or `view`) counted at the next block's height.
+///
+/// Port of Core's `CheckSequenceLocksAtTip()` (validation.cpp).
+fn sequence_locks_at_tip(
+    cs: &ChainstateManager,
+    tx: &Transaction,
+    prev_heights: &mut [i32],
+) -> bool {
+    use crate::validation::{check_sequence_locks, LOCKTIME_VERIFY_SEQUENCE};
+    let tip = match cs.tip() {
+        Some(t) => t,
+        None => return false,
+    };
+    let next_height = cs.height() + 1;
+    if next_height < cs.consensus().csv_height {
+        return true;
+    }
+    let tip_mtp = cs.median_time_past(tip);
+    let chain = cs.active_chain();
+    let mtp_at = |h: i32| -> i64 {
+        match chain.get_block_index(h) {
+            Some(i) => cs.median_time_past(i),
+            None => tip_mtp,
+        }
+    };
+    check_sequence_locks(tx, LOCKTIME_VERIFY_SEQUENCE, prev_heights, next_height, tip_mtp, mtp_at)
+}
+
+fn sequence_locks_ok(cs: &ChainstateManager, pool: &TxMemPool, tx: &Transaction) -> bool {
+    let next_height = cs.height() + 1;
+    let mut heights: Vec<i32> = Vec::with_capacity(tx.vin.len());
+    for input in &tx.vin {
+        if pool.exists(&input.prevout.hash) {
+            heights.push(next_height);
+        } else {
+            match cs.coins_tip().get_coin(&input.prevout) {
+                Some(c) => heights.push(c.height as i32),
+                None => return false,
+            }
+        }
+    }
+    sequence_locks_at_tip(cs, tx, &mut heights)
 }
