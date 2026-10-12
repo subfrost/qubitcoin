@@ -35,7 +35,7 @@ impl FeeRate {
     pub const ZERO: FeeRate = FeeRate { sats_per_kvb: 0 };
 
     /// Create a fee rate from satoshis per 1000 virtual bytes.
-    pub fn new(sats_per_kvb: i64) -> Self {
+    pub const fn new(sats_per_kvb: i64) -> Self {
         FeeRate { sats_per_kvb }
     }
 
@@ -911,6 +911,42 @@ impl TxMemPool {
         }
     }
 
+    /// Direct in-mempool children of `txid` (transactions spending its outputs).
+    pub fn children_of(&self, txid: &Txid) -> Vec<Txid> {
+        let entries = self.entries.read();
+        let spenders = self.spenders.read();
+        let mut out = Vec::new();
+        if let Some(e) = entries.get(txid) {
+            for n in 0..e.tx.vout.len() {
+                if let Some(c) = spenders.get(&OutPoint::new(*txid, n as u32)) {
+                    if !out.contains(c) {
+                        out.push(*c);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// All in-mempool ancestors of a transaction with the given inputs
+    /// (not including the transaction itself).
+    pub fn ancestors_of_inputs(&self, tx: &qubitcoin_consensus::transaction::Transaction) -> Vec<Txid> {
+        let entries = self.entries.read();
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack: Vec<Txid> = tx.vin.iter().map(|i| i.prevout.hash).collect();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            if let Some(e) = entries.get(&t) {
+                out.push(t);
+                stack.extend(e.tx.vin.iter().map(|i| i.prevout.hash));
+            }
+        }
+        out
+    }
+
     /// Get all transaction IDs currently in the mempool.
     pub fn get_txids(&self) -> Vec<Txid> {
         self.entries.read().keys().copied().collect()
@@ -1126,6 +1162,18 @@ impl TxMemPool {
     /// 4. The replacement must pay for its own bandwidth at incremental_relay_fee
     /// 5. No more than MAX_BIP125_REPLACEMENT_CANDIDATES may be evicted
     pub fn check_rbf(&self, entry: &MempoolEntry) -> Result<Vec<Txid>, String> {
+        self.check_rbf_with_extra(entry, &[])
+    }
+
+    /// [`check_rbf`](Self::check_rbf) with additional transactions treated
+    /// as direct conflicts even though they spend no common input. Used for
+    /// TRUC sibling eviction (Core adds the sibling to `m_conflicts` and
+    /// applies the normal replacement rules).
+    pub fn check_rbf_with_extra(
+        &self,
+        entry: &MempoolEntry,
+        extra_conflicts: &[Txid],
+    ) -> Result<Vec<Txid>, String> {
         let entries = self.entries.read();
         let spenders = self.spenders.read();
 
@@ -1136,6 +1184,11 @@ impl TxMemPool {
                 if !direct_conflicts.contains(&conflict_txid) {
                     direct_conflicts.push(conflict_txid);
                 }
+            }
+        }
+        for t in extra_conflicts {
+            if entries.contains_key(t) && !direct_conflicts.contains(t) {
+                direct_conflicts.push(*t);
             }
         }
 

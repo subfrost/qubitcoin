@@ -41,6 +41,16 @@ pub mod chainstate;
 /// Equivalent to `CTxMemPool` in Bitcoin Core.
 pub mod mempool;
 
+/// Ephemeral dust policy. Equivalent to `src/policy/ephemeral_policy.cpp`.
+pub mod ephemeral_policy;
+
+/// Mempool acceptance (`MemPoolAccept`) for single transactions and packages.
+/// Equivalent to the mempool half of `validation.cpp` in Bitcoin Core.
+pub mod mempool_accept;
+
+/// TRUC (v3) transaction policy. Equivalent to `src/policy/truc_policy.cpp`.
+pub mod truc_policy;
+
 /// Block template assembly (`BlockAssembler`).
 /// Equivalent to `src/node/miner.cpp` in Bitcoin Core.
 pub mod miner;
