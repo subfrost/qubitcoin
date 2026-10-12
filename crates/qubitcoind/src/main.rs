@@ -599,7 +599,14 @@ async fn main() {
                 IndexerMode::Async
             };
             let configs = qubitcoin_indexer::config::parse_load_indexer_args(&indexer_args);
-            match IndexerManager::new(configs, &datadir, mode) {
+            let transforms = match qubitcoin_indexer::config::parse_load_transform_args(&args.get_args("loadtransform")) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!(error = %e, "invalid -loadtransform");
+                    std::process::exit(1);
+                }
+            };
+            match IndexerManager::with_transforms(configs, transforms, &datadir, mode) {
                 Ok(mgr) => {
                     let mgr = Arc::new(mgr);
 
@@ -714,12 +721,90 @@ async fn main() {
             .unwrap_or(BlockHash::ZERO);
         Arc::new(qubitcoin_rpc::mining::TipWatch::new(tip_hash))
     };
+    // 8c. Pending-block simulation over the indexer DAG (admin RPCs).
+    let simulation: Option<Arc<qubitcoin_indexer::simulation::SimulationEngine>> = indexer_manager.as_ref().map(|im| {
+        use qubitcoin_indexer::simulation::{SimConfig, SimulationEngine};
+        let d = SimConfig::default();
+        let cfg = SimConfig {
+            max_overlays: args.get_int_arg("simmaxoverlays").map(|v| v.max(1) as usize).unwrap_or(d.max_overlays),
+            max_overlay_bytes: args
+                .get_int_arg("simmaxoverlaymb")
+                .map(|v| (v.max(1) as usize) << 20)
+                .unwrap_or(d.max_overlay_bytes),
+            max_view_cache_bytes: args
+                .get_int_arg("simviewcachemb")
+                .map(|v| (v.max(0) as usize) << 20)
+                .unwrap_or(d.max_view_cache_bytes),
+            fuel_per_node: args.get_int_arg("simfuel").map(|v| v.max(1) as u64).unwrap_or(d.fuel_per_node),
+            max_memory_bytes: args
+                .get_int_arg("simmaxmemorymb")
+                .map(|v| (v.max(1) as usize) << 20)
+                .unwrap_or(d.max_memory_bytes),
+            deadline: args
+                .get_int_arg("simdeadlinems")
+                .map(|v| std::time::Duration::from_millis(v.max(1) as u64))
+                .unwrap_or(d.deadline),
+            max_bytes_per_overlay: d.max_bytes_per_overlay,
+        };
+        let cs = chainstate.clone();
+        let tip_fn = move || chain_events::sim_tip(&cs.lock());
+        Arc::new(SimulationEngine::new(im.shared(), Arc::new(tip_fn), cfg))
+    });
+
     let chain_events = Arc::new(chain_events::ChainEvents {
         mempool: mempool.clone(),
         tip_watch: tip_watch.clone(),
         node_state: node_state.clone(),
         notifications: notifications.clone(),
+        on_tip: simulation.clone().map(|e| {
+            Arc::new(move |h: BlockHash| e.on_tip_changed(*h.data())) as Arc<dyn Fn(BlockHash) + Send + Sync>
+        }),
     });
+
+    // 8d. User-registered DAG nodes (off unless -dagmaxusernodes > 0 or a
+    // per-owner quota is set with setdagquota).
+    let user_dag: Option<Arc<qubitcoin_indexer::usernodes::UserDag>> = indexer_manager.as_ref().and_then(|im| {
+        use qubitcoin_indexer::usernodes::{Quota, UserDag, UserDagConfig};
+        let d = UserDagConfig::default();
+        let dq = Quota::default();
+        let cfg = UserDagConfig {
+            workers: args.get_int_arg("dagworkers").map(|v| v.max(1) as usize).unwrap_or(d.workers),
+            default_quota: Quota {
+                max_nodes: args.get_int_arg("dagmaxusernodes").map(|v| v.max(0) as u32).unwrap_or(dq.max_nodes),
+                fuel_per_block: args.get_int_arg("dagfuelperblock").map(|v| v.max(1) as u64).unwrap_or(dq.fuel_per_block),
+                storage_bytes: args
+                    .get_int_arg("dagmaxstoragemb")
+                    .map(|v| (v.max(0) as u64) << 20)
+                    .unwrap_or(dq.storage_bytes),
+            },
+            ..d
+        };
+        let cs = chainstate.clone();
+        let bf = block_files.clone();
+        let read_block = Arc::new(move |h: u32| {
+            let block = {
+                let c = cs.lock();
+                let idx = c.active_chain().get_block_index(h as i32)?;
+                let e = c.block_index().get(idx);
+                if e.file < 0 {
+                    return None;
+                }
+                DiskBlockPos { file: e.file, pos: e.data_pos }
+            };
+            serialize(&bf.read_block(&block).ok()?).ok()
+        });
+        let tip = chainstate.lock().height().max(0) as u32;
+        match UserDag::open(im.shared(), &datadir, cfg, read_block, tip) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to open user DAG nodes");
+                None
+            }
+        }
+    });
+    if let (Some(e), Some(d)) = (&simulation, &user_dag) {
+        e.add_provider(d.clone());
+    }
 
     let block_processor = Arc::new(chain_events::BlockProcessor {
         chainstate: chainstate.clone(),
@@ -728,6 +813,7 @@ async fn main() {
         block_index_db: block_index_db.clone(),
         tx_index_db: tx_index_db.clone(),
         indexer_manager: indexer_manager.clone(),
+        user_dag: user_dag.clone(),
         magic_bytes,
         events: chain_events.clone(),
         dbcache_limit: (dbcache_mb as u64) * 1024 * 1024,
@@ -813,6 +899,46 @@ async fn main() {
         // metashrew_view/metashrew_height aliases are registered via register_indexer_rpcs above
     }
 
+    // Simulation RPCs (admin tier, like the mining RPCs).
+    if let Some(ref engine) = simulation {
+        use qubitcoin_rpc::server::{RpcRequest, RpcResponse, RPC_MISC_ERROR};
+        qubitcoin_indexer::dag_rpc::register_simulation_rpcs(
+            &mut |name: &str, handler: Box<dyn Fn(&serde_json::Value) -> serde_json::Value + Send + Sync>| {
+                registry.register_admin(name, move |req: &RpcRequest| {
+                    let params = req.params.clone().unwrap_or(serde_json::Value::Array(vec![]));
+                    // Simulation runs wasm; keep it off the async worker.
+                    let result = tokio::task::block_in_place(|| handler(&params));
+                    if let Some(err) = result.get("error") {
+                        RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, err.as_str().unwrap_or("unknown error").to_string())
+                    } else {
+                        RpcResponse::success(req.id.clone(), result)
+                    }
+                });
+            },
+            engine.clone(),
+        );
+        tracing::info!("indexer simulation RPCs registered");
+    }
+    if let Some(ref d) = user_dag {
+        use qubitcoin_rpc::server::{RpcRequest, RpcResponse, RPC_MISC_ERROR};
+        qubitcoin_indexer::dag_rpc::register_user_dag_rpcs(
+            &mut |name: &str, handler: Box<dyn Fn(&serde_json::Value) -> serde_json::Value + Send + Sync>| {
+                registry.register_admin(name, move |req: &RpcRequest| {
+                    let params = req.params.clone().unwrap_or(serde_json::Value::Array(vec![]));
+                    let result = tokio::task::block_in_place(|| handler(&params));
+                    match result.get("error") {
+                        Some(err) if result.as_object().map(|o| o.len() == 1).unwrap_or(false) => {
+                            RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, err.as_str().unwrap_or("unknown error").to_string())
+                        }
+                        _ => RpcResponse::success(req.id.clone(), result),
+                    }
+                });
+            },
+            d.clone(),
+        );
+        tracing::info!("user DAG node RPCs registered");
+    }
+
     // Mining RPCs: getblocktemplate, submitblock, submitheader,
     // getblockheader, prioritisetransaction, getprioritisedtransactions,
     // getmininginfo/getnetworkhashps/getdifficulty (live), and on regtest
@@ -842,6 +968,33 @@ async fn main() {
             }),
         );
         tracing::info!("mining and mempool RPCs registered");
+    }
+
+    // `help`: every registered method, with full text for the DAG ones.
+    {
+        use qubitcoin_rpc::server::{RpcRequest, RpcResponse, RPC_MISC_ERROR};
+        let mut names = registry.method_names();
+        names.push("help".to_string());
+        names.sort();
+        names.dedup();
+        registry.register("help", move |req: &RpcRequest| {
+            let cmd = req.params.as_ref().and_then(|p| p.get(0)).and_then(|v| v.as_str());
+            match cmd {
+                None => RpcResponse::success(req.id.clone(), serde_json::json!(names.join("\n"))),
+                Some(c) => {
+                    if let Some((_, text)) = qubitcoin_indexer::dag_rpc::HELP.iter().find(|(m, _)| *m == c) {
+                        if names.iter().any(|n| n == c) {
+                            return RpcResponse::success(req.id.clone(), serde_json::json!(text));
+                        }
+                    }
+                    if names.iter().any(|n| n == c) {
+                        RpcResponse::success(req.id.clone(), serde_json::json!(format!("{} - Qubitcoin RPC method", c)))
+                    } else {
+                        RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, format!("help: unknown command: {}", c))
+                    }
+                }
+            }
+        });
     }
 
     tracing::info!(
@@ -1948,4 +2101,19 @@ fn print_usage() {
     println!("  -zmqpubhashtx=<address>     Publish transaction hashes");
     println!("  -zmqpubrawtx=<address>      Publish raw transactions");
     println!("  -zmqpubsequence=<address>   Publish block connect + mempool accept/remove events");
+    println!("  -loadindexer=<label>:<path>[:N|start=N][:deps=a,b][:transform=T][:runner=fork]");
+    println!("                     Load a WASM indexer (DAG node; see docs/INDEXER-DAG.md)");
+    println!("  -loadtransform=<name>:builtin:embed-view-in-coinbase:upstream=U:view=V:magic=M");
+    println!("  -loadtransform=<name>:<path.wasm>[:sha256=H][:deps=a,b][:fuel=N]");
+    println!("                     Load a transform node");
+    println!("  -simmaxoverlays=<n> Max cached simulation overlays (default: 64)");
+    println!("  -simmaxoverlaymb=<n> Overlay memory budget in MB (default: 512)");
+    println!("  -simviewcachemb=<n> Simulated-view cache in MB (default: 64)");
+    println!("  -simfuel=<n>       Fuel cap per indexer per simulation (default: 20000000000)");
+    println!("  -simmaxmemorymb=<n> Wasm memory cap per simulated indexer in MB (default: 4096)");
+    println!("  -simdeadlinems=<n> Wall-clock cap per indexer per simulation (default: 30000)");
+    println!("  -dagmaxusernodes=<n> User DAG nodes per owner by default (default: 0 = off)");
+    println!("  -dagfuelperblock=<n> Default per-owner fuel cap per block (default: 1000000000)");
+    println!("  -dagmaxstoragemb=<n> Default per-owner store cap in MB (default: 1024)");
+    println!("  -dagworkers=<n>    Worker threads for user DAG nodes (default: 2)");
 }

@@ -27,7 +27,7 @@ use qubitcoin_node::chainstate::{ChainUpdate, ChainstateManager};
 use qubitcoin_node::mempool::TxMemPool;
 use qubitcoin_node::mempool_accept::update_mempool_for_chain_update;
 use qubitcoin_node::tx_index_db::TxIndexDB;
-use qubitcoin_primitives::Txid;
+use qubitcoin_primitives::{BlockHash, Txid};
 use qubitcoin_rpc::mining::{BlockSink, SinkOutcome, TipWatch};
 use qubitcoin_rpc::node_rpc::NodeState;
 use qubitcoin_serialize::serialize;
@@ -41,6 +41,9 @@ pub struct ChainEvents {
     pub tip_watch: Arc<TipWatch>,
     pub node_state: Arc<NodeState>,
     pub notifications: Arc<Notifications>,
+    /// Called with the new tip after every tip change (connect, disconnect,
+    /// reorg); the indexer simulation engine drops its overlays here.
+    pub on_tip: Option<Arc<dyn Fn(BlockHash) + Send + Sync>>,
 }
 
 impl ChainEvents {
@@ -74,7 +77,30 @@ impl ChainEvents {
             }
         }
         self.tip_watch.notify(tip_hash);
+        if let Some(f) = &self.on_tip {
+            f(tip_hash);
+        }
     }
+}
+
+/// The tip a pending-block simulation builds on: the active tip, with
+/// header fields for a block at `tip + 1` (time = max(MTP + 1, now), the
+/// next required bits). No proof of work is ever computed.
+pub fn sim_tip(cs: &ChainstateManager) -> Option<qubitcoin_indexer::simulation::SimTip> {
+    let tip = cs.tip()?;
+    let e = cs.block_index().get(tip);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let time = (cs.median_time_past(tip) + 1).max(now) as u32;
+    Some(qubitcoin_indexer::simulation::SimTip {
+        hash: *e.block_hash.data(),
+        height: e.height as u32,
+        version: 0x2000_0000,
+        time,
+        bits: cs.next_work_required(tip, time),
+    })
 }
 
 /// Stores, connects and persists blocks.
@@ -85,6 +111,8 @@ pub struct BlockProcessor {
     pub block_index_db: Arc<BlockIndexDB<RocksDatabase>>,
     pub tx_index_db: Arc<TxIndexDB<RocksDatabase>>,
     pub indexer_manager: Option<Arc<IndexerManager>>,
+    /// User-registered DAG nodes; run after the standard indexers.
+    pub user_dag: Option<Arc<qubitcoin_indexer::usernodes::UserDag>>,
     pub magic_bytes: [u8; 4],
     pub events: Arc<ChainEvents>,
     /// Flush the UTXO cache once it exceeds this many bytes (`-dbcache`).
@@ -211,12 +239,19 @@ impl BlockProcessor {
         if let Some(ref im) = self.indexer_manager {
             if let Some(h) = fork_height {
                 im.on_reorg(h as u32);
+                if let Some(ref d) = self.user_dag {
+                    d.on_reorg(h as u32);
+                }
             }
             for c in &update.connected {
                 match serialize(&*c.block) {
                     Ok(bytes) => im.on_block_connected(c.height as u32, &bytes),
                     Err(e) => tracing::error!(error = %e, "serialize block for indexers"),
                 }
+            }
+            // Standard indexers first; user nodes follow on their own pool.
+            if let (Some(d), Some(last)) = (&self.user_dag, update.connected.last()) {
+                d.notify_block(last.height as u32);
             }
         }
         Ok(SinkOutcome {
@@ -281,6 +316,14 @@ mod tests {
 
     /// Open (or reopen) a regtest node in `dir`, as `main` does.
     fn open(dir: &PathBuf) -> Node {
+        open_with(dir, None, None)
+    }
+
+    fn open_with(
+        dir: &PathBuf,
+        indexer_manager: Option<Arc<IndexerManager>>,
+        on_tip: Option<Arc<dyn Fn(BlockHash) + Send + Sync>>,
+    ) -> Node {
         std::fs::create_dir_all(dir.join("blocks/index")).unwrap();
         std::fs::create_dir_all(dir.join("chainstate")).unwrap();
         std::fs::create_dir_all(dir.join("txindex")).unwrap();
@@ -319,6 +362,7 @@ mod tests {
             tip_watch: Arc::new(TipWatch::new(tip)),
             node_state: node_state.clone(),
             notifications: Arc::new(Notifications::default()),
+            on_tip,
         });
         let processor = Arc::new(BlockProcessor {
             chainstate: cs.clone(),
@@ -326,7 +370,8 @@ mod tests {
             coins_db: coins_db.clone(),
             block_index_db,
             tx_index_db,
-            indexer_manager: None,
+            indexer_manager,
+            user_dag: None,
             magic_bytes: MAGIC,
             events,
             dbcache_limit: 1 << 30,
@@ -535,5 +580,105 @@ mod tests {
         assert_eq!(tip(&n), b2.block_hash(), "rolled back to B after the failed reorg");
         assert_eq!(utxo_hash(&n), before);
         let _ = std::fs::remove_dir_all(&n.dir);
+    }
+
+    /// Counts transactions: `/txs` += tx count of each block; view `txs`.
+    const SEC_WAT: &str = r#"
+(module
+  (import "env" "__host_len" (func $host_len (result i32)))
+  (import "env" "__load_input" (func $load_input (param i32)))
+  (import "env" "__flush" (func $flush (param i32)))
+  (import "env" "__get" (func $get (param i32 i32)))
+  (import "env" "__get_len" (func $get_len (param i32) (result i32)))
+  (memory (export "memory") 64)
+  (data (i32.const 0xFC) "\04\00\00\00/txs")
+  (data (i32.const 0x3FC) "\0c\00\00\00\0a\04/txs\0a\04\00\00\00\00")
+  (func $read_u32 (param $key i32) (result i32)
+    (if (result i32) (i32.eq (call $get_len (local.get $key)) (i32.const 4))
+      (then (call $get (local.get $key) (i32.const 0x200)) (i32.load (i32.const 0x200)))
+      (else (i32.const 0))))
+  (func (export "_start")
+    (drop (call $host_len))
+    (call $load_input (i32.const 0x10000))
+    (i32.store (i32.const 0x408)
+      (i32.add (call $read_u32 (i32.const 0x100)) (i32.load8_u (i32.const 0x10054))))
+    (call $flush (i32.const 0x400)))
+  (func (export "txs") (result i32)
+    (i32.store (i32.const 0x2FC) (call $get_len (i32.const 0x100)))
+    (call $get (i32.const 0x100) (i32.const 0x300))
+    (i32.const 0x300))
+)
+"#;
+
+    #[test]
+    fn test_simulateblock_over_live_chain_touches_nothing_and_expires_on_new_tip() {
+        use qubitcoin_indexer::simulation::{SimConfig, SimRequest, SimulationEngine};
+        use qubitcoin_indexer::{config::IndexerConfig, store, IndexerMode};
+        let dir = temp_dir("sim");
+        std::fs::create_dir_all(&dir).unwrap();
+        let wasm = dir.join("sec.wasm");
+        std::fs::write(&wasm, wat::parse_str(SEC_WAT).unwrap()).unwrap();
+        let mut cfg = IndexerConfig::new("sec", wasm);
+        cfg.fork_runner = true;
+        let im = Arc::new(IndexerManager::new(vec![cfg], &dir.join("idx"), IndexerMode::Synchronous).unwrap());
+        let slot: Arc<std::sync::OnceLock<Arc<SimulationEngine>>> = Arc::new(std::sync::OnceLock::new());
+        let s2 = slot.clone();
+        let hook: Arc<dyn Fn(BlockHash) + Send + Sync> = Arc::new(move |h: BlockHash| {
+            if let Some(e) = s2.get() {
+                e.on_tip_changed(*h.data());
+            }
+        });
+        let n = open_with(&dir, Some(im.clone()), Some(hook));
+        let mut blocks = vec![];
+        for _ in 0..3 {
+            let b = block_on(&n, tip(&n), vec![], 0, 0);
+            assert!(p2p(&n, &b));
+            blocks.push(b);
+        }
+        assert_eq!(im.indexer_height("sec"), Some(3));
+        let cs2 = n.cs.clone();
+        let engine = Arc::new(SimulationEngine::new(
+            im.shared(),
+            Arc::new(move || sim_tip(&cs2.lock())),
+            SimConfig::default(),
+        ));
+        slot.set(engine.clone()).ok().unwrap();
+
+        let utxo_before = utxo_hash(&n);
+        let tip_before = tip(&n);
+        let db = im.get_indexer("sec").unwrap().db.clone();
+        let idx_before = store::dump(&db);
+        let spend = Transaction::new(
+            2,
+            vec![TxIn {
+                prevout: OutPoint::new(*blocks[0].vtx[0].txid(), 0),
+                script_sig: Script::new(),
+                sequence: SEQUENCE_FINAL,
+                witness: Witness { stack: vec![vec![0x51]] },
+            }],
+            vec![TxOut::new(Amount::from_sat(1000), wsh_op_true())],
+            0,
+        );
+        let r = engine
+            .simulate(SimRequest { txs: vec![serialize(&spend).unwrap()], ..Default::default() })
+            .unwrap();
+        assert_eq!(r["height"], 4);
+        assert_eq!(r["per_indexer"]["sec"]["ok"], true, "{}", r);
+        let id = r["overlay_id"].as_str().unwrap().to_string();
+        let v = engine.view(&id, "sec", "txs", vec![]).unwrap();
+        assert_eq!(u32::from_le_bytes(v[..4].try_into().unwrap()), 3 + 2);
+        // The simulated block is never submitted and nothing persistent moved.
+        assert_eq!(tip(&n), tip_before);
+        assert_eq!(n.cs.lock().height(), 3);
+        assert_eq!(utxo_hash(&n), utxo_before);
+        assert_eq!(store::dump(&db), idx_before);
+        assert_eq!(n.mempool.size(), 0);
+
+        // A new tip fires the hook and drops the overlay.
+        let b = block_on(&n, tip(&n), vec![], 0, 0);
+        assert!(p2p(&n, &b));
+        assert!(engine.overlay(&id).is_none());
+        assert_eq!(im.indexer_height("sec"), Some(4));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

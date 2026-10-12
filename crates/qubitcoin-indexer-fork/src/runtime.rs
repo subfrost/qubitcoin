@@ -20,6 +20,7 @@ use std::sync::Arc;
 use tokio::runtime::Handle;
 use wasmtime::*;
 
+use crate::host::{ExecError, ExecErrorKind, ExecLimits, ExecOutcome, HostContext};
 use crate::state::ForkWasmState;
 use crate::storage::MemStorage;
 use crate::upstream::ForkUpstream;
@@ -245,6 +246,137 @@ impl ForkRuntime {
         read_arraybuffer(&store, &memory, result_ptr)
     }
 
+
+    /// True if the module exports a function called `name`.
+    pub fn has_export(&self, name: &str) -> bool {
+        self.async_module
+            .exports()
+            .any(|e| e.name() == name && matches!(e.ty(), ExternType::Func(_)))
+    }
+
+    /// Run `_start()` with a host context and caps, on the caller's tokio
+    /// runtime (any flavor: the async linker never blocks in place).
+    ///
+    /// `input_data` is the full metashrew input (`height_le32 ++ block`).
+    /// Returns the `__flush`ed pairs and the fuel used.
+    pub async fn run_block_ctx(
+        &self,
+        input_data: Vec<u8>,
+        storage: MemStorage,
+        label: &str,
+        host: HostContext,
+        limits: ExecLimits,
+    ) -> Result<ExecOutcome<Vec<(Vec<u8>, Vec<u8>)>>, ExecError> {
+        let mut state = ForkWasmState::new(input_data, storage, label, false);
+        state.host = host;
+        let (r, fuel_used, state) = self.exec(state, limits, None).await;
+        r.map_err(|e| e.into_error(fuel_used))?;
+        let state = state.expect("state returned on success");
+        if !state.completed {
+            return Err(ExecError {
+                kind: ExecErrorKind::Failed,
+                message: "WASM module did not call __flush".into(),
+                fuel_used,
+            });
+        }
+        Ok(ExecOutcome { value: state.pending_flush.unwrap_or_default(), fuel_used })
+    }
+
+    /// Call an exported `() -> i32` function returning an ArrayBuffer
+    /// pointer (a metashrew view, or a transform's `transform`) with a host
+    /// context and caps. `input_data` is passed verbatim to `__load_input`;
+    /// for a metashrew view the caller prefixes the height.
+    pub async fn call_export_ctx(
+        &self,
+        fn_name: &str,
+        input_data: Vec<u8>,
+        storage: MemStorage,
+        label: &str,
+        host: HostContext,
+        limits: ExecLimits,
+    ) -> Result<ExecOutcome<Vec<u8>>, ExecError> {
+        let mut state = ForkWasmState::new(input_data, storage, label, true);
+        state.host = host;
+        let (r, fuel_used, _state) = self.exec(state, limits, Some(fn_name)).await;
+        let out = r.map_err(|e| e.into_error(fuel_used))?;
+        Ok(ExecOutcome { value: out, fuel_used })
+    }
+
+    /// Shared driver: fuel-metered store, caps, async-linker instance, and
+    /// the deadline. `export = None` runs `_start`; `Some(name)` calls the
+    /// `() -> i32` export and reads the ArrayBuffer it returns. Host errors
+    /// and aborts are folded into the result. Returns the state on success.
+    async fn exec(
+        &self,
+        mut state: ForkWasmState,
+        limits: ExecLimits,
+        export: Option<&str>,
+    ) -> (Result<Vec<u8>, ExecFail>, u64, Option<ForkWasmState>) {
+        if let Some(m) = limits.max_memory_bytes {
+            state.set_memory_limit(m);
+        }
+        let initial = limits.fuel.unwrap_or(u64::MAX);
+        let mut store = Store::new(&self.async_engine, state);
+        store.limiter(|s| &mut s.limits);
+        if let Err(e) = store.set_fuel(initial) {
+            return (Err(ExecFail::failed(format!("set fuel: {}", e))), 0, None);
+        }
+        if let Err(e) = store.fuel_async_yield_interval(Some(10_000)) {
+            return (Err(ExecFail::failed(format!("fuel yield: {}", e))), 0, None);
+        }
+        let instance = match self.instantiate_async(&mut store).await {
+            Ok(i) => i,
+            Err(e) => return (Err(ExecFail::failed(e)), 0, None),
+        };
+        let r = {
+            let run = async {
+                match export {
+                    None => {
+                        let start = instance
+                            .get_typed_func::<(), ()>(&mut store, "_start")
+                            .map_err(|e| ExecFail::failed(format!("missing _start: {}", e)))?;
+                        start.call_async(&mut store, ()).await.map_err(classify_trap)?;
+                        Ok(Vec::new())
+                    }
+                    Some(name) => {
+                        let f = instance
+                            .get_typed_func::<(), i32>(&mut store, name)
+                            .map_err(|e| ExecFail::failed(format!("missing export '{}': {}", name, e)))?;
+                        let ptr = f.call_async(&mut store, ()).await.map_err(classify_trap)?;
+                        let memory = instance
+                            .get_memory(&mut store, "memory")
+                            .ok_or_else(|| ExecFail::failed("no memory export"))?;
+                        read_arraybuffer(&store, &memory, ptr).map_err(ExecFail::failed)
+                    }
+                }
+            };
+            match limits.deadline {
+                Some(d) => match tokio::time::timeout(d, run).await {
+                    Ok(r) => r,
+                    Err(_) => Err(ExecFail {
+                        kind: ExecErrorKind::Deadline,
+                        message: format!("deadline of {:?} exceeded", d),
+                    }),
+                },
+                None => run.await,
+            }
+        };
+        let left = store.get_fuel().unwrap_or(0);
+        let used = initial.saturating_sub(left);
+        let state = store.into_data();
+        // A host refusal is the root cause even if the module then trapped.
+        if let Some(msg) = state.host_error.clone() {
+            return (Err(ExecFail { kind: ExecErrorKind::Host, message: msg }), used, None);
+        }
+        match r {
+            Err(e) => (Err(e), used, None),
+            Ok(_) if state.had_failure => {
+                (Err(ExecFail::failed("WASM module aborted")), used, None)
+            }
+            Ok(out) => (Ok(out), used, Some(state)),
+        }
+    }
+
     /// Instantiate for block processing using the async linker.
     async fn instantiate_async_block(
         &self,
@@ -276,6 +408,35 @@ impl ForkRuntime {
             .await
             .map_err(|e| format!("wasmtime instantiate_async: {}", e))
     }
+}
+
+/// Internal failure before the fuel count is attached.
+struct ExecFail {
+    kind: ExecErrorKind,
+    message: String,
+}
+
+impl ExecFail {
+    fn failed(m: impl Into<String>) -> Self {
+        ExecFail { kind: ExecErrorKind::Failed, message: m.into() }
+    }
+    fn into_error(self, fuel_used: u64) -> ExecError {
+        ExecError { kind: self.kind, message: self.message, fuel_used }
+    }
+}
+
+/// Map a wasmtime call error onto an [`ExecErrorKind`].
+fn classify_trap(e: wasmtime::Error) -> ExecFail {
+    if let Some(t) = e.downcast_ref::<Trap>() {
+        if *t == Trap::OutOfFuel {
+            return ExecFail { kind: ExecErrorKind::OutOfFuel, message: "out of fuel".into() };
+        }
+    }
+    let msg = format!("{:?}", e);
+    if msg.contains("growth failure") || msg.contains("memory minimum size") {
+        return ExecFail { kind: ExecErrorKind::Memory, message: format!("memory cap: {}", e) };
+    }
+    ExecFail::failed(format!("trap: {}", e))
 }
 
 fn prepare_memory(_instance: &Instance, _store: &mut Store<ForkWasmState>) {
@@ -477,6 +638,55 @@ fn link_host_functions_sync(linker: &mut Linker<ForkWasmState>) -> Result<(), St
         )
         .map_err(|e| format!("link abort: {}", e))?;
 
+    linker
+        .func_wrap(
+            "env",
+            "__secondary_get_len",
+            |mut caller: Caller<'_, ForkWasmState>, name_ptr: i32, key_ptr: i32| -> i32 {
+                secondary_lookup(&mut caller, name_ptr, key_ptr)
+                    .map(|v| v.len() as i32)
+                    .unwrap_or(0)
+            },
+        )
+        .map_err(|e| format!("link __secondary_get_len: {}", e))?;
+
+    linker
+        .func_wrap(
+            "env",
+            "__secondary_get",
+            |mut caller: Caller<'_, ForkWasmState>, name_ptr: i32, key_ptr: i32, value_ptr: i32| {
+                if let Some(v) = secondary_lookup(&mut caller, name_ptr, key_ptr) {
+                    let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
+                    if memory.write(&mut caller, value_ptr as usize, &v).is_err() {
+                        caller.data_mut().had_failure = true;
+                    }
+                }
+            },
+        )
+        .map_err(|e| format!("link __secondary_get: {}", e))?;
+
+    linker
+        .func_wrap(
+            "env",
+            "__upstream_view",
+            |mut caller: Caller<'_, ForkWasmState>, _n: i32, _f: i32, _i: i32| -> i32 {
+                caller.data_mut().host_error =
+                    Some("__upstream_view is not available in this mode".into());
+                -1
+            },
+        )
+        .map_err(|e| format!("link __upstream_view: {}", e))?;
+
+    linker
+        .func_wrap(
+            "env",
+            "__upstream_view_read",
+            |mut caller: Caller<'_, ForkWasmState>, out_ptr: i32| {
+                stash_read(&mut caller, out_ptr);
+            },
+        )
+        .map_err(|e| format!("link __upstream_view_read: {}", e))?;
+
     Ok(())
 }
 
@@ -654,12 +864,132 @@ fn link_host_functions_async(linker: &mut Linker<ForkWasmState>) -> Result<(), S
         )
         .map_err(|e| format!("link async abort: {}", e))?;
 
+    linker
+        .func_wrap(
+            "env",
+            "__secondary_get_len",
+            |mut caller: Caller<'_, ForkWasmState>, name_ptr: i32, key_ptr: i32| -> i32 {
+                secondary_lookup(&mut caller, name_ptr, key_ptr)
+                    .map(|v| v.len() as i32)
+                    .unwrap_or(0)
+            },
+        )
+        .map_err(|e| format!("link async __secondary_get_len: {}", e))?;
+
+    linker
+        .func_wrap(
+            "env",
+            "__secondary_get",
+            |mut caller: Caller<'_, ForkWasmState>, name_ptr: i32, key_ptr: i32, value_ptr: i32| {
+                if let Some(v) = secondary_lookup(&mut caller, name_ptr, key_ptr) {
+                    let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
+                    if memory.write(&mut caller, value_ptr as usize, &v).is_err() {
+                        caller.data_mut().had_failure = true;
+                    }
+                }
+            },
+        )
+        .map_err(|e| format!("link async __secondary_get: {}", e))?;
+
+    linker
+        .func_wrap_async(
+            "env",
+            "__upstream_view",
+            |mut caller: Caller<'_, ForkWasmState>, (name_ptr, fn_ptr, input_ptr): (i32, i32, i32)| {
+                Box::new(async move {
+                    let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
+                    let args = (|| {
+                        let n = read_arraybuffer(&caller, &memory, name_ptr)?;
+                        let f = read_arraybuffer(&caller, &memory, fn_ptr)?;
+                        let i = read_arraybuffer(&caller, &memory, input_ptr)?;
+                        Ok::<_, String>((n, f, i))
+                    })();
+                    let (n, f, i) = match args {
+                        Ok(a) => a,
+                        Err(e) => {
+                            caller.data_mut().host_error = Some(format!("__upstream_view args: {}", e));
+                            return -1;
+                        }
+                    };
+                    let name = String::from_utf8_lossy(&n).to_string();
+                    let view_fn = String::from_utf8_lossy(&f).to_string();
+                    let views = caller.data().host.views.clone();
+                    let Some(views) = views else {
+                        caller.data_mut().host_error = Some("no upstream views in this context".into());
+                        return -1;
+                    };
+                    match views.upstream_view(&name, &view_fn, i).await {
+                        Ok(v) => {
+                            let len = v.len() as i32;
+                            caller.data_mut().view_stash = Some(v);
+                            len
+                        }
+                        Err(e) => {
+                            caller.data_mut().host_error =
+                                Some(format!("upstream view {}.{}: {}", name, view_fn, e));
+                            -1
+                        }
+                    }
+                })
+            },
+        )
+        .map_err(|e| format!("link async __upstream_view: {}", e))?;
+
+    linker
+        .func_wrap(
+            "env",
+            "__upstream_view_read",
+            |mut caller: Caller<'_, ForkWasmState>, out_ptr: i32| {
+                stash_read(&mut caller, out_ptr);
+            },
+        )
+        .map_err(|e| format!("link async __upstream_view_read: {}", e))?;
+
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Shared host function bodies (sync — flush/log/abort)
 // ---------------------------------------------------------------------------
+
+/// `__secondary_get*` body: read name + key, ask the host context. A refusal
+/// records `host_error` (which fails the invocation) and reads as absent.
+fn secondary_lookup(
+    caller: &mut Caller<'_, ForkWasmState>,
+    name_ptr: i32,
+    key_ptr: i32,
+) -> Option<Vec<u8>> {
+    let memory = caller.get_export("memory")?.into_memory()?;
+    let name = read_arraybuffer(&*caller, &memory, name_ptr).ok()?;
+    let key = read_arraybuffer(&*caller, &memory, key_ptr).ok()?;
+    let name = String::from_utf8_lossy(&name).to_string();
+    let reader = caller.data().host.secondary.clone();
+    let Some(reader) = reader else {
+        caller.data_mut().host_error.get_or_insert_with(|| {
+            format!("__secondary_get({}): no secondary access in this context", name)
+        });
+        return None;
+    };
+    match reader.secondary_get(&name, &key) {
+        Ok(v) => v,
+        Err(e) => {
+            caller
+                .data_mut()
+                .host_error
+                .get_or_insert_with(|| format!("__secondary_get({}): {}", name, e));
+            None
+        }
+    }
+}
+
+/// `__upstream_view_read`: copy the stashed view result to `out_ptr`.
+fn stash_read(caller: &mut Caller<'_, ForkWasmState>, out_ptr: i32) {
+    let Some(v) = caller.data_mut().view_stash.take() else { return };
+    let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
+    if memory.write(&mut *caller, out_ptr as usize, &v).is_err() {
+        caller.data_mut().had_failure = true;
+    }
+}
 
 fn flush_handler(caller: &mut Caller<'_, ForkWasmState>, data_ptr: i32) {
     let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
