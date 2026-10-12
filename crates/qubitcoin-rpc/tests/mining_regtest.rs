@@ -130,7 +130,8 @@ fn test_pool_flow_gbt_solve_submitblock() {
     let mut registry = RpcRegistry::new();
     register_mining_rpcs(&mut registry, ctx);
 
-    let port = 30000 + (std::process::id() % 20000) as u16;
+    // A free port picked by the OS (fixed ports collide on shared build hosts).
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
     let server = RpcServer::new(
         RpcServerConfig {
             bind_addr: format!("127.0.0.1:{}", port).parse().unwrap(),

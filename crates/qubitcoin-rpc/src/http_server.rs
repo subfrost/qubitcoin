@@ -7,7 +7,9 @@
 //! requests to the `RpcRegistry` for JSON-RPC processing.  Authentication
 //! via HTTP Basic Auth is supported when `rpc_user` / `rpc_password` are set.
 
-use crate::server::{parse_rpc_request, process_request, AuthTier, RpcRegistry, RpcResponse};
+use crate::server::{AuthTier, JsonRpcVersion, RpcRegistry, RpcRequest, RpcResponse};
+#[cfg(test)]
+use crate::server::process_request;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -167,86 +169,213 @@ impl RpcServer {
                     return;
                 }
 
-                // Per-method auth: parse the JSON-RPC request to get the method
-                // name, then check if it requires authentication.
+                // Parse the body: one request object or a batch (array).
                 let auth_configured = auth_user.is_some() && auth_pass.is_some();
-                let result = match parse_rpc_request(&body) {
-                    Err(err_json) => err_json,
-                    Ok(request) => {
-                        // Methods above the Public tier require authentication.
-                        // An unregistered method is treated as Admin so that a
-                        // typo or a future registration can never fail open.
-                        let tier = registry
-                            .auth_tier_for(&request.method)
-                            .unwrap_or(AuthTier::Admin);
+                let parsed: serde_json::Value = match serde_json::from_str(&body) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        // Core: RPC_PARSE_ERROR in a 1.0-style reply, HTTP 500.
+                        let reply = RpcResponse::error(
+                            serde_json::Value::Null,
+                            crate::server::RPC_PARSE_ERROR,
+                            "Parse error".into(),
+                        )
+                        .to_json_string(JsonRpcVersion::V1Legacy);
+                        let _ = stream.write_all(json_http_response(500, &reply).as_bytes()).await;
+                        return;
+                    }
+                };
+                let (is_batch, items): (bool, Vec<serde_json::Value>) = match parsed {
+                    serde_json::Value::Array(a) => (true, a),
+                    other => (false, vec![other]),
+                };
+                let calls: Vec<Call> = items.iter().map(parse_call).collect();
 
-                        if tier == AuthTier::Admin {
-                            // Fail closed: if no credentials are configured
-                            // there is no way to authorise an admin method, so
-                            // refuse it rather than serving it to anyone.
-                            if !auth_configured {
-                                let response = http_response(
-                                    401,
-                                    "Unauthorized: this method requires authentication, \
-                                     but no rpcuser/rpcpassword is configured",
-                                );
-                                let _ = stream.write_all(response.as_bytes()).await;
-                                return;
-                            }
-                            if !check_auth(
-                                &headers,
-                                auth_user.as_deref().unwrap(),
-                                auth_pass.as_deref().unwrap(),
-                            ) {
-                                let response = http_response(401, "Unauthorized");
-                                let _ = stream.write_all(response.as_bytes()).await;
-                                return;
-                            }
-                        }
+                // Authentication is per HTTP request: if any call needs the
+                // admin tier, the request must carry valid credentials. An
+                // unregistered method is treated as Admin so that a typo or
+                // a future registration can never fail open.
+                let needs_admin = calls.iter().any(|c| match c {
+                    Call::Request { request, .. } => registry
+                        .auth_tier_for(&request.method)
+                        .unwrap_or(AuthTier::Admin)
+                        == AuthTier::Admin,
+                    Call::Invalid { .. } => false,
+                });
+                if needs_admin {
+                    // Fail closed: if no credentials are configured there is
+                    // no way to authorise an admin method.
+                    if !auth_configured {
+                        let response = http_response(
+                            401,
+                            "Unauthorized: this method requires authentication, \
+                             but no rpcuser/rpcpassword is configured",
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        return;
+                    }
+                    if !check_auth(&headers, auth_user.as_deref().unwrap(), auth_pass.as_deref().unwrap()) {
+                        let response = http_response(401, "Unauthorized");
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        return;
+                    }
+                }
+                let user = if auth_configured { extract_auth_user(&headers) } else { None };
 
-                        // Optional per-user method whitelist.
-                        let denied = auth_configured
-                            && extract_auth_user(&headers)
-                                .map(|user| !registry.user_allowed(&user, &request.method))
-                                .unwrap_or(false);
-                        let version = RpcResponse::detect_version(&request);
-                        let resp = if denied {
-                            RpcResponse::error(
-                                request.id.clone(),
-                                403,
-                                format!("Method not allowed for user: {}", request.method),
-                            )
-                        } else {
-                            // Handlers are synchronous and may block (chainstate
-                            // lock, getblocktemplate long polling), so run them
-                            // on the blocking pool rather than an async worker.
-                            let reg = registry.clone();
-                            match tokio::task::spawn_blocking(move || reg.dispatch(&request)).await {
-                                Ok(r) => r,
-                                Err(_) => {
-                                    let response = http_response(500, "Internal Server Error");
-                                    let _ = stream.write_all(response.as_bytes()).await;
-                                    return;
-                                }
-                            }
-                        };
-                        resp.to_json_string(version)
+                // Handlers are synchronous and may block (chainstate lock,
+                // getblocktemplate long polling), so run them on the
+                // blocking pool rather than an async worker.
+                let reg = registry.clone();
+                let replies = match tokio::task::spawn_blocking(move || {
+                    calls
+                        .into_iter()
+                        .map(|c| execute_call(&reg, c, user.as_deref()))
+                        .collect::<Vec<_>>()
+                })
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        let _ = stream.write_all(http_response(500, "Internal Server Error").as_bytes()).await;
+                        return;
                     }
                 };
 
-                // Send HTTP response.
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\n\
-                     Content-Type: application/json\r\n\
-                     Content-Length: {}\r\n\
-                     Connection: close\r\n\r\n{}",
-                    result.len(),
-                    result
-                );
+                let response = if is_batch {
+                    // Core: a batch always answers 200 with the array of
+                    // replies; 2.0 notifications get no entry.
+                    let body: Vec<serde_json::Value> = replies
+                        .into_iter()
+                        .filter_map(|r| r.map(|(json, _)| json))
+                        .collect();
+                    json_http_response(200, &serde_json::Value::Array(body).to_string())
+                } else {
+                    match replies.into_iter().next().flatten() {
+                        // A 2.0 notification: 204 No Content.
+                        None => "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string(),
+                        Some((json, status)) => json_http_response(status, &json.to_string()),
+                    }
+                };
                 let _ = stream.write_all(response.as_bytes()).await;
             });
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// JSON-RPC request handling (port of Core's httprpc.cpp / rpc/request.cpp)
+// ---------------------------------------------------------------------------
+
+/// One element of a request (or a batch).
+enum Call {
+    /// A well-formed request; `notification` = JSON-RPC 2.0 without `id`.
+    Request {
+        request: RpcRequest,
+        version: JsonRpcVersion,
+        notification: bool,
+    },
+    /// Not a request object (Core's "Invalid Request object").
+    Invalid { id: serde_json::Value },
+}
+
+fn parse_call(v: &serde_json::Value) -> Call {
+    let obj = match v.as_object() {
+        Some(o) => o,
+        None => return Call::Invalid { id: serde_json::Value::Null },
+    };
+    let id = obj.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let method = match obj.get("method").and_then(|m| m.as_str()) {
+        Some(m) if !m.is_empty() => m.to_string(),
+        _ => return Call::Invalid { id },
+    };
+    let jsonrpc = obj.get("jsonrpc").and_then(|j| j.as_str()).map(|s| s.to_string());
+    let version = if jsonrpc.as_deref() == Some("2.0") {
+        JsonRpcVersion::V2
+    } else {
+        JsonRpcVersion::V1Legacy
+    };
+    let notification = version == JsonRpcVersion::V2 && !obj.contains_key("id");
+    Call::Request {
+        request: RpcRequest {
+            jsonrpc,
+            method,
+            params: obj.get("params").cloned(),
+            id,
+        },
+        version,
+        notification,
+    }
+}
+
+/// Core's `JSONErrorReply` status: 400 for an invalid request, 404 for an
+/// unknown method, 500 for any other error. Only JSON-RPC 1.0 replies use
+/// it; 2.0 replies are always 200.
+fn status_for(resp: &RpcResponse, version: JsonRpcVersion) -> u16 {
+    match (&resp.error, version) {
+        (Some(e), JsonRpcVersion::V1Legacy) => match e.code {
+            crate::server::RPC_INVALID_REQUEST => 400,
+            crate::server::RPC_METHOD_NOT_FOUND => 404,
+            _ => 500,
+        },
+        _ => 200,
+    }
+}
+
+/// Run one call; `None` for a notification.
+fn execute_call(
+    registry: &RpcRegistry,
+    call: Call,
+    user: Option<&str>,
+) -> Option<(serde_json::Value, u16)> {
+    let (resp, version, notification) = match call {
+        Call::Invalid { id } => (
+            RpcResponse::error(id, crate::server::RPC_INVALID_REQUEST, "Invalid Request object".into()),
+            JsonRpcVersion::V1Legacy,
+            false,
+        ),
+        Call::Request { request, version, notification } => {
+            let allowed = user.map(|u| registry.user_allowed(u, &request.method)).unwrap_or(true);
+            let resp = if allowed {
+                registry.dispatch(&request)
+            } else {
+                RpcResponse::error(
+                    request.id.clone(),
+                    403,
+                    format!("Method not allowed for user: {}", request.method),
+                )
+            };
+            (resp, version, notification)
+        }
+    };
+    if notification {
+        return None;
+    }
+    let status = status_for(&resp, version);
+    let json: serde_json::Value =
+        serde_json::from_str(&resp.to_json_string(version)).unwrap_or(serde_json::Value::Null);
+    Some((json, status))
+}
+
+fn json_http_response(code: u16, body: &str) -> String {
+    let status = match code {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "Unknown",
+    };
+    format!(
+        "HTTP/1.1 {} {}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{}",
+        code,
+        status,
+        body.len(),
+        body
+    )
 }
 
 // ---------------------------------------------------------------------------

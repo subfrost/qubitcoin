@@ -257,7 +257,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_publish_hashblock_and_sequence_to_subscriber() {
-        let port = 41000 + (std::process::id() % 10000) as u16;
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let addr = format!("tcp://127.0.0.1:{}", port);
         let n = ZmqNotifier::start(&[
             ZmqConfig { topic: "hashblock", address: addr.clone() },
