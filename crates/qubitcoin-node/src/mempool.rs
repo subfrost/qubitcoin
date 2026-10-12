@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
 
@@ -363,6 +364,78 @@ pub struct MempoolInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Mempool events
+// ---------------------------------------------------------------------------
+
+/// Why a transaction left the mempool.
+///
+/// Port of Bitcoin Core's `MemPoolRemovalReason` (src/kernel/mempool_removal_reason.h).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemPoolRemovalReason {
+    /// Expired from mempool.
+    Expiry,
+    /// Removed in size limiting.
+    SizeLimit,
+    /// Removed for reorganization.
+    Reorg,
+    /// Removed for block (included in a connected block).
+    Block,
+    /// Removed for conflict with an in-block transaction.
+    Conflict,
+    /// Removed for replacement (BIP125).
+    Replaced,
+    /// Removed by a direct call that carries no more specific reason.
+    Other,
+}
+
+/// A mempool change, delivered to the listener installed with
+/// [`TxMemPool::set_event_listener`].
+///
+/// Mirrors the `TransactionAddedToMempool` / `TransactionRemovedFromMempool`
+/// validation-interface signals that Bitcoin Core's ZMQ notifier consumes
+/// (src/validationinterface.h). `mempool_sequence` is the pool's
+/// `m_sequence_number` value assigned to the event.
+#[derive(Debug, Clone)]
+pub enum MempoolEvent {
+    /// A transaction entered the mempool.
+    Added {
+        /// The transaction.
+        tx: TransactionRef,
+        /// Mempool sequence number of this event.
+        mempool_sequence: u64,
+    },
+    /// A transaction left the mempool.
+    Removed {
+        /// The transaction.
+        tx: TransactionRef,
+        /// Why it was removed.
+        reason: MemPoolRemovalReason,
+        /// Mempool sequence number of this event.
+        mempool_sequence: u64,
+    },
+}
+
+/// Callback receiving [`MempoolEvent`]s. It is invoked while the pool's
+/// internal locks are held, so it must not call back into the mempool.
+pub type MempoolEventListener = Arc<dyn Fn(&MempoolEvent) + Send + Sync>;
+
+/// One `prioritisetransaction` fee delta, as reported by
+/// `getprioritisedtransactions`.
+///
+/// Port of Bitcoin Core's `CTxMemPool::delta_info` (src/txmempool.h).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrioritisedTx {
+    /// Transaction id the delta applies to.
+    pub txid: Txid,
+    /// Fee delta in satoshis.
+    pub delta: i64,
+    /// Whether the transaction is currently in the mempool.
+    pub in_mempool: bool,
+    /// Modified fee (fee + delta), present only when `in_mempool`.
+    pub modified_fee: Option<Amount>,
+}
+
+// ---------------------------------------------------------------------------
 // TxMemPool
 // ---------------------------------------------------------------------------
 
@@ -391,6 +464,14 @@ pub struct TxMemPool {
     /// Full-RBF policy: if true, allow replacement of non-signaling transactions.
     /// Matches Bitcoin Core's `-mempoolfullrbf` flag (default true since v28).
     full_rbf: bool,
+    /// Counter bumped on every add/remove (Core's `nTransactionsUpdated`),
+    /// used by `getblocktemplate` long polling.
+    transactions_updated: AtomicU64,
+    /// Fee deltas from `prioritisetransaction` (Core's `mapDeltas`). Kept
+    /// for transactions not (yet) in the pool too.
+    deltas: RwLock<HashMap<Txid, i64>>,
+    /// Optional change listener (ZMQ, notifications).
+    listener: RwLock<Option<MempoolEventListener>>,
 }
 
 impl TxMemPool {
@@ -405,12 +486,118 @@ impl TxMemPool {
             entries: RwLock::new(HashMap::new()),
             spenders: RwLock::new(HashMap::new()),
             total_fee: AtomicI64::new(0),
-            sequence: AtomicU64::new(0),
+            // Core's m_sequence_number starts at 1.
+            sequence: AtomicU64::new(1),
             min_relay_fee,
             incremental_relay_fee: DEFAULT_INCREMENTAL_RELAY_FEE,
             max_mempool_size: max_size,
             full_rbf: true, // Default true, matching Bitcoin Core v28+
+            transactions_updated: AtomicU64::new(0),
+            deltas: RwLock::new(HashMap::new()),
+            listener: RwLock::new(None),
         }
+    }
+
+    /// Install (or clear) the listener that receives [`MempoolEvent`]s.
+    pub fn set_event_listener(&self, listener: Option<MempoolEventListener>) {
+        *self.listener.write() = listener;
+    }
+
+    /// Port of Bitcoin Core's `CTxMemPool::GetAndIncrementSequence()`.
+    fn next_sequence(&self) -> u64 {
+        self.sequence.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Current mempool sequence number (Core's `GetSequence()`).
+    pub fn get_sequence(&self) -> u64 {
+        self.sequence.load(Ordering::Relaxed)
+    }
+
+    /// Port of Bitcoin Core's `CTxMemPool::GetTransactionsUpdated()`.
+    pub fn get_transactions_updated(&self) -> u64 {
+        self.transactions_updated.load(Ordering::Relaxed)
+    }
+
+    /// Port of Bitcoin Core's `CTxMemPool::AddTransactionsUpdated()`.
+    pub fn add_transactions_updated(&self, n: u64) {
+        self.transactions_updated.fetch_add(n, Ordering::Relaxed);
+    }
+
+    fn notify(&self, event: MempoolEvent) {
+        if let Some(l) = self.listener.read().as_ref() {
+            l(&event);
+        }
+    }
+
+    fn on_removed(&self, tx: &TransactionRef, reason: MemPoolRemovalReason) {
+        // Core increments the sequence for every removal, even when (for
+        // BLOCK) it is not reported.
+        let seq = self.next_sequence();
+        self.transactions_updated.fetch_add(1, Ordering::Relaxed);
+        self.notify(MempoolEvent::Removed {
+            tx: tx.clone(),
+            reason,
+            mempool_sequence: seq,
+        });
+    }
+
+    // -- prioritisetransaction ----------------------------------------------
+
+    /// Add `fee_delta` satoshis to the fee the block assembler credits
+    /// `txid` with. Deltas accumulate; a total of zero removes the entry.
+    ///
+    /// Port of Bitcoin Core's `CTxMemPool::PrioritiseTransaction()`. Core
+    /// also rewrites the cached ancestor/descendant modified fees; here the
+    /// block assembler applies deltas when it builds its packages, so only
+    /// the delta map is maintained.
+    pub fn prioritise_transaction(&self, txid: &Txid, fee_delta: i64) {
+        {
+            let mut deltas = self.deltas.write();
+            let d = deltas.entry(*txid).or_insert(0);
+            *d = d.saturating_add(fee_delta);
+            if *d == 0 {
+                deltas.remove(txid);
+            }
+        }
+        self.transactions_updated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Fee delta currently applied to `txid` (Core's `ApplyDelta`).
+    pub fn get_fee_delta(&self, txid: &Txid) -> i64 {
+        self.deltas.read().get(txid).copied().unwrap_or(0)
+    }
+
+    /// Drop any fee delta for `txid` (Core's `ClearPrioritisation`).
+    pub fn clear_prioritisation(&self, txid: &Txid) {
+        self.deltas.write().remove(txid);
+    }
+
+    /// All fee deltas, for `getprioritisedtransactions`.
+    ///
+    /// Port of Bitcoin Core's `CTxMemPool::GetPrioritisedTransactions()`.
+    pub fn get_prioritised_transactions(&self) -> Vec<PrioritisedTx> {
+        let deltas = self.deltas.read();
+        let entries = self.entries.read();
+        let mut out: Vec<PrioritisedTx> = deltas
+            .iter()
+            .map(|(txid, delta)| {
+                let entry = entries.get(txid);
+                PrioritisedTx {
+                    txid: *txid,
+                    delta: *delta,
+                    in_mempool: entry.is_some(),
+                    modified_fee: entry.map(|e| Amount::from_sat(e.fee.to_sat() + *delta)),
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.txid.as_bytes().cmp(b.txid.as_bytes()));
+        out
+    }
+
+    /// Clones of every entry, for block assembly. Transactions are
+    /// reference-counted so this does not copy transaction data.
+    pub fn entries_snapshot(&self) -> Vec<MempoolEntry> {
+        self.entries.read().values().cloned().collect()
     }
 
     /// Add a validated transaction to the mempool without further validation.
@@ -438,9 +625,6 @@ impl TxMemPool {
         // Update total fee.
         self.total_fee
             .fetch_add(entry.fee.to_sat(), Ordering::Relaxed);
-
-        // Bump sequence.
-        self.sequence.fetch_add(1, Ordering::Relaxed);
 
         // Update ancestor/descendant stats for related entries.
         // We need to update descendants of our ancestors and ancestors of our
@@ -485,7 +669,14 @@ impl TxMemPool {
             }
         }
 
+        let tx = entry.tx.clone();
         entries.insert(txid, entry);
+        let seq = self.next_sequence();
+        self.transactions_updated.fetch_add(1, Ordering::Relaxed);
+        self.notify(MempoolEvent::Added {
+            tx,
+            mempool_sequence: seq,
+        });
         true
     }
 
@@ -564,6 +755,16 @@ impl TxMemPool {
     /// Returns the list of removed transactions (the root transaction plus
     /// any descendants that were evicted).
     pub fn remove_recursive(&self, txid: &Txid) -> Vec<TransactionRef> {
+        self.remove_recursive_with_reason(txid, MemPoolRemovalReason::Other)
+    }
+
+    /// [`remove_recursive`](Self::remove_recursive) with an explicit
+    /// removal reason (Core's `removeRecursive(tx, reason)`).
+    pub fn remove_recursive_with_reason(
+        &self,
+        txid: &Txid,
+        reason: MemPoolRemovalReason,
+    ) -> Vec<TransactionRef> {
         let mut entries = self.entries.write();
         let mut spenders = self.spenders.write();
 
@@ -597,6 +798,7 @@ impl TxMemPool {
                     }
                 }
 
+                self.on_removed(&entry.tx, reason);
                 removed_txs.push(entry.tx);
             }
         }
@@ -607,6 +809,15 @@ impl TxMemPool {
     ///
     /// Returns the removed entry, or `None` if the txid was not in the pool.
     pub fn remove_entry(&self, txid: &Txid) -> Option<MempoolEntry> {
+        self.remove_entry_with_reason(txid, MemPoolRemovalReason::Other)
+    }
+
+    /// [`remove_entry`](Self::remove_entry) with an explicit removal reason.
+    pub fn remove_entry_with_reason(
+        &self,
+        txid: &Txid,
+        reason: MemPoolRemovalReason,
+    ) -> Option<MempoolEntry> {
         let mut entries = self.entries.write();
         let mut spenders = self.spenders.write();
 
@@ -627,6 +838,7 @@ impl TxMemPool {
                 }
             }
 
+            self.on_removed(&entry.tx, reason);
             Some(entry)
         } else {
             None
@@ -669,7 +881,33 @@ impl TxMemPool {
     /// confirmed transaction (and cleans up spender tracking).
     pub fn remove_for_block(&self, txids: &[Txid]) {
         for txid in txids {
-            self.remove_entry(txid);
+            self.remove_entry_with_reason(txid, MemPoolRemovalReason::Block);
+            self.clear_prioritisation(txid);
+        }
+    }
+
+    /// Remove the transactions of a newly connected block, plus every
+    /// mempool transaction that conflicts with them (spends an input that
+    /// the block spends), and clear their fee deltas.
+    ///
+    /// Port of Bitcoin Core's `CTxMemPool::removeForBlock()` together with
+    /// `removeConflicts()` (src/txmempool.cpp).
+    pub fn remove_for_block_txs(&self, txs: &[TransactionRef]) {
+        for tx in txs {
+            let txid = *tx.txid();
+            self.remove_entry_with_reason(&txid, MemPoolRemovalReason::Block);
+            // removeConflicts: anything else spending the same outpoints.
+            for input in &tx.vin {
+                if input.prevout.is_null() {
+                    continue;
+                }
+                if let Some(spender) = self.get_spender(&input.prevout) {
+                    if spender != txid {
+                        self.remove_recursive_with_reason(&spender, MemPoolRemovalReason::Conflict);
+                    }
+                }
+            }
+            self.clear_prioritisation(&txid);
         }
     }
 
@@ -703,6 +941,7 @@ impl TxMemPool {
 
     /// Clear all transactions from the mempool.
     pub fn clear(&self) {
+        self.transactions_updated.fetch_add(1, Ordering::Relaxed);
         self.entries.write().clear();
         self.spenders.write().clear();
         self.total_fee.store(0, Ordering::Relaxed);
@@ -747,7 +986,7 @@ impl TxMemPool {
 
             match worst_txid {
                 Some(txid) => {
-                    self.remove_recursive(&txid);
+                    self.remove_recursive_with_reason(&txid, MemPoolRemovalReason::SizeLimit);
                 }
                 None => break,
             }
@@ -990,7 +1229,7 @@ impl TxMemPool {
     /// The caller should have already called `check_rbf()` to validate.
     pub fn replace(&self, entry: MempoolEntry, evict_txids: &[Txid]) -> bool {
         for txid in evict_txids {
-            self.remove_recursive(txid);
+            self.remove_recursive_with_reason(txid, MemPoolRemovalReason::Replaced);
         }
         self.add_unchecked(entry)
     }
@@ -1015,7 +1254,7 @@ impl TxMemPool {
 
         let count = expired.len();
         for txid in &expired {
-            self.remove_recursive(txid);
+            self.remove_recursive_with_reason(txid, MemPoolRemovalReason::Expiry);
         }
         count
     }
