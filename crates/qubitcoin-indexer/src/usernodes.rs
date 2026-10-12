@@ -24,7 +24,13 @@
 //!   zero user nodes, so the feature is off unless the operator enables it.
 //!
 //! User nodes can also be named in `simulateblock` as `@owner/name`.
+//!
+//! Two program kinds exist: `wasm` (a metashrew-ABI indexer run by the fork
+//! runner) and `bpf` (a userspace eBPF program, see [`crate::bpf`]). Both go
+//! through the same scheduling, metering, quotas, pause-on-error, reorg
+//! rollback and simulation paths; only the executor differs.
 
+use crate::bpf::BpfProgram;
 use crate::dag::DagAccess;
 use crate::simulation::{SimExec, SimNodeProvider, SimNodeSpec};
 use crate::{store, DagShared, PersistentBackend};
@@ -84,7 +90,7 @@ impl Default for UserDagConfig {
 pub struct UserNodeSpec {
     pub owner: String,
     pub name: String,
-    /// `"wasm"` (a metashrew-ABI indexer).
+    /// `"wasm"` (a metashrew-ABI indexer) or `"bpf"` (SBPF v3 bytecode).
     pub kind: String,
     pub sha256: String,
     pub upstreams: Vec<String>,
@@ -113,12 +119,40 @@ struct Status {
     state: NodeState,
     blocks: u64,
     last_fuel: u64,
+    /// `log` lines of the last processed block (BPF nodes).
+    last_logs: Vec<String>,
+}
+
+/// The executor of a user node.
+#[derive(Clone)]
+pub enum NodeProgram {
+    Wasm(Arc<ForkRuntime>),
+    Bpf(Arc<BpfProgram>),
+}
+
+impl NodeProgram {
+    fn load(kind: &str, program: &[u8]) -> Result<Self, String> {
+        match kind {
+            "wasm" => Ok(NodeProgram::Wasm(Arc::new(ForkRuntime::new(program).map_err(|e| format!("compile: {}", e))?))),
+            "bpf" => Ok(NodeProgram::Bpf(Arc::new(BpfProgram::new(program)?))),
+            k => Err(format!("unknown kind '{}' (expected 'wasm' or 'bpf')", k)),
+        }
+    }
+}
+
+/// File extension of a stored program of `kind`.
+fn program_ext(kind: &str) -> &'static str {
+    if kind == "bpf" {
+        "bpf"
+    } else {
+        "wasm"
+    }
 }
 
 /// A live user node.
 pub struct UserNode {
     pub spec: UserNodeSpec,
-    fork: Arc<ForkRuntime>,
+    program: NodeProgram,
     pub db: Arc<rocksdb::DB>,
     db_dir: PathBuf,
     /// Next height to process.
@@ -273,7 +307,7 @@ impl UserDag {
         let specs: Vec<UserNodeSpec> =
             serde_json::from_value(v.get("nodes").cloned().unwrap_or(json!([]))).map_err(|e| e.to_string())?;
         for spec in specs {
-            let prog = std::fs::read(self.dir.join("programs").join(format!("{}.wasm", spec.sha256)))
+            let prog = std::fs::read(self.dir.join("programs").join(format!("{}.{}", spec.sha256, program_ext(&spec.kind))))
                 .map_err(|e| format!("program for {}: {}", spec.id(), e))?;
             match self.instantiate(spec.clone(), &prog) {
                 Ok(n) => {
@@ -297,7 +331,7 @@ impl UserDag {
     }
 
     fn instantiate(&self, spec: UserNodeSpec, program: &[u8]) -> Result<Arc<UserNode>, String> {
-        let fork = ForkRuntime::new(program).map_err(|e| format!("compile: {}", e))?;
+        let program = NodeProgram::load(&spec.kind, program)?;
         let owner_dir = hex::encode(&Sha256::digest(spec.owner.as_bytes())[..8]);
         let db_dir = self.dir.join("users").join(owner_dir).join(&spec.name).join("db");
         std::fs::create_dir_all(&db_dir).map_err(|e| e.to_string())?;
@@ -311,11 +345,11 @@ impl UserDag {
         };
         Ok(Arc::new(UserNode {
             spec,
-            fork: Arc::new(fork),
+            program,
             db,
             db_dir,
             next: AtomicU32::new(next),
-            status: parking_lot::Mutex::new(Status { state: NodeState::Running, blocks: 0, last_fuel: 0 }),
+            status: parking_lot::Mutex::new(Status { state: NodeState::Running, blocks: 0, last_fuel: 0, last_logs: Vec::new() }),
             work: parking_lot::Mutex::new(()),
             removed: AtomicBool::new(false),
         }))
@@ -327,9 +361,8 @@ impl UserDag {
             return Err("owner and name must be 1-64 chars of [A-Za-z0-9-_.]".into());
         }
         match spec.kind.as_str() {
-            "wasm" => {}
-            "bpf" => return Err("kind 'bpf' is not implemented yet".into()),
-            k => return Err(format!("unknown kind '{}' (expected 'wasm')", k)),
+            "wasm" | "bpf" => {}
+            k => return Err(format!("unknown kind '{}' (expected 'wasm' or 'bpf')", k)),
         }
         let have = hex::encode(Sha256::digest(program));
         if have != spec.sha256.trim_start_matches("0x").to_lowercase() {
@@ -357,7 +390,10 @@ impl UserDag {
         }
         let mut spec = spec;
         spec.sha256 = have.clone();
-        std::fs::write(self.dir.join("programs").join(format!("{}.wasm", have)), program).map_err(|e| e.to_string())?;
+        // Compile / verify before anything is stored.
+        NodeProgram::load(&spec.kind, program)?;
+        std::fs::write(self.dir.join("programs").join(format!("{}.{}", have, program_ext(&spec.kind))), program)
+            .map_err(|e| e.to_string())?;
         let node = self.instantiate(spec, program)?;
         self.nodes.write().insert(id.clone(), node.clone());
         self.save_registry()?;
@@ -420,6 +456,7 @@ impl UserDag {
             "error": error,
             "blocks_processed": s.blocks,
             "last_block_fuel": s.last_fuel,
+            "logs": s.last_logs,
             "storage_bytes": store::approx_size(&n.db),
         })
     }
@@ -552,21 +589,26 @@ impl UserDag {
             backend: Arc::new(PersistentBackend { shared: self.shared.clone(), height: h }),
         };
         let limits = n.limits(&self.quota(owner), &self.config);
-        let fork = n.fork.clone();
         let db = n.db.clone();
         let label = n.spec.id();
         let vf = view_fn.to_string();
-        let r = crate::simulation::run_blocking(async move {
-            fork.call_export_ctx(
-                &vf,
-                full,
-                store::fork_storage(store::LayeredReader::at_height(db, h), h),
-                &label,
-                access.host(),
-                limits,
-            )
-            .await
-        });
+        let r = match &n.program {
+            NodeProgram::Wasm(fork) => {
+                let fork = fork.clone();
+                crate::simulation::run_blocking(async move {
+                    fork.call_export_ctx(
+                        &vf,
+                        full,
+                        store::fork_storage(store::LayeredReader::at_height(db, h), h),
+                        &label,
+                        access.host(),
+                        limits,
+                    )
+                    .await
+                })
+            }
+            NodeProgram::Bpf(p) => p.view(&vf, &input, h, store::LayeredReader::at_height(db, h), access, limits),
+        };
         let tip = self.chain_tip.load(Ordering::Acquire);
         let fuel = match &r {
             Ok(o) => o.fuel_used,
@@ -597,20 +639,30 @@ impl UserDag {
             let Some(raw) = (self.blocks)(h) else { return false };
             let quota = self.quota(&n.spec.owner);
             let limits = n.limits(&quota, &self.config);
-            let mut full = Vec::with_capacity(4 + raw.len());
-            full.extend_from_slice(&h.to_le_bytes());
-            full.extend_from_slice(&raw);
             let access = DagAccess {
                 node: n.spec.id(),
                 allowed: n.spec.upstreams.clone(),
                 backend: Arc::new(PersistentBackend { shared: self.shared.clone(), height: h }),
             };
             let reader = store::LayeredReader::at_height(n.db.clone(), h.saturating_sub(1));
-            let fork = n.fork.clone();
             let label = n.spec.id();
-            let r = crate::simulation::run_blocking(async move {
-                fork.run_block_ctx(full, store::fork_storage(reader, h), &label, access.host(), limits).await
-            });
+            let mut logs = Vec::new();
+            let r = match &n.program {
+                NodeProgram::Wasm(fork) => {
+                    let fork = fork.clone();
+                    let mut full = Vec::with_capacity(4 + raw.len());
+                    full.extend_from_slice(&h.to_le_bytes());
+                    full.extend_from_slice(&raw);
+                    crate::simulation::run_blocking(async move {
+                        fork.run_block_ctx(full, store::fork_storage(reader, h), &label, access.host(), limits).await
+                    })
+                }
+                NodeProgram::Bpf(p) => p.run_block(h, &raw, reader, access, limits).map(|o| {
+                    logs = o.value.logs;
+                    qubitcoin_indexer_fork::ExecOutcome { value: o.value.pairs, fuel_used: o.fuel_used }
+                }),
+            };
+            n.status.lock().last_logs = logs;
             let mut u = Usage { blocks: 1, ..Default::default() };
             let outcome: Result<(), String> = match r {
                 Ok(o) => {
@@ -704,16 +756,20 @@ impl SimNodeProvider for UserDag {
         let rest = name.strip_prefix('@')?;
         let (owner, n) = rest.split_once('/')?;
         let node = self.node(owner, n)?;
-        Some(Ok(SimNodeSpec {
-            name: name.to_string(),
-            upstreams: node.spec.upstreams.clone(),
-            input: None,
-            exec: SimExec::Wasm {
-                fork: node.fork.clone(),
+        let exec = match &node.program {
+            NodeProgram::Wasm(fork) => SimExec::Wasm {
+                fork: fork.clone(),
                 base: Some(node.db.clone()),
                 base_tip: node.height(),
                 start_height: node.spec.start_height,
             },
-        }))
+            NodeProgram::Bpf(p) => SimExec::Bpf {
+                program: p.clone(),
+                base: Some(node.db.clone()),
+                base_tip: node.height(),
+                start_height: node.spec.start_height,
+            },
+        };
+        Some(Ok(SimNodeSpec { name: name.to_string(), upstreams: node.spec.upstreams.clone(), input: None, exec }))
     }
 }

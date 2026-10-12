@@ -33,6 +33,8 @@ metashrew-runtime = { git = "https://github.com/kungfuflex/metashrew", branch = 
 rockshrew-runtime = { git = "https://github.com/kungfuflex/metashrew", branch = "master" }
 metashrew-sync = { git = "https://github.com/kungfuflex/metashrew", branch = "master" }
 async-trait = "0.1"
+# Userspace eBPF (interpreter only; no JIT) for `bpf` user DAG nodes.
+solana-sbpf = { version = "0.25", default-features = false }
 
 [dev-dependencies]
 tempfile = { workspace = true }

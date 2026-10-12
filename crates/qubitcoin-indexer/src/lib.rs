@@ -10,6 +10,7 @@
 //! and users can register their own nodes ([`usernodes`]).
 
 pub mod adapters;
+pub mod bpf;
 pub mod config;
 pub mod dag;
 pub mod dag_rpc;

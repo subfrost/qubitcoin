@@ -817,9 +817,10 @@ fn user_nodes_index_isolate_meter_and_roll_back() {
     dag.set_quota("alice", Quota { max_nodes: 3, fuel_per_block: 50_000_000, storage_bytes: 1 << 30 }).unwrap();
     assert!(dag.register(spec("alice", "u1", &ter, &["sec"], 1), b"x").unwrap_err().contains("sha256"));
     assert!(dag.register(spec("alice", "u1", &ter, &["nope"], 1), &ter).unwrap_err().contains("unknown upstream"));
+    // A wasm module is not BPF bytecode: the verifier refuses it.
     let mut b = spec("alice", "b1", &ter, &[], 1);
     b.kind = "bpf".into();
-    assert!(dag.register(b, &ter).unwrap_err().contains("not implemented"));
+    assert!(dag.register(b, &ter).unwrap_err().contains("verifier"));
 
     // A tertiary-shaped user node, backfilled from height 1.
     let before_std = dump_all(&mgr);
@@ -952,4 +953,404 @@ fn user_dag_rpc_shapes() {
     assert_eq!(rpcs["getdagusage"](&json!(["o", 0, 10]))["nodes"]["n"]["blocks"], 1);
     assert_eq!(rpcs["unregisterdagnode"](&json!(["o", "n"])), json!({"unregistered": true}));
     assert!(rpcs["resumedagnode"](&json!(["o", "n"])).get("error").is_some());
+}
+
+// ---------------------------------------------------------------------------
+// BPF user nodes
+// ---------------------------------------------------------------------------
+//
+// Programs are assembled in-test (solana-sbpf assembler, SBPF v3). The heap
+// region starts at 0x3_0000_0000.
+//
+// * `COUNT_ASM` — block: `/txs` += tx count of the input block (u64), emits
+//   the block's tx count, logs "/txs". View `txs`: emits `/txs`; any other
+//   view exits with r0 = 2.
+// * `DBL_ASM` — block: `/dbl` = `secondary_get(up0, "/txs")` +
+//   `upstream_view(up0, "txs")` (= 2 × the upstream's `/txs`). Any view
+//   emits `/dbl`.
+// * `SPIN_ASM` — loops forever (instruction cap).
+// * `RESERVED_ASM` — writes a host-reserved key (0xff prefix).
+
+const COUNT_ASM: &str = "
+    lddw r6, 0x300000000
+    jne r1, 0, view
+    mov64 r1, r6
+    mov64 r2, 128
+    mov64 r3, 0
+    syscall get_input
+    ldxb r7, [r6+84]
+    stw [r6+256], 0x7378742f
+    mov64 r1, r6
+    add64 r1, 256
+    mov64 r2, 4
+    mov64 r3, r6
+    add64 r3, 264
+    mov64 r4, 8
+    syscall kv_get
+    ldxdw r8, [r6+264]
+    jeq r0, 8, have
+    mov64 r8, 0
+have:
+    add64 r8, r7
+    stxdw [r6+264], r8
+    mov64 r1, r6
+    add64 r1, 256
+    mov64 r2, 4
+    mov64 r3, r6
+    add64 r3, 264
+    mov64 r4, 8
+    syscall kv_set
+    stxdw [r6+272], r7
+    mov64 r1, r6
+    add64 r1, 272
+    mov64 r2, 8
+    syscall emit
+    mov64 r1, r6
+    add64 r1, 256
+    mov64 r2, 4
+    syscall log
+    mov64 r0, 0
+    exit
+view:
+    mov64 r1, r6
+    mov64 r2, 64
+    mov64 r3, 0
+    syscall get_input
+    ldxw r7, [r6+4]
+    jne r7, 3, bad
+    ldxw r7, [r6+8]
+    jne r7, 0x737874, bad
+    stw [r6+256], 0x7378742f
+    mov64 r1, r6
+    add64 r1, 256
+    mov64 r2, 4
+    mov64 r3, r6
+    add64 r3, 264
+    mov64 r4, 8
+    syscall kv_get
+    mov64 r1, r6
+    add64 r1, 264
+    mov64 r2, 8
+    syscall emit
+    mov64 r0, 0
+    exit
+bad:
+    mov64 r0, 2
+    exit
+";
+
+const DBL_ASM: &str = "
+    lddw r6, 0x300000000
+    stw [r6+280], 0x6c62642f
+    jne r1, 0, view
+    stw [r6+256], 0x7378742f
+    mov64 r1, 0
+    mov64 r2, r6
+    add64 r2, 256
+    mov64 r3, 4
+    mov64 r4, r6
+    add64 r4, 264
+    mov64 r5, 8
+    syscall secondary_get
+    ldxw r7, [r6+264]
+    jeq r0, 4, got
+    mov64 r7, 0
+got:
+    stw [r6+288], 0x737874
+    stxdw [r6+320], r6
+    stdw [r6+328], 0
+    mov64 r8, r6
+    add64 r8, 352
+    stxdw [r6+336], r8
+    stdw [r6+344], 8
+    mov64 r1, 0
+    mov64 r2, r6
+    add64 r2, 288
+    mov64 r3, 3
+    mov64 r4, r6
+    add64 r4, 320
+    syscall upstream_view
+    ldxw r8, [r6+352]
+    add64 r7, r8
+    stxdw [r6+272], r7
+    mov64 r1, r6
+    add64 r1, 280
+    mov64 r2, 4
+    mov64 r3, r6
+    add64 r3, 272
+    mov64 r4, 8
+    syscall kv_set
+    mov64 r0, 0
+    exit
+view:
+    mov64 r1, r6
+    add64 r1, 280
+    mov64 r2, 4
+    mov64 r3, r6
+    add64 r3, 272
+    mov64 r4, 8
+    syscall kv_get
+    mov64 r1, r6
+    add64 r1, 272
+    mov64 r2, 8
+    syscall emit
+    mov64 r0, 0
+    exit
+";
+
+const SPIN_ASM: &str = "
+spin:
+    add64 r0, 1
+    ja spin
+";
+
+const RESERVED_ASM: &str = "
+    lddw r6, 0x300000000
+    stb [r6+0], 0xff
+    mov64 r1, r6
+    mov64 r2, 1
+    mov64 r3, r6
+    mov64 r4, 1
+    syscall kv_set
+    mov64 r0, 0
+    exit
+";
+
+use qubitcoin_indexer::bpf;
+
+fn bpf_spec(owner: &str, name: &str, prog: &[u8], ups: &[&str], start: u32) -> UserNodeSpec {
+    let mut s = spec(owner, name, prog, ups, start);
+    s.kind = "bpf".into();
+    s
+}
+
+fn le64(v: &[u8]) -> u64 {
+    assert_eq!(v.len(), 8, "expected a u64, got {:?}", v);
+    u64::from_le_bytes(v.try_into().unwrap())
+}
+
+fn quota(max_nodes: u32, fuel: u64) -> Quota {
+    Quota { max_nodes, fuel_per_block: fuel, storage_bytes: 1 << 30 }
+}
+
+/// sec/ter manager with blocks of [2, 0, 4] txs (tx counts 3, 1, 5) and a
+/// user DAG at tip 3.
+fn bpf_fixture(dir: &Path) -> (IndexerManager, Chain, Arc<parking_lot::Mutex<Vec<Vec<u8>>>>, Arc<UserDag>) {
+    let mgr = sec_ter(dir);
+    let mut chain = Chain::new();
+    for n in [2, 0, 4] {
+        chain.connect(&mgr, n);
+    }
+    let blocks = Arc::new(parking_lot::Mutex::new(chain.blocks.clone()));
+    let dag = open_dag(dir, &mgr, blocks.clone(), 3);
+    (mgr, chain, blocks, dag)
+}
+
+#[test]
+fn bpf_nodes_count_read_upstreams_and_isolate() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mgr, _chain, _blocks, dag) = bpf_fixture(dir.path());
+    let count = bpf::assemble(COUNT_ASM).unwrap();
+    let dbl = bpf::assemble(DBL_ASM).unwrap();
+    let reserved = bpf::assemble(RESERVED_ASM).unwrap();
+    dag.set_quota("alice", quota(3, 10_000_000)).unwrap();
+    dag.set_quota("bob", quota(2, 10_000_000)).unwrap();
+    let before_std = dump_all(&mgr);
+
+    dag.register(bpf_spec("alice", "cnt", &count, &[], 1), &count).unwrap();
+    dag.register(bpf_spec("alice", "dbl", &dbl, &["sec"], 1), &dbl).unwrap();
+    // Reads upstream #0 without declaring any: denied, pauses only itself.
+    dag.register(bpf_spec("alice", "nodecl", &dbl, &[], 1), &dbl).unwrap();
+    // The same program and keys under another owner, from height 2.
+    dag.register(bpf_spec("bob", "cnt", &count, &[], 2), &count).unwrap();
+    dag.register(bpf_spec("bob", "evil", &reserved, &[], 1), &reserved).unwrap();
+
+    wait_until("bpf nodes at 3", || {
+        ["alice/cnt", "alice/dbl", "bob/cnt"].iter().all(|id| {
+            let (o, n) = id.split_once('/').unwrap();
+            dag.node(o, n).unwrap().height() == Some(3)
+        })
+    });
+    // Counting txs per block (3 + 1 + 5), as of any height.
+    assert_eq!(le64(&dag.view("alice", "cnt", "txs", vec![], None).unwrap()), 9);
+    assert_eq!(le64(&dag.view("alice", "cnt", "txs", vec![], Some(1)).unwrap()), 3);
+    assert_eq!(le64(&dag.view("alice", "cnt", bpf::EMITTED_VIEW, vec![], None).unwrap()), 5);
+    assert_eq!(le64(&dag.view("alice", "cnt", bpf::EMITTED_VIEW, vec![], Some(2)).unwrap()), 1);
+    let e = dag.view("alice", "cnt", "nope", vec![], None).unwrap_err();
+    assert!(e.contains("r0 = 2"), "{}", e);
+    let st = dag.status("alice", "cnt").unwrap();
+    assert_eq!(st["kind"], "bpf");
+    assert_eq!(st["state"], "running");
+    assert_eq!(st["logs"], serde_json::json!(["/txs"]));
+
+    // Upstream secondary key + upstream view: 2 × sec./txs, at each height.
+    assert_eq!(le64(&dag.view("alice", "dbl", "dbl", vec![], None).unwrap()), 18);
+    assert_eq!(le64(&dag.view("alice", "dbl", "dbl", vec![], Some(2)).unwrap()), 8);
+    assert_eq!(le32(&mgr.call_view("ter", "dbl", vec![]).unwrap()), 18);
+
+    // Isolation: undeclared upstream denied; reserved keys refused; bob's
+    // counter (same keys) is its own; no standard store was touched.
+    wait_until("nodecl and evil to error", || {
+        dag.status("alice", "nodecl").unwrap()["state"] == "errored" && dag.status("bob", "evil").unwrap()["state"] == "errored"
+    });
+    let st = dag.status("alice", "nodecl").unwrap();
+    assert!(st["error"].as_str().unwrap().contains("access denied"), "{}", st);
+    assert_eq!(st["height"], serde_json::Value::Null);
+    assert!(dag.status("bob", "evil").unwrap()["error"].as_str().unwrap().contains("reserved"));
+    assert_eq!(le64(&dag.view("bob", "cnt", "txs", vec![], None).unwrap()), 1 + 5);
+    assert_eq!(le64(&dag.view("alice", "cnt", "txs", vec![], None).unwrap()), 9);
+    assert_ne!(dag.node("alice", "cnt").unwrap().db.path(), dag.node("bob", "cnt").unwrap().db.path());
+    assert_eq!(before_std, dump_all(&mgr), "a BPF node wrote into a standard store");
+
+    // Verifier: a bad program is refused and nothing is stored.
+    let bad = bpf::assemble("ja +7\nexit").unwrap();
+    dag.set_quota("dave", quota(1, 10_000_000)).unwrap();
+    let e = dag.register(bpf_spec("dave", "bad", &bad, &[], 1), &bad).unwrap_err();
+    assert!(e.contains("verifier") && e.contains("jump out of code"), "{}", e);
+    let unknown = bpf::assemble("syscall open_socket\nmov64 r0, 0\nexit").unwrap();
+    let e = dag.register(bpf_spec("dave", "bad", &unknown, &[], 1), &unknown).unwrap_err();
+    assert!(e.contains("verifier") && e.contains("syscall"), "{}", e);
+    assert!(dag.node("dave", "bad").is_none());
+    assert!(!dir.path().join("dag/programs").join(format!("{}.bpf", sha_hex(&bad))).exists());
+
+    // Metering: instructions are fuel; 2 writes per block (/txs + emit).
+    let u = dag.usage("alice", 0, 100);
+    let cnt = &u["nodes"]["cnt"];
+    assert_eq!(cnt["blocks"], 3, "{}", u);
+    assert_eq!(cnt["kv_writes"], 6, "{}", u);
+    assert!(cnt["fuel"].as_u64().unwrap() > 0);
+    assert_eq!(u["nodes"]["nodecl"]["errors"], 1);
+
+    // Registrations (and the stored .bpf program) survive a restart.
+    dag.shutdown();
+    drop(dag);
+    std::thread::sleep(Duration::from_millis(300));
+    let dag = open_dag(dir.path(), &mgr, _blocks.clone(), 3);
+    assert_eq!(dag.list(Some("alice")).as_array().unwrap().len(), 3);
+    assert_eq!(le64(&dag.view("alice", "cnt", "txs", vec![], None).unwrap()), 9);
+}
+
+#[test]
+fn bpf_instruction_cap_pauses_only_that_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mgr, mut chain, blocks, dag) = bpf_fixture(dir.path());
+    let count = bpf::assemble(COUNT_ASM).unwrap();
+    let spin = bpf::assemble(SPIN_ASM).unwrap();
+    dag.set_quota("carol", quota(2, 100_000)).unwrap();
+    dag.register(bpf_spec("carol", "spin", &spin, &[], 2), &spin).unwrap();
+    dag.register(bpf_spec("carol", "cnt", &count, &[], 1), &count).unwrap();
+    wait_until("spin to error and cnt at 3", || {
+        dag.status("carol", "spin").unwrap()["state"] == "errored" && dag.node("carol", "cnt").unwrap().height() == Some(3)
+    });
+    let st = dag.status("carol", "spin").unwrap();
+    assert!(st["error"].as_str().unwrap().contains("out_of_fuel"), "{}", st);
+    assert_eq!(st["height"], serde_json::Value::Null);
+    assert_eq!(dag.usage("carol", 0, 100)["nodes"]["spin"]["fuel"], 100_000);
+
+    // A new block: the counter advances, the spinner stays paused.
+    let b4 = chain.connect(&mgr, 1);
+    blocks.lock().push(b4);
+    dag.notify_block(4);
+    wait_until("cnt at 4", || dag.node("carol", "cnt").unwrap().height() == Some(4));
+    assert_eq!(le64(&dag.view("carol", "cnt", "txs", vec![], None).unwrap()), 9 + 2);
+    assert_eq!(dag.status("carol", "spin").unwrap()["state"], "errored");
+    // A view is capped the same way (the node's fuel cap).
+    let spin_view = dag.view("carol", "spin", "x", vec![], None);
+    assert!(spin_view.is_err());
+
+    // Resume retries, and it runs out again.
+    dag.resume("carol", "spin").unwrap();
+    wait_until("spin to error again", || {
+        let u = dag.usage("carol", 0, 100);
+        u["nodes"]["spin"]["errors"] == 2
+    });
+    assert_eq!(dag.status("carol", "spin").unwrap()["state"], "errored");
+}
+
+#[test]
+fn bpf_reorg_rollback_and_simulation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mgr, mut chain, blocks, dag) = bpf_fixture(dir.path());
+    let count = bpf::assemble(COUNT_ASM).unwrap();
+    let dbl = bpf::assemble(DBL_ASM).unwrap();
+    dag.set_quota("alice", quota(2, 10_000_000)).unwrap();
+    dag.register(bpf_spec("alice", "cnt", &count, &[], 1), &count).unwrap();
+    dag.register(bpf_spec("alice", "dbl", &dbl, &["sec"], 1), &dbl).unwrap();
+    wait_until("both at 3", || {
+        dag.node("alice", "cnt").unwrap().height() == Some(3) && dag.node("alice", "dbl").unwrap().height() == Some(3)
+    });
+
+    // Simulation overlay: a block with 2 txs (3 with the coinbase) on top of
+    // the tip. The BPF nodes read their own and their upstream's simulated
+    // state, and their stores are untouched.
+    let before = (store::dump(&dag.node("alice", "cnt").unwrap().db), store::dump(&dag.node("alice", "dbl").unwrap().db));
+    let e = chain.engine(&mgr, SimConfig::default());
+    e.add_provider(dag.clone());
+    let r = e
+        .simulate(SimRequest {
+            txs: txs(2, 70),
+            indexers: Some(vec!["@alice/cnt".into(), "@alice/dbl".into()]),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(r["per_indexer"]["@alice/cnt"]["ok"], true, "{}", r);
+    assert_eq!(r["per_indexer"]["@alice/dbl"]["ok"], true, "{}", r);
+    assert_eq!(r["per_indexer"]["sec"]["ok"], true, "{}", r);
+    assert!(r["per_indexer"]["@alice/cnt"]["fuel_used"].as_u64().unwrap() > 0);
+    let id = r["overlay_id"].as_str().unwrap();
+    assert_eq!(le64(&e.view(id, "@alice/cnt", "txs", vec![]).unwrap()), 9 + 3);
+    assert_eq!(le64(&e.view(id, "@alice/cnt", bpf::EMITTED_VIEW, vec![]).unwrap()), 3);
+    assert_eq!(le64(&e.view(id, "@alice/dbl", "dbl", vec![]).unwrap()), 2 * (9 + 3));
+    // A stacked layer on the overlay.
+    let r2 = e
+        .simulate(SimRequest { txs: txs(1, 71), parent: Some(id.to_string()), ..Default::default() })
+        .unwrap();
+    let id2 = r2["overlay_id"].as_str().unwrap();
+    assert_eq!(le64(&e.view(id2, "@alice/cnt", "txs", vec![]).unwrap()), 9 + 3 + 2);
+    assert_eq!(le64(&dag.view("alice", "cnt", "txs", vec![], None).unwrap()), 9);
+    let after = (store::dump(&dag.node("alice", "cnt").unwrap().db), store::dump(&dag.node("alice", "dbl").unwrap().db));
+    assert_eq!(before, after, "simulation wrote into a BPF node's store");
+
+    // Reorg to 2, then a different block 3 with 6 txs (7 with the coinbase).
+    mgr.on_reorg(2);
+    dag.on_reorg(2);
+    assert_eq!(dag.node("alice", "cnt").unwrap().height(), Some(2));
+    assert_eq!(le64(&dag.view("alice", "cnt", "txs", vec![], None).unwrap()), 4);
+    assert_eq!(le64(&dag.view("alice", "dbl", "dbl", vec![], None).unwrap()), 8);
+    assert!(dag.view("alice", "cnt", bpf::EMITTED_VIEW, vec![], Some(3)).is_err());
+    {
+        let mut t = chain.tip.lock();
+        t.height = 2;
+        t.hash = qubitcoin_crypto::hash::hash256(&chain.blocks[1][..80]);
+    }
+    let alt3 = chain.connect(&mgr, 6);
+    {
+        let mut bl = blocks.lock();
+        bl.truncate(2);
+        bl.push(alt3);
+    }
+    dag.notify_block(3);
+    wait_until("both back at 3", || {
+        dag.node("alice", "cnt").unwrap().height() == Some(3) && dag.node("alice", "dbl").unwrap().height() == Some(3)
+    });
+    assert_eq!(le64(&dag.view("alice", "cnt", "txs", vec![], None).unwrap()), 4 + 7);
+    assert_eq!(le64(&dag.view("alice", "cnt", bpf::EMITTED_VIEW, vec![], None).unwrap()), 7);
+    assert_eq!(le64(&dag.view("alice", "dbl", "dbl", vec![], None).unwrap()), 2 * (4 + 7));
+}
+
+#[test]
+fn bpf_registerdagnode_rpc() {
+    use qubitcoin_indexer::dag_rpc::register_user_dag_rpcs;
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let (_mgr, _chain, _blocks, dag) = bpf_fixture(dir.path());
+    let mut rpcs = std::collections::HashMap::new();
+    register_user_dag_rpcs(&mut |n: &str, h| { rpcs.insert(n.to_string(), h); }, dag.clone());
+    let count = bpf::assemble(COUNT_ASM).unwrap();
+    rpcs["setdagquota"](&json!(["o", {"max_nodes": 1}]));
+    let r = rpcs["registerdagnode"](&json!(["o", "c", "bpf", format!("0x{}", hex::encode(&count)), sha_hex(&count), [], 1]));
+    assert_eq!(r["kind"], "bpf", "{}", r);
+    wait_until("c at 3", || dag.node("o", "c").unwrap().height() == Some(3));
+    assert_eq!(rpcs["dagview"](&json!(["o", "c", "txs", "0x"])), json!(format!("0x{}", hex::encode(9u64.to_le_bytes()))));
+    assert_eq!(rpcs["dagview"](&json!(["o", "c", "__emitted", "0x", 1])), json!(format!("0x{}", hex::encode(3u64.to_le_bytes()))));
 }
