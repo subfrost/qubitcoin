@@ -33,8 +33,27 @@ pub struct Notifications {
 }
 
 impl Notifications {
-    /// A new tip was connected (Core: `UpdatedBlockTip` + `BlockConnected`).
-    pub fn block_connected(&self, block: &Block, hash: BlockHash, initial_download: bool) {
+    /// Core's `BlockDisconnected` (a block left the active chain).
+    pub fn block_disconnected(&self, block: &Block) {
+        #[cfg(feature = "zmq")]
+        if let Some(z) = &self.zmq {
+            z.block_disconnected(block);
+        }
+        let _ = block;
+    }
+
+    /// Core's `BlockConnected` (a block joined the active chain).
+    pub fn block_connected(&self, block: &Block) {
+        #[cfg(feature = "zmq")]
+        if let Some(z) = &self.zmq {
+            z.block_connected(block);
+        }
+        let _ = block;
+    }
+
+    /// Core's `UpdatedBlockTip` / `NotifyBlockTip`: the active tip moved to
+    /// `tip` (after any reorganisation completed).
+    pub fn updated_block_tip(&self, tip: &Block, hash: BlockHash, initial_download: bool) {
         // Core only runs -blocknotify once out of initial sync
         // (SynchronizationState::POST_INIT).
         if !initial_download {
@@ -44,9 +63,9 @@ impl Notifications {
         }
         #[cfg(feature = "zmq")]
         if let Some(z) = &self.zmq {
-            z.block_connected(block, hash, initial_download);
+            z.updated_block_tip(tip, hash, initial_download);
         }
-        let _ = block;
+        let _ = tip;
     }
 
     /// Mempool listener entry point.

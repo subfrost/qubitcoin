@@ -31,7 +31,7 @@ use qubitcoin_node::miner::BlockAssemblerOptions;
 use qubitcoin_primitives::arith_uint256::uint256_to_arith;
 use qubitcoin_primitives::{Amount, ArithUint256, BlockHash};
 use qubitcoin_rpc::http_server::{RpcServer, RpcServerConfig};
-use qubitcoin_rpc::mining::{register_mining_rpcs, BlockSink, MemoryBlockSink, MiningContext, TipWatch};
+use qubitcoin_rpc::mining::{register_mining_rpcs, BlockSink, MemoryBlockSink, MiningContext, SinkOutcome, TipWatch};
 use qubitcoin_rpc::server::RpcRegistry;
 use qubitcoin_script::Script;
 use qubitcoin_serialize::{deserialize, serialize};
@@ -44,9 +44,9 @@ struct RecordingSink {
 }
 
 impl BlockSink for RecordingSink {
-    fn process_new_block(&self, block: &Block) -> Result<bool, BlockValidationState> {
+    fn process_new_block(&self, block: &Block) -> Result<SinkOutcome, BlockValidationState> {
         let r = self.inner.process_new_block(block)?;
-        if r {
+        if r.in_active_chain && r.new_block {
             self.blocks.lock().push(block.clone());
         }
         Ok(r)

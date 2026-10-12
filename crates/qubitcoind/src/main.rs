@@ -104,24 +104,11 @@ struct LiveNodeInterface {
     chainstate: Arc<parking_lot::Mutex<ChainstateManager>>,
     mempool: Arc<TxMemPool>,
     block_files: Arc<NodeBlockFileManager>,
-    coins_db: Arc<CoinsViewDB<RocksDatabase>>,
-    block_index_db: Arc<BlockIndexDB<RocksDatabase>>,
-    tx_index_db: Arc<TxIndexDB<RocksDatabase>>,
     node_state: Arc<NodeState>,
-    /// Network magic bytes for block serialization.
-    magic_bytes: [u8; 4],
-    /// Counter for periodic UTXO flushes during IBD.
-    blocks_since_flush: parking_lot::Mutex<u64>,
-    /// Maximum UTXO cache size in bytes (from -dbcache).
-    dbcache_limit: u64,
     /// Tracks IBD progress for logging blocks/sec and ETA.
     ibd_tracker: parking_lot::Mutex<IbdTracker>,
-    /// Pending TX index entries accumulated between flushes.
-    pending_tx_index: parking_lot::Mutex<Vec<(Txid, i32, u32, u32)>>,
-    /// Optional in-process WASM secondary indexer manager.
-    indexer_manager: Option<Arc<IndexerManager>>,
-    /// Tip-change fan-out (mempool cleanup, long-poll wake-up, notifiers).
-    events: Arc<chain_events::ChainEvents>,
+    /// Shared block storage + ProcessNewBlock + persistence + events.
+    processor: Arc<chain_events::BlockProcessor>,
 }
 
 /// Tracks IBD (Initial Block Download) progress for logging.
@@ -132,131 +119,31 @@ struct IbdTracker {
 
 impl NodeInterface for LiveNodeInterface {
     fn process_block(&self, data: &[u8]) -> Result<bool, String> {
-        // Deserialize the block.
         let block: Block = deserialize(data).map_err(|e| format!("block deserialize: {}", e))?;
-        let block_hash = block.header.block_hash();
+        // Stored wherever it attaches; ActivateBestChain reorganises onto
+        // it if its chain has the most work (side-branch blocks and undo
+        // data are read back from disk).
+        let outcome = self.processor.process(&block, false).map_err(|e| format!("{:?}", e))?;
 
-        // Write block data to flat files using the typed BlockFileManager.
-        let pos = self
-            .block_files
-            .write_block(&block, self.magic_bytes)
-            .map_err(|e| format!("block file write: {}", e))?;
-
-        // Process through chainstate.
-        let (accepted, block_undo) = {
-            let mut cs = self.chainstate.lock();
-
-            // Update the block index entry with file position before processing.
-            if let Some(arena_idx) = cs.lookup_block_index(&block_hash) {
-                let idx = cs.block_index_mut().get_mut(arena_idx);
-                idx.file = pos.file;
-                idx.data_pos = pos.pos;
-                cs.mark_dirty(arena_idx);
-            }
-
-            cs.process_new_block(&block).map_err(|e| format!("{:?}", e))?
-        };
-
-        // Write undo data to disk and update block index with undo position.
-        if let Some(undo) = block_undo {
-            let undo_pos = self
-                .block_files
-                .write_undo(pos.file, &undo)
-                .map_err(|e| format!("undo file write: {}", e))?;
-            let mut cs = self.chainstate.lock();
-            cs.set_undo_pos(&block_hash, undo_pos.pos);
+        let height = *self.node_state.chain_height.read();
+        if outcome.in_active_chain && height % 1000 == 0 {
+            let mut tracker = self.ibd_tracker.lock();
+            let elapsed = tracker.last_log_time.elapsed();
+            let blocks_delta = height - tracker.last_log_height;
+            let blocks_per_sec = if elapsed.as_secs_f64() > 0.0 {
+                blocks_delta as f64 / elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
+            tracing::info!(
+                height = height,
+                blocks_per_sec = format!("{:.1}", blocks_per_sec),
+                "IBD progress"
+            );
+            tracker.last_log_time = std::time::Instant::now();
+            tracker.last_log_height = height;
         }
-
-        if accepted {
-            // Accumulate TX index entries for batched flush (avoids per-block RocksDB writes).
-            {
-                let mut pending = self.pending_tx_index.lock();
-                for (i, tx) in block.vtx.iter().enumerate() {
-                    pending.push((tx.txid().clone(), pos.file, pos.pos, i as u32));
-                }
-            }
-
-            let mut flush_count = self.blocks_since_flush.lock();
-            *flush_count += 1;
-
-            // Update RPC state.
-            let mut cs = self.chainstate.lock();
-            let height = cs.height();
-            let tip_hash = cs
-                .tip()
-                .map(|t| cs.block_index().get(t).block_hash.to_hex())
-                .unwrap_or_default();
-            *self.node_state.chain_height.write() = height;
-            *self.node_state.best_block_hash.write() = tip_hash;
-
-            // The block is the new tip: drop its transactions (and their
-            // conflicts) from the mempool, wake long polls, notify.
-            let ibd = cs.is_initial_block_download();
-            self.events.block_connected(&block, block_hash, height, ibd);
-
-            // Log progress during IBD with blocks/sec and sync percentage.
-            if height % 1000 == 0 {
-                let cache_mb = cs.coins_tip().dynamic_memory_usage() / (1024 * 1024);
-                let mut tracker = self.ibd_tracker.lock();
-                let elapsed = tracker.last_log_time.elapsed();
-                let blocks_delta = height - tracker.last_log_height;
-                let blocks_per_sec = if elapsed.as_secs_f64() > 0.0 {
-                    blocks_delta as f64 / elapsed.as_secs_f64()
-                } else {
-                    0.0
-                };
-
-                // Estimate sync progress based on known mainnet height (~870,000 as of 2025).
-                let estimated_tip = 870_000i32;
-                let progress_pct = (height as f64 / estimated_tip as f64 * 100.0).min(100.0);
-
-                tracing::info!(
-                    height = height,
-                    blocks_per_sec = format!("{:.1}", blocks_per_sec),
-                    progress = format!("{:.2}%", progress_pct),
-                    cache_mb = cache_mb,
-                    "IBD progress"
-                );
-
-                tracker.last_log_time = std::time::Instant::now();
-                tracker.last_log_height = height;
-            }
-
-            // Notify secondary indexers of the new block.
-            if let Some(ref im) = self.indexer_manager {
-                im.on_block_connected(height as u32, data);
-            }
-
-            // Memory-bounded flush: trigger when block count threshold OR cache
-            // size exceeds the -dbcache limit (default 1024 MiB).
-            let cache_bytes = cs.coins_tip().dynamic_memory_usage();
-            let need_flush = *flush_count >= 2_000 || cache_bytes > self.dbcache_limit;
-
-            if need_flush {
-                let cache_mb = cache_bytes / (1024 * 1024);
-                tracing::info!(height = height, cache_mb = cache_mb, "flushing UTXO cache and block index");
-                cs.flush_coins(self.coins_db.as_ref());
-
-                // Persist block index.
-                let dirty = cs.dirty_block_indices();
-                let refs: Vec<&qubitcoin_common::chain::BlockIndex> = dirty.into_iter().collect();
-                self.block_index_db.write_block_indices(&refs);
-                cs.clear_dirty();
-
-                // Flush accumulated TX index entries.
-                {
-                    let mut pending = self.pending_tx_index.lock();
-                    if !pending.is_empty() {
-                        self.tx_index_db.write_tx_positions(&pending);
-                        pending.clear();
-                    }
-                }
-
-                *flush_count = 0;
-            }
-        }
-
-        Ok(accepted)
+        Ok(outcome.in_active_chain)
     }
 
     fn accept_block_header(&self, header_data: &[u8]) -> Result<bool, String> {
@@ -626,12 +513,18 @@ async fn main() {
     // Wire the disk-backed block reader so chainstate can read blocks/undo
     // from flat files during chain reorganization.
     {
-        let bf = block_files.clone();
-        chainstate.set_block_reader(std::sync::Arc::new(move |file, data_pos, undo_pos| {
-            let block = bf.read_block(&DiskBlockPos { file, pos: data_pos }).ok()?;
-            let undo = bf.read_undo(&DiskBlockPos { file, pos: undo_pos }).ok()?;
-            Some((block, undo))
-        }));
+        let (bf1, bf2, bf3) = (block_files.clone(), block_files.clone(), block_files.clone());
+        chainstate.set_disk_access(
+            std::sync::Arc::new(move |file, data_pos| {
+                bf1.read_block(&DiskBlockPos { file, pos: data_pos }).ok()
+            }),
+            std::sync::Arc::new(move |file, undo_pos| {
+                bf2.read_undo(&DiskBlockPos { file, pos: undo_pos }).ok()
+            }),
+            std::sync::Arc::new(move |file, undo: &qubitcoin_node::undo::BlockUndo| {
+                bf3.write_undo(file, undo).ok().map(|p| p.pos)
+            }),
+        );
     }
 
     // Wrap chainstate in Arc<Mutex> for thread-safe sharing.
@@ -804,6 +697,20 @@ async fn main() {
         notifications: notifications.clone(),
     });
 
+    let block_processor = Arc::new(chain_events::BlockProcessor {
+        chainstate: chainstate.clone(),
+        block_files: block_files.clone(),
+        coins_db: coins_db.clone(),
+        block_index_db: block_index_db.clone(),
+        tx_index_db: tx_index_db.clone(),
+        indexer_manager: indexer_manager.clone(),
+        magic_bytes,
+        events: chain_events.clone(),
+        dbcache_limit: (dbcache_mb as u64) * 1024 * 1024,
+        blocks_since_flush: parking_lot::Mutex::new(0),
+        pending_tx_index: parking_lot::Mutex::new(Vec::new()),
+    });
+
     // 9. Set up RPC server
     let rpc_port: u16 = args.get_int_arg("rpcport").unwrap_or(match network {
         Network::Mainnet => 8332,
@@ -888,14 +795,7 @@ async fn main() {
     // generatetoaddress.
     {
         let sink = Arc::new(chain_events::DaemonBlockSink {
-            chainstate: chainstate.clone(),
-            block_files: block_files.clone(),
-            coins_db: coins_db.clone(),
-            block_index_db: block_index_db.clone(),
-            tx_index_db: tx_index_db.clone(),
-            indexer_manager: indexer_manager.clone(),
-            magic_bytes,
-            events: chain_events.clone(),
+            processor: block_processor.clone(),
         });
         let ns_peers = node_state.clone();
         let ctx = Arc::new(qubitcoin_rpc::mining::MiningContext::new(
@@ -987,20 +887,12 @@ async fn main() {
         chainstate: chainstate.clone(),
         mempool: mempool.clone(),
         block_files: block_files.clone(),
-        coins_db: coins_db.clone(),
-        block_index_db: block_index_db.clone(),
-        tx_index_db: tx_index_db.clone(),
         node_state: node_state.clone(),
-        magic_bytes,
-        blocks_since_flush: parking_lot::Mutex::new(0),
-        dbcache_limit: (dbcache_mb as u64) * 1024 * 1024,
-        pending_tx_index: parking_lot::Mutex::new(Vec::new()),
         ibd_tracker: parking_lot::Mutex::new(IbdTracker {
             last_log_time: std::time::Instant::now(),
             last_log_height: initial_height,
         }),
-        indexer_manager: indexer_manager.clone(),
-        events: chain_events.clone(),
+        processor: block_processor.clone(),
     });
 
     if let Some(event_rx) = event_rx {
@@ -1109,19 +1001,8 @@ async fn main() {
 
     // 13. Graceful shutdown: flush all state to disk
     tracing::info!("flushing state to disk...");
-    {
-        let cs = chainstate.lock();
-
-        // Flush UTXO cache.
-        cs.flush_coins(coins_db.as_ref());
-
-        // Persist all block index entries.
-        let dirty = cs.dirty_block_indices();
-        let refs: Vec<&qubitcoin_common::chain::BlockIndex> = dirty.into_iter().collect();
-        block_index_db.write_block_indices(&refs);
-
-        tracing::info!(height = cs.height(), "state flushed to disk");
-    }
+    block_processor.flush();
+    tracing::info!(height = chainstate.lock().height(), "state flushed to disk");
 
     // Save wallet to disk.
     {

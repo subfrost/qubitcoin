@@ -151,17 +151,31 @@ impl ZmqNotifier {
         }
     }
 
-    /// A block became the tip. Core's `BlockConnected` publishes
-    /// `hashtx`/`rawtx` for every transaction and the `C` sequence entry;
-    /// `UpdatedBlockTip` then publishes `hashblock`/`rawblock`, but not
-    /// during initial block download.
-    pub fn block_connected(&self, block: &Block, hash: BlockHash, initial_download: bool) {
+    /// Core's `BlockConnected`: `hashtx`/`rawtx` for every transaction,
+    /// then the `C` sequence entry.
+    pub fn block_connected(&self, block: &Block) {
         for tx in &block.vtx {
             self.notify_transaction(tx);
         }
         if self.wants("sequence") {
-            self.publish("sequence", sequence_body(hash.as_bytes(), b'C', None));
+            self.publish("sequence", sequence_body(block.header.block_hash().as_bytes(), b'C', None));
         }
+    }
+
+    /// Core's `BlockDisconnected`: `hashtx`/`rawtx` for every transaction,
+    /// then the `D` sequence entry.
+    pub fn block_disconnected(&self, block: &Block) {
+        for tx in &block.vtx {
+            self.notify_transaction(tx);
+        }
+        if self.wants("sequence") {
+            self.publish("sequence", sequence_body(block.header.block_hash().as_bytes(), b'D', None));
+        }
+    }
+
+    /// Core's `UpdatedBlockTip`: `hashblock`/`rawblock` for the new tip,
+    /// except during initial block download.
+    pub fn updated_block_tip(&self, tip: &Block, hash: BlockHash, initial_download: bool) {
         if initial_download {
             return;
         }
@@ -169,7 +183,7 @@ impl ZmqNotifier {
             self.publish("hashblock", display_bytes(hash.as_bytes()));
         }
         if self.wants("rawblock") {
-            if let Ok(raw) = serialize(block) {
+            if let Ok(raw) = serialize(tip) {
                 self.publish("rawblock", raw);
             }
         }
@@ -260,7 +274,8 @@ mod tests {
         let params = qubitcoin_common::chainparams::ChainParams::regtest();
         let genesis = params.create_genesis_block();
         let hash = genesis.header.block_hash();
-        n.block_connected(&genesis, hash, false);
+        n.block_connected(&genesis);
+        n.updated_block_tip(&genesis, hash, false);
 
         let mut got = Vec::new();
         for _ in 0..2 {
@@ -278,7 +293,8 @@ mod tests {
         assert_eq!(hb.get(2).unwrap().as_ref(), &0u32.to_le_bytes());
 
         // During IBD only the connect sequence entry is published.
-        n.block_connected(&genesis, hash, true);
+        n.block_connected(&genesis);
+        n.updated_block_tip(&genesis, hash, true);
         let m = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
             .await
             .unwrap()
@@ -288,5 +304,14 @@ mod tests {
         assert!(tokio::time::timeout(std::time::Duration::from_millis(300), sub.recv())
             .await
             .is_err());
+
+        // A disconnect publishes the D entry.
+        n.block_disconnected(&genesis);
+        let m = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.get(1).unwrap()[32], b'D');
+        assert_eq!(m.get(2).unwrap().as_ref(), &2u32.to_le_bytes());
     }
 }

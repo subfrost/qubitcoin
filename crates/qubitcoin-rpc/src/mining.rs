@@ -61,12 +61,21 @@ pub const TEMPLATE_REFRESH_SECS: u64 = 5;
 // Context
 // ---------------------------------------------------------------------------
 
+/// What happened to a block handed to a [`BlockSink`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SinkOutcome {
+    /// False if the block data was already known (Core's `new_block`).
+    pub new_block: bool,
+    /// The block is on the active chain after processing.
+    pub in_active_chain: bool,
+}
+
 /// Persists and connects blocks on behalf of the mining RPCs.
 pub trait BlockSink: Send + Sync {
-    /// Write `block` to storage and run it through `ProcessNewBlock`.
-    /// Returns `Ok(true)` when it became the new tip. Called without the
-    /// chainstate lock held.
-    fn process_new_block(&self, block: &Block) -> Result<bool, BlockValidationState>;
+    /// Store `block` and run it through `ProcessNewBlock` (which may
+    /// reorganise onto it). `Err` when the block itself is invalid. Called
+    /// without the chainstate lock held.
+    fn process_new_block(&self, block: &Block) -> Result<SinkOutcome, BlockValidationState>;
 }
 
 /// A [`BlockSink`] that connects blocks to an in-memory chainstate only
@@ -81,13 +90,20 @@ pub struct MemoryBlockSink {
 }
 
 impl BlockSink for MemoryBlockSink {
-    fn process_new_block(&self, block: &Block) -> Result<bool, BlockValidationState> {
-        let (on_tip, _) = self.chainstate.lock().process_new_block(block)?;
-        if on_tip {
-            self.mempool.remove_for_block_txs(&block.vtx);
-            self.tip_watch.notify(block.header.block_hash());
+    fn process_new_block(&self, block: &Block) -> Result<SinkOutcome, BlockValidationState> {
+        let mut cs = self.chainstate.lock();
+        let out = cs.process_block(block, None)?;
+        qubitcoin_node::mempool_accept::update_mempool_for_chain_update(&cs, &self.mempool, &out.update);
+        if out.update.tip_changed() {
+            self.mempool.add_transactions_updated(1);
+            let tip = cs.tip().expect("tip");
+            self.tip_watch.notify(cs.block_index().get(tip).block_hash);
         }
-        Ok(on_tip)
+        let e = cs.block_index().get(out.arena_idx);
+        Ok(SinkOutcome {
+            new_block: out.new_block,
+            in_active_chain: cs.active_chain().get_block_index(e.height) == Some(out.arena_idx),
+        })
     }
 }
 
@@ -627,7 +643,7 @@ fn getblocktemplate(ctx: &MiningContext, req: &RpcRequest) -> RpcResponse {
 /// (Core's `state.IsError()`), reported as `RPC_VERIFY_ERROR`.
 pub fn submit_block(ctx: &MiningContext, mut block: Block) -> Result<Value, String> {
     {
-        let mut cs = ctx.chainstate.lock();
+        let cs = ctx.chainstate.lock();
         let consensus = cs.consensus().clone();
         let prev_idx = cs.lookup_block_index(&block.header.prev_blockhash);
         if let Some(pi) = prev_idx {
@@ -657,35 +673,18 @@ pub fn submit_block(ctx: &MiningContext, mut block: Block) -> Result<Value, Stri
         if cs.block_index().get(pi).status.has_failed() {
             return Ok(json!("bad-prevblk"));
         }
-
-        // A block that does not extend the tip is a side branch: Core stores
-        // it (AcceptBlock) without connecting it and, since BlockChecked
-        // never fires for it, reports "inconclusive". The header and the
-        // contextual checks are applied; the block data is not persisted.
-        if cs.tip() != Some(pi) {
-            if let Err(state) = cs.accept_block_header(&block.header) {
-                return Ok(bip22_result(&state));
-            }
-            let prev = cs.block_index().get(pi);
-            let mtp = cs.median_time_past(pi);
-            let mut state = BlockValidationState::new();
-            if !qubitcoin_node::validation::contextual_check_block(
-                &block,
-                prev.height,
-                mtp,
-                &consensus,
-                &mut state,
-            ) {
-                return Ok(bip22_result(&state));
-            }
-            tracing::info!(hash = %hash.to_hex(), "submitblock: valid side-branch block not connected");
-            return Ok(json!("inconclusive"));
-        }
     }
 
+    // ProcessNewBlock: stored wherever it attaches; reorganises onto it if
+    // its chain now has the most work.
     Ok(match ctx.sink.process_new_block(&block) {
-        Ok(true) => Value::Null,
-        Ok(false) => json!("inconclusive"),
+        // Core: `!new_block && accepted` -> "duplicate".
+        Ok(o) if !o.new_block => json!("duplicate"),
+        // Connected (BlockChecked fired with a valid state).
+        Ok(o) if o.in_active_chain => Value::Null,
+        // Valid but on a side branch with less work: BlockChecked never
+        // fired for it.
+        Ok(_) => json!("inconclusive"),
         Err(state) if state.is_error() => return Err(state.get_reject_reason().to_string()),
         Err(state) => bip22_result(&state),
     })
@@ -962,8 +961,8 @@ pub fn generate_blocks(ctx: &MiningContext, script: &Script, nblocks: u64) -> Re
         }
         let hash = block.header.block_hash();
         match ctx.sink.process_new_block(&block) {
-            Ok(true) => {}
-            Ok(false) => return Err("ProcessNewBlock, block not accepted".into()),
+            Ok(o) if o.in_active_chain => {}
+            Ok(_) => return Err("ProcessNewBlock, block not accepted".into()),
             Err(state) => {
                 return Err(format!("ProcessNewBlock, block not accepted: {}", state.get_reject_reason()))
             }
