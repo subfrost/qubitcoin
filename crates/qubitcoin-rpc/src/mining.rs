@@ -269,10 +269,38 @@ fn gbt_rule_value(name: &str, optional: bool) -> String {
     }
 }
 
-/// Decode a segwit address to its scriptPubKey; any other string pays to
-/// `OP_TRUE` (the regtest behaviour `generatetoaddress` always had here).
-fn coinbase_script_for(address: &str) -> Script {
-    if let Ok((_, version, program)) = bech32::segwit::decode(address) {
+/// Base58 decoding (Core's `DecodeBase58`).
+fn base58_decode(s: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let mut out: Vec<u8> = Vec::new();
+    for c in s.bytes() {
+        let mut carry = ALPHABET.iter().position(|&a| a == c)? as u32;
+        for b in out.iter_mut().rev() {
+            carry += (*b as u32) * 58;
+            *b = (carry & 0xff) as u8;
+            carry >>= 8;
+        }
+        while carry > 0 {
+            out.insert(0, (carry & 0xff) as u8);
+            carry >>= 8;
+        }
+    }
+    let zeros = s.bytes().take_while(|&c| c == b'1').count();
+    let mut v = vec![0u8; zeros];
+    v.extend(out);
+    Some(v)
+}
+
+/// Decode an address for this network to its scriptPubKey.
+///
+/// Port of Core's `DecodeDestination` + `GetScriptForDestination`
+/// (key_io.cpp): bech32/bech32m segwit addresses with the network's HRP,
+/// and base58check P2PKH / P2SH with the network's version bytes.
+pub fn decode_destination(address: &str, params: &qubitcoin_common::chainparams::ChainParams) -> Option<Script> {
+    if let Ok((hrp, version, program)) = bech32::segwit::decode(address) {
+        if !hrp.as_str().eq_ignore_ascii_case(&params.bech32_hrp) {
+            return None;
+        }
         let ver_op: u8 = match version.to_u8() {
             0 => 0x00,
             n => 0x50 + n,
@@ -281,9 +309,29 @@ fn coinbase_script_for(address: &str) -> Script {
         raw.push(ver_op);
         raw.push(program.len() as u8);
         raw.extend_from_slice(&program);
-        Script::from_bytes(raw)
+        return Some(Script::from_bytes(raw));
+    }
+    let data = base58_decode(address)?;
+    if data.len() != 25 {
+        return None;
+    }
+    let (payload, check) = data.split_at(21);
+    if qubitcoin_crypto::hash::hash256(payload)[..4] != *check {
+        return None;
+    }
+    let hash = &payload[1..];
+    if payload[0] == params.base58_prefix_pubkey_hash[0] {
+        let mut spk = vec![0x76, 0xa9, 0x14];
+        spk.extend_from_slice(hash);
+        spk.extend_from_slice(&[0x88, 0xac]);
+        Some(Script::from_bytes(spk))
+    } else if payload[0] == params.base58_prefix_script_hash[0] {
+        let mut spk = vec![0xa9, 0x14];
+        spk.extend_from_slice(hash);
+        spk.push(0x87);
+        Some(Script::from_bytes(spk))
     } else {
-        Script::from_bytes(vec![0x51])
+        None
     }
 }
 
@@ -906,6 +954,28 @@ fn getmininginfo(ctx: &MiningContext, req: &RpcRequest) -> RpcResponse {
     o.insert("networkhashps".into(), json!(network_hash_ps(&cs, 120, -1)));
     o.insert("pooledtx".into(), json!(ctx.mempool.size()));
     o.insert("chain".into(), json!(ctx.chain_name));
+    if cs.consensus().signet_blocks {
+        o.insert("signet_challenge".into(), json!(hex_encode(&cs.consensus().signet_challenge)));
+    }
+    // Core v29 `next`: the block that would be mined next
+    // (NextEmptyBlockIndex: time = max(MTP + 1, now), its nBits).
+    if let Some(tip) = cs.tip() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let time = get_minimum_time(&cs, tip).max(now) as u32;
+        let next_bits = cs.next_work_required(tip, time);
+        o.insert(
+            "next".into(),
+            json!({
+                "height": cs.height() + 1,
+                "bits": format!("{:08x}", next_bits),
+                "difficulty": get_difficulty(next_bits),
+                "target": target_hex(next_bits),
+            }),
+        );
+    }
     o.insert("warnings".into(), json!([]));
     RpcResponse::success(req.id.clone(), Value::Object(o))
 }
@@ -989,7 +1059,15 @@ fn generatetoaddress(ctx: &MiningContext, req: &RpcRequest) -> RpcResponse {
         Some(a) => a,
         None => return RpcResponse::error(id, crate::server::RPC_INVALID_PARAMS, "missing address".into()),
     };
-    match generate_blocks(ctx, &coinbase_script_for(address), nblocks) {
+    let script = {
+        let cs = ctx.chainstate.lock();
+        decode_destination(address, cs.params())
+    };
+    let script = match script {
+        Some(s) => s,
+        None => return RpcResponse::error(id, RPC_INVALID_ADDRESS_OR_KEY, "Error: Invalid address".into()),
+    };
+    match generate_blocks(ctx, &script, nblocks) {
         Ok(h) => RpcResponse::success(id, json!(h)),
         Err(e) => RpcResponse::error(id, RPC_MISC_ERROR, e),
     }
@@ -1038,6 +1116,31 @@ mod tests {
     use super::*;
     use qubitcoin_common::chainparams::ChainParams;
     use qubitcoin_common::coins::EmptyCoinsView;
+
+    /// BIP173 regtest P2WPKH test vector.
+    const REGTEST_ADDR: &str = "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080";
+
+    #[test]
+    fn test_decode_destination_and_invalid_address() {
+        let p = ChainParams::regtest();
+        let wpkh = decode_destination(REGTEST_ADDR, &p).unwrap();
+        assert_eq!(wpkh.as_bytes()[..2], [0x00, 0x14]);
+        // Wrong network HRP.
+        assert!(decode_destination("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", &p).is_none());
+        assert!(decode_destination("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", &ChainParams::mainnet()).is_some());
+        // Base58 P2PKH (mainnet genesis payout address) and P2SH.
+        let m = ChainParams::mainnet();
+        let p2pkh = decode_destination("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", &m).unwrap();
+        assert_eq!(p2pkh.as_bytes()[..3], [0x76, 0xa9, 0x14]);
+        let p2sh = decode_destination("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy", &m).unwrap();
+        assert_eq!(p2sh.as_bytes()[0], 0xa9);
+        assert!(decode_destination("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNb", &m).is_none(), "bad checksum");
+
+        let ctx = regtest_ctx();
+        let r = registry(&ctx);
+        let e = call(&r, "generatetoaddress", json!([1, "notanaddress"])).error.unwrap();
+        assert_eq!((e.code, e.message.as_str()), (RPC_INVALID_ADDRESS_OR_KEY, "Error: Invalid address"));
+    }
 
     fn regtest_ctx() -> Arc<MiningContext> {
         let params = ChainParams::regtest();
@@ -1200,7 +1303,7 @@ mod tests {
     fn test_submitblock_duplicate_and_high_hash() {
         let ctx = regtest_ctx();
         let r = registry(&ctx);
-        ok(call(&r, "generatetoaddress", json!([1, "x"])));
+        ok(call(&r, "generatetoaddress", json!([1, REGTEST_ADDR])));
         assert_eq!(ctx.chainstate.lock().height(), 1);
 
         // Assemble a fresh block, break its PoW, submit -> "high-hash".
@@ -1363,12 +1466,15 @@ mod tests {
     fn test_mininginfo_and_difficulty_are_live() {
         let ctx = regtest_ctx();
         let r = registry(&ctx);
-        ok(call(&r, "generatetoaddress", json!([3, "x"])));
+        ok(call(&r, "generatetoaddress", json!([3, REGTEST_ADDR])));
         let m = ok(call(&r, "getmininginfo", json!([])));
         assert_eq!(m["blocks"], json!(3));
         assert_eq!(m["chain"], json!("regtest"));
         assert_eq!(m["bits"], json!("207fffff"));
         assert_eq!(m["pooledtx"], json!(0));
+        assert_eq!(m["next"]["height"], json!(4));
+        assert_eq!(m["next"]["bits"], json!("207fffff"));
+        assert!(m["next"]["target"].as_str().unwrap().starts_with("7fffff"));
         let d = ok(call(&r, "getdifficulty", json!([]))).as_f64().unwrap();
         assert!(d > 0.0 && d < 1e-9);
         assert!(ok(call(&r, "getnetworkhashps", json!([]))).as_f64().unwrap() >= 0.0);
@@ -1386,7 +1492,7 @@ mod tests {
         });
         std::thread::sleep(Duration::from_millis(200));
         assert!(!waiter.is_finished(), "long poll must block while nothing changes");
-        let mined = ok(call(&r, "generatetoaddress", json!([1, "x"])));
+        let mined = ok(call(&r, "generatetoaddress", json!([1, REGTEST_ADDR])));
         let t2 = waiter.join().unwrap();
         assert_eq!(t2["previousblockhash"], mined[0]);
         assert_eq!(t2["height"], json!(2));
