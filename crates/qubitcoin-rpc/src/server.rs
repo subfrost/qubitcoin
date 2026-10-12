@@ -144,6 +144,41 @@ impl RpcResponse {
         }
     }
 
+    /// Serialize for the wire in the request's JSON-RPC dialect.
+    ///
+    /// Port of Bitcoin Core's `JSONRPCReplyObj` (src/rpc/request.cpp):
+    /// a JSON-RPC 1.0 reply always carries both `result` and `error` (one of
+    /// them `null`); a 2.0 reply carries `"jsonrpc": "2.0"` and exactly one
+    /// of them. Either way a successful `null` result (e.g. `submitblock`
+    /// accepting a block) is sent as `"result": null`, never omitted.
+    pub fn to_json_string(&self, version: JsonRpcVersion) -> String {
+        let mut o = serde_json::Map::new();
+        let error = self
+            .error
+            .as_ref()
+            .map(|e| serde_json::to_value(e).unwrap_or(serde_json::Value::Null));
+        let result = self.result.clone().unwrap_or(serde_json::Value::Null);
+        match version {
+            JsonRpcVersion::V1Legacy => {
+                o.insert("result".into(), if error.is_some() { serde_json::Value::Null } else { result });
+                o.insert("error".into(), error.unwrap_or(serde_json::Value::Null));
+            }
+            JsonRpcVersion::V2 => {
+                o.insert("jsonrpc".into(), serde_json::json!("2.0"));
+                match error {
+                    Some(e) => {
+                        o.insert("error".into(), e);
+                    }
+                    None => {
+                        o.insert("result".into(), result);
+                    }
+                }
+            }
+        }
+        o.insert("id".into(), self.id.clone());
+        serde_json::Value::Object(o).to_string()
+    }
+
     /// Create an error response with additional data.
     pub fn error_with_data(
         id: serde_json::Value,

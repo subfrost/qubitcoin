@@ -205,27 +205,32 @@ impl RpcServer {
                         }
 
                         // Optional per-user method whitelist.
-                        if auth_configured {
-                            if let Some(user) = extract_auth_user(&headers) {
-                                if !registry.user_allowed(&user, &request.method) {
-                                    let resp = RpcResponse::error(
-                                        request.id.clone(),
-                                        403,
-                                        format!("Method not allowed for user: {}", request.method),
-                                    );
-                                    serde_json::to_string(&resp).unwrap_or_default()
-                                } else {
-                                    let resp = registry.dispatch(&request);
-                                    serde_json::to_string(&resp).unwrap_or_default()
-                                }
-                            } else {
-                                let resp = registry.dispatch(&request);
-                                serde_json::to_string(&resp).unwrap_or_default()
-                            }
+                        let denied = auth_configured
+                            && extract_auth_user(&headers)
+                                .map(|user| !registry.user_allowed(&user, &request.method))
+                                .unwrap_or(false);
+                        let version = RpcResponse::detect_version(&request);
+                        let resp = if denied {
+                            RpcResponse::error(
+                                request.id.clone(),
+                                403,
+                                format!("Method not allowed for user: {}", request.method),
+                            )
                         } else {
-                            let resp = registry.dispatch(&request);
-                            serde_json::to_string(&resp).unwrap_or_default()
-                        }
+                            // Handlers are synchronous and may block (chainstate
+                            // lock, getblocktemplate long polling), so run them
+                            // on the blocking pool rather than an async worker.
+                            let reg = registry.clone();
+                            match tokio::task::spawn_blocking(move || reg.dispatch(&request)).await {
+                                Ok(r) => r,
+                                Err(_) => {
+                                    let response = http_response(500, "Internal Server Error");
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                    return;
+                                }
+                            }
+                        };
+                        resp.to_json_string(version)
                     }
                 };
 
