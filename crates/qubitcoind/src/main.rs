@@ -1,6 +1,9 @@
 //! Qubitcoind: The Qubitcoin daemon.
 //! A production-ready Bitcoin-compatible full node.
 
+mod chain_events;
+mod notify;
+
 use qubitcoin_common::chainparams::{ChainParams, Network};
 use qubitcoin_common::coins::{CoinsView, CoinsViewDB, FlushableCoinsView};
 use qubitcoin_consensus::block::{Block, BlockHeader};
@@ -115,6 +118,8 @@ struct LiveNodeInterface {
     pending_tx_index: parking_lot::Mutex<Vec<(Txid, i32, u32, u32)>>,
     /// Optional in-process WASM secondary indexer manager.
     indexer_manager: Option<Arc<IndexerManager>>,
+    /// Tip-change fan-out (mempool cleanup, long-poll wake-up, notifiers).
+    events: Arc<chain_events::ChainEvents>,
 }
 
 /// Tracks IBD (Initial Block Download) progress for logging.
@@ -181,6 +186,11 @@ impl NodeInterface for LiveNodeInterface {
                 .unwrap_or_default();
             *self.node_state.chain_height.write() = height;
             *self.node_state.best_block_hash.write() = tip_hash;
+
+            // The block is the new tip: drop its transactions (and their
+            // conflicts) from the mempool, wake long polls, notify.
+            let ibd = cs.is_initial_block_download();
+            self.events.block_connected(&block, block_hash, height, ibd);
 
             // Log progress during IBD with blocks/sec and sync percentage.
             if height % 1000 == 0 {
@@ -798,6 +808,29 @@ async fn main() {
         }
     }
 
+    // 8b. Tip-change fan-out shared by P2P, submitblock and generate.
+    let notifications = Arc::new(notify::Notifications {
+        block_notify: args.get_arg("blocknotify").map(|s| s.to_string()),
+    });
+    {
+        let n = notifications.clone();
+        mempool.set_event_listener(Some(Arc::new(move |e: &mempool::MempoolEvent| n.mempool_event(e))));
+    }
+    let tip_watch = {
+        let cs = chainstate.lock();
+        let tip_hash = cs
+            .tip()
+            .map(|t| cs.block_index().get(t).block_hash)
+            .unwrap_or(BlockHash::ZERO);
+        Arc::new(qubitcoin_rpc::mining::TipWatch::new(tip_hash))
+    };
+    let chain_events = Arc::new(chain_events::ChainEvents {
+        mempool: mempool.clone(),
+        tip_watch: tip_watch.clone(),
+        node_state: node_state.clone(),
+        notifications: notifications.clone(),
+    });
+
     // 9. Set up RPC server
     let rpc_port: u16 = args.get_int_arg("rpcport").unwrap_or(match network {
         Network::Mainnet => 8332,
@@ -876,169 +909,35 @@ async fn main() {
         // metashrew_view/metashrew_height aliases are registered via register_indexer_rpcs above
     }
 
-    // Register real generatetoaddress for regtest mining.
-    if network == Network::Regtest {
-        use qubitcoin_rpc::server::{RpcRequest, RpcResponse, RPC_INVALID_PARAMS, RPC_MISC_ERROR};
-        use qubitcoin_node::miner::BlockAssembler;
-        use qubitcoin_primitives::ArithUint256;
-        use qubitcoin_primitives::arith_uint256::uint256_to_arith;
-
-        let cs_gen = chainstate.clone();
-        let bf_gen = block_files.clone();
-        let cdb_gen = coins_db.clone();
-        let ns_gen = node_state.clone();
-        let im_gen = indexer_manager.clone();
-        let mp_gen = mempool.clone();
-        let magic_gen = magic_bytes;
-        let bi_db_gen = block_index_db.clone();
-        let miner_opts_gen = miner_options.clone();
-
-        registry.register("generatetoaddress", move |req: &RpcRequest| {
-            let params_arr = match req.params.as_ref().and_then(|p| p.as_array()) {
-                Some(a) => a.clone(),
-                None => return RpcResponse::error(req.id.clone(), RPC_INVALID_PARAMS, "expected array params".into()),
-            };
-            let nblocks = params_arr.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
-            let address_str = match params_arr.get(1).and_then(|v| v.as_str()) {
-                Some(a) => a.to_string(),
-                None => return RpcResponse::error(req.id.clone(), RPC_INVALID_PARAMS, "missing address".into()),
-            };
-
-            // Build coinbase output script from address (P2WPKH/P2TR bech32).
-            let coinbase_script = {
-                if let Ok((_, version, program)) = bech32::segwit::decode(&address_str) {
-                    let ver_op: u8 = match version.to_u8() { 0 => 0x00, n => 0x50 + n };
-                    let mut raw = Vec::with_capacity(2 + program.len());
-                    raw.push(ver_op);
-                    raw.push(program.len() as u8);
-                    raw.extend_from_slice(&program);
-                    qubitcoin_script::Script::from(raw)
-                } else {
-                    // Fallback: OP_TRUE (anyone-can-spend) for regtest.
-                    qubitcoin_script::Script::from(vec![0x51u8])
-                }
-            };
-
-            let mut hashes = Vec::new();
-            let wall_clock = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as u32;
-            let mut last_time = {
-                let cs = cs_gen.lock();
-                let tip_time = if let Some(tip) = cs.tip() {
-                    cs.block_index().get(tip).time
-                } else {
-                    0
-                };
-                // Use whichever is later: wall clock or tip time
-                std::cmp::max(wall_clock, tip_time)
-            };
-            for _ in 0..nblocks {
-                let mut cs = cs_gen.lock();
-                let height = cs.height() + 1;
-
-                // Assemble the block: ancestor-feerate package selection,
-                // weight/sigop limits, BIP34 coinbase and witness commitment.
-                // Maps to: `GenerateBlock()` -> `BlockAssembler::CreateNewBlock()`
-                // in Core's rpc/mining.cpp.
-                let tmpl = match BlockAssembler::new(&cs, Some(&mp_gen), miner_opts_gen.clone())
-                    .create_new_block(&coinbase_script)
-                {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::error!(height = height, error = %e, "block assembly failed");
-                        return RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, e.to_string());
-                    }
-                };
-                let mut block = tmpl.block;
-                let prev_hash = block.header.prev_blockhash;
-
-                // Strictly increasing timestamps so back-to-back regtest
-                // blocks never collide (and always exceed the parent's MTP).
-                last_time += 1;
-                let time = last_time;
-                block.header.time = time;
-                if let Some(tip) = cs.tip() {
-                    block.header.bits = cs.next_work_required(tip, time);
-                }
-
-                // Solve PoW (trivial on regtest).
-                let mut target = ArithUint256::zero();
-                target.set_compact(block.header.bits);
-                loop {
-                    let hash = block.header.block_hash();
-                    let hash_arith = uint256_to_arith(&hash.into_uint256());
-                    if hash_arith <= target { break; }
-                    block.header.nonce = block.header.nonce.wrapping_add(1);
-                }
-                let block_hash = block.header.block_hash();
-
-                // Serialize and process through chainstate.
-                let block_bytes = match serialize(&block) {
-                    Ok(b) => b,
-                    Err(e) => return RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, format!("serialize: {}", e)),
-                };
-
-                // Write to block files.
-                let pos = match bf_gen.write_block(&block, magic_gen) {
-                    Ok(p) => p,
-                    Err(e) => return RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, format!("write: {}", e)),
-                };
-
-                // Process through chainstate (validates + connects).
-                // This must happen BEFORE updating data_pos because process_new_block
-                // creates the block index entry via accept_block_header.
-                tracing::info!(height = height, time = time, prev_hash = %prev_hash.to_hex(), "mining block");
-                match cs.process_new_block(&block) {
-                    Ok((true, undo)) => {
-                        // Update block index with file position AFTER the entry exists.
-                        if let Some(arena_idx) = cs.lookup_block_index(&block_hash) {
-                            let idx = cs.block_index_mut().get_mut(arena_idx);
-                            idx.file = pos.file;
-                            idx.data_pos = pos.pos;
-                            cs.mark_dirty(arena_idx);
-                        }
-                        // Write undo data.
-                        if let Some(undo_data) = undo {
-                            if let Ok(undo_pos) = bf_gen.write_undo(pos.file, &undo_data) {
-                                cs.set_undo_pos(&block_hash, undo_pos.pos);
-                            }
-                        }
-                        // Flush coins + block index to disk for crash safety.
-                        cs.flush_coins(cdb_gen.as_ref());
-                        let dirty = cs.dirty_block_indices();
-                        if !dirty.is_empty() {
-                            let refs: Vec<&qubitcoin_common::chain::BlockIndex> = dirty.into_iter().collect();
-                            bi_db_gen.write_block_indices(&refs);
-                        }
-                        // Update RPC state.
-                        *ns_gen.chain_height.write() = height;
-                        *ns_gen.best_block_hash.write() = block_hash.to_hex();
-                        // Remove included (and conflicting) txs from mempool.
-                        mp_gen.remove_for_block_txs(&block.vtx);
-                    }
-                    Ok((false, _)) => {
-                        return RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, "block not accepted".into());
-                    }
-                    Err(e) => {
-                        tracing::error!(height = height, time = time, error = %format!("{:?}", e), "mining failed");
-                        return RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, format!("process: {:?}", e));
-                    }
-                }
-                drop(cs);
-
-                // Notify secondary indexers.
-                if let Some(ref im) = im_gen {
-                    im.on_block_connected(height as u32, &block_bytes);
-                }
-
-                hashes.push(block_hash.to_hex());
-            }
-
-            RpcResponse::success(req.id.clone(), serde_json::json!(hashes))
+    // Mining RPCs: getblocktemplate, submitblock, submitheader,
+    // getblockheader, prioritisetransaction, getprioritisedtransactions,
+    // getmininginfo/getnetworkhashps/getdifficulty (live), and on regtest
+    // generatetoaddress.
+    {
+        let sink = Arc::new(chain_events::DaemonBlockSink {
+            chainstate: chainstate.clone(),
+            block_files: block_files.clone(),
+            coins_db: coins_db.clone(),
+            block_index_db: block_index_db.clone(),
+            tx_index_db: tx_index_db.clone(),
+            indexer_manager: indexer_manager.clone(),
+            magic_bytes,
+            events: chain_events.clone(),
         });
-        tracing::info!("real generatetoaddress registered for regtest");
+        let ns_peers = node_state.clone();
+        let ctx = Arc::new(qubitcoin_rpc::mining::MiningContext::new(
+            chainstate.clone(),
+            mempool.clone(),
+            sink,
+            tip_watch.clone(),
+            miner_options.clone(),
+            Arc::new(move || *ns_peers.connections.read()),
+            network != Network::Mainnet,
+            chain_name,
+            network == Network::Regtest,
+        ));
+        qubitcoin_rpc::mining::register_mining_rpcs(&mut registry, ctx);
+        tracing::info!("mining RPCs registered");
     }
 
     tracing::info!(
@@ -1121,6 +1020,7 @@ async fn main() {
             last_log_height: initial_height,
         }),
         indexer_manager: indexer_manager.clone(),
+        events: chain_events.clone(),
     });
 
     if let Some(event_rx) = event_rx {
@@ -2267,4 +2167,7 @@ fn print_usage() {
     println!("  -maxconnections=<n> Max connections (default: 125)");
     println!("  -loglevel=<level>  Log level: error, warn, info, debug, trace");
     println!("  -dbcache=<n>       UTXO cache size in MB (default: 1024)");
+    println!("  -blockmaxweight=<n> Max block weight to mine (default: 3996000)");
+    println!("  -blockmintxfee=<amt> Min fee rate (BTC/kvB) for mined txs (default: 0)");
+    println!("  -blocknotify=<cmd> Run cmd when the best block changes (%s = hash)");
 }
