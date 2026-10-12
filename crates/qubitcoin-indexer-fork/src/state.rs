@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use wasmtime::StoreLimits;
 
+use crate::host::HostContext;
 use crate::storage::MemStorage;
 
 /// Host state threaded through the wasmtime `Store`. The runtime's
@@ -26,6 +27,12 @@ pub struct ForkWasmState {
     /// slim runtime's behavior so subsequent __get/__get_len reads
     /// within the same _start() see the staged values.
     pub write_cache: HashMap<Vec<u8>, Vec<u8>>,
+    /// Upstream services (`__secondary_get`, `__upstream_view`).
+    pub host: HostContext,
+    /// Result of the last `__upstream_view`, read by `__upstream_view_read`.
+    pub view_stash: Option<Vec<u8>>,
+    /// First error a host service reported; fails the invocation.
+    pub host_error: Option<String>,
 }
 
 impl ForkWasmState {
@@ -50,7 +57,21 @@ impl ForkWasmState {
             view_mode,
             limits,
             write_cache: HashMap::new(),
+            host: HostContext::default(),
+            view_stash: None,
+            host_error: None,
         }
+    }
+
+    /// Cap linear memory at `bytes` (growth beyond it traps).
+    pub fn set_memory_limit(&mut self, bytes: usize) {
+        self.limits = wasmtime::StoreLimitsBuilder::new()
+            .memory_size(bytes)
+            .memories(usize::MAX)
+            .tables(usize::MAX)
+            .instances(usize::MAX)
+            .trap_on_grow_failure(true)
+            .build();
     }
 }
 

@@ -46,11 +46,16 @@
 //! # Ok::<(), String>(())
 //! ```
 
+pub mod host;
 pub mod runtime;
 pub mod state;
 pub mod storage;
 pub mod upstream;
 
+pub use host::{
+    ExecError, ExecErrorKind, ExecLimits, ExecOutcome, HostContext, SecondaryReader,
+    UpstreamViewCaller,
+};
 pub use runtime::ForkRuntime;
 pub use state::ForkWasmState;
 pub use storage::MemStorage;

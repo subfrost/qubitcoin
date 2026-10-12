@@ -10,7 +10,7 @@ description = "In-memory WASM indexer runtime with read-through upstream host fu
 [dependencies]
 qubitcoin-indexer-core = { path = "../qubitcoin-indexer-core" }
 wasmtime = "43"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 prost = "0.12"
 sha2 = "0.10"
 parking_lot = "0.12"
