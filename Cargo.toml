@@ -1,5 +1,10 @@
 [workspace]
 resolver = "2"
+# Self-contained crates (each declares its own [workspace]). The indexer
+# path-depends on qubitcoin-indexer-fork, so it must be excluded explicitly.
+exclude = [
+    "crates/qubitcoin-indexer-fork",
+]
 members = [
     "crates/qubitcoin-crypto",
     "crates/qubitcoin-primitives",

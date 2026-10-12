@@ -688,6 +688,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "asynchronous-codec"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a860072022177f903e59730004fb5dc13db9275b79bb2aef7ba8ce831956c233"
+dependencies = [
+ "bytes",
+ "futures-sink",
+ "futures-util",
+ "memchr",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1499,6 +1512,15 @@ name = "crossbeam-epoch"
 version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-queue"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03e8bd762f7479489c70ed6c768ddca99d7296857de437a68dcb2a94365b3fae"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -3692,12 +3714,20 @@ name = "qubitcoin-indexer"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bitcoin 0.32.102",
+ "hex",
  "metashrew-runtime",
  "metashrew-sync",
  "parking_lot",
  "prost",
  "prost-build",
+ "qubitcoin-consensus",
+ "qubitcoin-crypto",
  "qubitcoin-indexer-core",
+ "qubitcoin-indexer-fork",
+ "qubitcoin-primitives",
+ "qubitcoin-script",
+ "qubitcoin-serialize",
  "rayon",
  "rocksdb",
  "rockshrew-runtime",
@@ -3719,6 +3749,20 @@ dependencies = [
  "prost",
  "prost-build",
  "sha2",
+]
+
+[[package]]
+name = "qubitcoin-indexer-fork"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "parking_lot",
+ "prost",
+ "qubitcoin-indexer-core",
+ "sha2",
+ "tokio",
+ "tracing",
+ "wasmtime",
 ]
 
 [[package]]
@@ -3786,11 +3830,15 @@ dependencies = [
 name = "qubitcoin-rpc"
 version = "0.1.0"
 dependencies = [
+ "bech32 0.11.1",
  "parking_lot",
  "qubitcoin-common",
  "qubitcoin-consensus",
+ "qubitcoin-crypto",
  "qubitcoin-node",
  "qubitcoin-primitives",
+ "qubitcoin-script",
+ "qubitcoin-serialize",
  "qubitcoin-util",
  "serde",
  "serde_json",
@@ -3960,6 +4008,7 @@ name = "qubitcoind"
 version = "0.1.0"
 dependencies = [
  "bech32 0.11.1",
+ "bytes",
  "parking_lot",
  "qubitcoin-common",
  "qubitcoin-consensus",
@@ -3977,6 +4026,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "wat",
+ "zeromq",
 ]
 
 [[package]]
@@ -4521,12 +4572,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "saa"
+version = "5.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd85992a680de788217d9c70b74aa7685b108cf1aba02f728fb27f1b27199ad1"
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "scc"
+version = "3.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d5f8ca67c4f6208caf824037a6a9df0211b4e0937fccc4f543441f294d04511"
+dependencies = [
+ "saa",
+ "sdd",
 ]
 
 [[package]]
@@ -4558,6 +4625,15 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "sdd"
+version = "4.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a31877eee03686b905845993b5d9809a220c9dd5a10e9d6021d7ca67384c9070"
+dependencies = [
+ "saa",
+]
 
 [[package]]
 name = "sec1"
@@ -5223,6 +5299,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-util"
+version = "0.7.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-io",
+ "futures-sink",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "toml"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5593,6 +5683,7 @@ version = "1.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf3923a6f5c4c6382e0b653c4117f48d631ea17f38ed86e2a828e6f7412f5239"
 dependencies = [
+ "getrandom 0.4.3",
  "js-sys",
  "wasm-bindgen",
 ]
@@ -6606,6 +6697,30 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "zeromq"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "efb2c254fd8f366755335c9e43b865f8484fe3bd717d65ffe7c3f28852863030"
+dependencies = [
+ "async-trait",
+ "asynchronous-codec",
+ "bytes",
+ "crossbeam-queue",
+ "futures",
+ "log",
+ "num-traits",
+ "once_cell",
+ "parking_lot",
+ "rand 0.9.5",
+ "regex",
+ "scc",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]

@@ -2,26 +2,39 @@
 //!
 //! Embeds metashrew-compatible WASM indexers that run in-process alongside
 //! the chain tip, providing atomic reorg handling and zero-config indexing.
+//!
+//! The loaded indexers form a DAG rooted at the raw block (see [`dag`] and
+//! `docs/INDEXER-DAG.md`): indexers read other indexers through `secondary`
+//! edges and may take their input block from a [`transform`] node. The same
+//! DAG can be run in fork mode over a hypothetical block ([`simulation`]),
+//! and users can register their own nodes ([`usernodes`]).
 
 pub mod adapters;
 pub mod config;
+pub mod dag;
+pub mod dag_rpc;
 pub mod rollback;
 pub mod rpc;
 pub mod runtime;
+pub mod simulation;
 pub mod smt;
 pub mod state;
 pub mod storage;
+pub mod store;
+pub mod transform;
 
-use config::IndexerConfig;
+use config::{IndexerConfig, TransformConfig};
+use dag::{DagAccess, DagBackend};
 use metashrew_runtime::MetashrewRuntime;
-use metashrew_sync::MetashrewRuntimeAdapter;
+use qubitcoin_indexer_fork::{ExecLimits, ForkRuntime};
 use rockshrew_runtime::RocksDBRuntimeAdapter;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use transform::TransformNode;
 
 pub use adapters::{QubitcoinNodeAdapter, QubitcoinStorageAdapter};
 
@@ -29,6 +42,13 @@ pub use adapters::{QubitcoinNodeAdapter, QubitcoinStorageAdapter};
 struct IndexerBlock {
     height: u32,
     data: Arc<Vec<u8>>, // [height_le32 ++ block_data]
+}
+
+/// Work for an indexer's worker thread, processed strictly in order.
+enum IndexerMsg {
+    Block(IndexerBlock),
+    /// Roll the indexer back to this height.
+    Reorg(u32),
 }
 
 /// Indexer execution mode.
@@ -41,16 +61,19 @@ pub enum IndexerMode {
     Async,
 }
 
-/// A single loaded indexer instance backed by MetashrewRuntime.
+/// A single loaded indexer instance.
 ///
-/// Uses the real metashrew/rockshrew crates to ensure exact storage format
-/// compatibility with the production alkanes.wasm and other WASM indexer modules.
+/// Indexers without `secondary` edges run on the real metashrew/rockshrew
+/// runtime (`runtime = Some`), for exact storage-format compatibility with
+/// production alkanes.wasm and other modules. Indexers that read other
+/// indexers through `__secondary_get` (which `MetashrewRuntime` does not
+/// link) run on the fork runtime and commit through the same metashrew
+/// store code (`runtime = None`). Both keep their KV in the same layout.
 pub struct IndexerInstance {
     /// Human-readable label.
     pub label: String,
-    /// MetashrewRuntime backed by RocksDB — handles block processing, views,
-    /// and storage in the exact same format as the production metashrew stack.
-    pub runtime: Arc<tokio::sync::RwLock<MetashrewRuntime<RocksDBRuntimeAdapter>>>,
+    /// MetashrewRuntime backed by RocksDB (None for fork-runner indexers).
+    pub runtime: Option<Arc<tokio::sync::RwLock<MetashrewRuntime<RocksDBRuntimeAdapter>>>>,
     /// Direct RocksDB handle for admin/raw reads (secondarykvget, etc.).
     pub db: Arc<rocksdb::DB>,
     /// SHA-256 hash of the WASM binary.
@@ -63,15 +86,45 @@ pub struct IndexerInstance {
     pub start_height: u32,
     /// Indexer layer (secondary or tertiary).
     pub layer: config::IndexerLayer,
-    /// Labels of indexers this one depends on (tertiary only).
+    /// `secondary` edges: indexers whose KV this one reads.
     pub depends_on: Vec<String>,
+    /// `transform` edge: the transform node producing this indexer's input.
+    pub input: Option<String>,
     /// Whether this indexer is paused (skipped by on_block_connected).
     pub paused: AtomicBool,
     /// Path to the RocksDB directory (for rsyncd exposure / admin).
     pub db_path: PathBuf,
     /// Channel sender for async block processing. When set, blocks are
     /// queued to a dedicated worker thread instead of processed inline.
-    pub block_sender: Option<mpsc::SyncSender<IndexerBlock>>,
+    block_sender: Option<mpsc::SyncSender<IndexerMsg>>,
+    /// The WASM binary (fork mode compiles it on first use).
+    pub wasm_bytes: Arc<Vec<u8>>,
+    fork: OnceLock<Result<Arc<ForkRuntime>, String>>,
+    /// Last block-processing error, if the last block failed.
+    pub last_error: parking_lot::Mutex<Option<String>>,
+}
+
+impl IndexerInstance {
+    /// The fork-mode runtime for this indexer's wasm (compiled once).
+    pub fn fork_runtime(&self) -> Result<Arc<ForkRuntime>, String> {
+        self.fork
+            .get_or_init(|| ForkRuntime::new(&self.wasm_bytes).map(Arc::new))
+            .clone()
+    }
+
+    /// `"metashrew"` or `"fork"`.
+    pub fn runner(&self) -> &'static str {
+        if self.runtime.is_some() {
+            "metashrew"
+        } else {
+            "fork"
+        }
+    }
+
+    /// True once any block has been committed to this indexer's store.
+    pub fn has_state(&self) -> bool {
+        store::stored_tip(&self.db).is_some()
+    }
 }
 
 /// Info returned by `pause()`.
@@ -92,6 +145,177 @@ pub struct IndexerStatusInfo {
     pub smt_enabled: bool,
     pub start_height: u32,
     pub depends_on: Vec<String>,
+    pub input: Option<String>,
+    pub runner: &'static str,
+    pub last_error: Option<String>,
+}
+
+/// The standard DAG, shared by worker threads, the simulation engine and
+/// user nodes.
+pub struct DagShared {
+    pub indexers: parking_lot::RwLock<HashMap<String, Arc<IndexerInstance>>>,
+    pub transforms: parking_lot::RwLock<HashMap<String, Arc<TransformNode>>>,
+    /// Topological order of all standard nodes (indexers and transforms).
+    pub order: parking_lot::RwLock<Vec<String>>,
+    /// Recent transform outputs keyed by (transform, height, header hash).
+    transform_cache: parking_lot::Mutex<VecDeque<((String, u32, [u8; 32]), Arc<Vec<u8>>)>>,
+}
+
+const TRANSFORM_CACHE_ENTRIES: usize = 16;
+
+impl DagShared {
+    fn new() -> Self {
+        DagShared {
+            indexers: parking_lot::RwLock::new(HashMap::new()),
+            transforms: parking_lot::RwLock::new(HashMap::new()),
+            order: parking_lot::RwLock::new(Vec::new()),
+            transform_cache: parking_lot::Mutex::new(VecDeque::new()),
+        }
+    }
+
+    pub fn indexer(&self, name: &str) -> Option<Arc<IndexerInstance>> {
+        self.indexers.read().get(name).cloned()
+    }
+
+    pub fn transform(&self, name: &str) -> Option<Arc<TransformNode>> {
+        self.transforms.read().get(name).cloned()
+    }
+
+    /// The DAG as name → upstream names (indexers and transforms).
+    pub fn graph(&self) -> BTreeMap<String, Vec<String>> {
+        let mut g = BTreeMap::new();
+        for (n, i) in self.indexers.read().iter() {
+            let mut ups = i.depends_on.clone();
+            if let Some(t) = &i.input {
+                ups.push(t.clone());
+            }
+            g.insert(n.clone(), ups);
+        }
+        for (n, t) in self.transforms.read().iter() {
+            g.insert(n.clone(), t.upstreams());
+        }
+        g
+    }
+
+    /// Recompute the topological order (errors on cycles / unknown nodes).
+    fn reorder(&self) -> Result<(), String> {
+        let order = dag::topo_order(&self.graph())?;
+        *self.order.write() = order;
+        Ok(())
+    }
+
+    /// Indexers `inst` must wait for before processing a height: its
+    /// `secondary` upstreams plus its input transform's upstreams.
+    pub fn wait_set(&self, inst: &IndexerInstance) -> Vec<String> {
+        let mut v = inst.depends_on.clone();
+        if let Some(t) = inst.input.as_ref().and_then(|t| self.transform(t)) {
+            v.extend(t.upstreams());
+        }
+        v
+    }
+
+    /// True once every indexer in `deps` has processed `height` (an indexer
+    /// whose start height is above `height` never will, and counts as ready).
+    pub fn deps_ready(&self, deps: &[String], height: u32) -> bool {
+        deps.iter().all(|d| match self.indexer(d) {
+            Some(dep) => {
+                height < dep.start_height
+                    || (dep.tip_height.load(Ordering::Acquire) >= height && dep.has_state())
+            }
+            None => false,
+        })
+    }
+
+    /// Output of transform `name` for the raw block at `height`, computed
+    /// against the persistent upstream state at `height` (cached).
+    pub async fn transform_output(&self, self_arc: &Arc<DagShared>, name: &str, height: u32, raw_block: &[u8]) -> Result<Arc<Vec<u8>>, String> {
+        let key_hash: [u8; 32] = Sha256::digest(&raw_block[..raw_block.len().min(80)]).into();
+        let key = (name.to_string(), height, key_hash);
+        if let Some((_, v)) = self.transform_cache.lock().iter().find(|(k, _)| *k == key) {
+            return Ok(v.clone());
+        }
+        let t = self.transform(name).ok_or_else(|| format!("unknown transform '{}'", name))?;
+        let access = DagAccess {
+            node: name.to_string(),
+            allowed: t.upstreams(),
+            backend: Arc::new(PersistentBackend { shared: self_arc.clone(), height }),
+        };
+        let out = t
+            .apply(height, raw_block, access, ExecLimits::default())
+            .await
+            .map_err(|e| format!("transform '{}' at {}: {}", name, height, e))?;
+        let out = Arc::new(out.value);
+        let mut c = self.transform_cache.lock();
+        c.push_back((key, out.clone()));
+        while c.len() > TRANSFORM_CACHE_ENTRIES {
+            c.pop_front();
+        }
+        Ok(out)
+    }
+
+    fn clear_transform_cache(&self) {
+        self.transform_cache.lock().clear();
+    }
+}
+
+/// Upstream reads against the persistent stores, as of a height.
+pub struct PersistentBackend {
+    pub shared: Arc<DagShared>,
+    pub height: u32,
+}
+
+#[async_trait::async_trait]
+impl DagBackend for PersistentBackend {
+    fn kv_get(&self, node: &str, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        let inst = self.shared.indexer(node).ok_or_else(|| format!("unknown indexer '{}'", node))?;
+        store::read_at_height(&inst.db, key, self.height)
+    }
+
+    async fn view(&self, node: &str, view_fn: &str, input: Vec<u8>) -> Result<Vec<u8>, String> {
+        let inst = self.shared.indexer(node).ok_or_else(|| format!("unknown indexer '{}'", node))?;
+        persistent_view(&self.shared, &inst, view_fn, input, self.height).await
+    }
+}
+
+/// Call a view of a persistent indexer as of `height`.
+pub async fn persistent_view(
+    shared: &Arc<DagShared>,
+    inst: &Arc<IndexerInstance>,
+    view_fn: &str,
+    input: Vec<u8>,
+    height: u32,
+) -> Result<Vec<u8>, String> {
+    match &inst.runtime {
+        Some(rt) => {
+            let runtime = rt.read().await;
+            runtime
+                .view(view_fn.to_string(), &input, height)
+                .await
+                .map_err(|e| format!("view '{}' failed: {}", view_fn, e))
+        }
+        None => {
+            let fork = inst.fork_runtime()?;
+            let mut full = Vec::with_capacity(4 + input.len());
+            full.extend_from_slice(&height.to_le_bytes());
+            full.extend_from_slice(&input);
+            let access = DagAccess {
+                node: inst.label.clone(),
+                allowed: inst.depends_on.clone(),
+                backend: Arc::new(PersistentBackend { shared: shared.clone(), height }),
+            };
+            fork.call_export_ctx(
+                view_fn,
+                full,
+                store::fork_storage(store::LayeredReader::at_height(inst.db.clone(), height), height),
+                &inst.label,
+                access.host(),
+                ExecLimits::default(),
+            )
+            .await
+            .map(|o| o.value)
+            .map_err(|e| format!("view '{}' failed: {}", view_fn, e))
+        }
+    }
 }
 
 /// Manages all loaded indexer instances.
@@ -99,200 +323,237 @@ pub struct IndexerManager {
     indexers: HashMap<String, Arc<IndexerInstance>>,
     mode: IndexerMode,
     datadir: PathBuf,
+    shared: Arc<DagShared>,
+}
+
+/// Open (or create) an indexer's store and runtime.
+fn open_instance(config: &IndexerConfig, datadir: &Path) -> Result<IndexerInstance, String> {
+    tracing::info!(
+        label = %config.label,
+        wasm = %config.wasm_path.display(),
+        "loading indexer module"
+    );
+    let wasm_bytes = std::fs::read(&config.wasm_path).map_err(|e| {
+        format!("failed to read WASM file '{}': {}", config.wasm_path.display(), e)
+    })?;
+    let wasm_hash: [u8; 32] = Sha256::digest(&wasm_bytes).into();
+
+    let db_dir = datadir.join("indexers").join(&config.label).join("db");
+    std::fs::create_dir_all(&db_dir).map_err(|e| format!("failed to create indexer db dir: {}", e))?;
+    let db_opts = RocksDBRuntimeAdapter::get_optimized_options();
+    let db = Arc::new(
+        rocksdb::DB::open(&db_opts, &db_dir)
+            .map_err(|e| format!("failed to open RocksDB at {:?}: {}", db_dir, e))?,
+    );
+
+    // Secondary edges need `__secondary_get`, which only the fork runner links.
+    let runtime = if config.depends_on.is_empty() && !config.fork_runner {
+        let adapter = RocksDBRuntimeAdapter::new(db.clone());
+        // Spawn on a dedicated thread to avoid "cannot block inside async" panic.
+        let rt = std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio for metashrew init");
+                rt.block_on(MetashrewRuntime::new(&wasm_bytes, adapter))
+            })
+            .join()
+            .expect("metashrew init thread panicked")
+        })
+        .map_err(|e| format!("metashrew runtime init: {}", e))?;
+        Some(Arc::new(tokio::sync::RwLock::new(rt)))
+    } else {
+        // Validate the module up front.
+        ForkRuntime::new(&wasm_bytes).map_err(|e| format!("indexer '{}': {}", config.label, e))?;
+        None
+    };
+
+    let tip_height = store::stored_tip(&db).unwrap_or(0);
+    Ok(IndexerInstance {
+        label: config.label.clone(),
+        runtime,
+        db,
+        wasm_hash,
+        tip_height: AtomicU32::new(tip_height),
+        smt_enabled: config.smt_enabled,
+        start_height: config.start_height,
+        layer: config.layer,
+        depends_on: config.depends_on.clone(),
+        input: config.input.clone(),
+        paused: AtomicBool::new(false),
+        db_path: db_dir,
+        block_sender: None,
+        wasm_bytes: Arc::new(wasm_bytes),
+        fork: OnceLock::new(),
+        last_error: parking_lot::Mutex::new(None),
+    })
+}
+
+/// Process the hardcoded genesis block on a fresh metashrew-runner indexer
+/// without edges (MetashrewRuntime needs block 0 to initialize its state).
+fn process_genesis(inst: &IndexerInstance) {
+    let Some(runtime) = inst.runtime.clone() else { return };
+    let genesis_hex = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4adae5494dffff7f20020000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a0100000043410496b538e853519c726a2c91e61ec11600ae1390813a627c66fb8be7947be63c52da7589379515d4e0a604f8141781e62294721166bf621e73a82cbf2342c858eeac00000000";
+    let genesis_bytes = hex::decode(genesis_hex).expect("genesis hex");
+    tracing::info!(label = %inst.label, "processing genesis block (height 0)");
+    let r = std::thread::scope(|s| {
+        s.spawn(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio for genesis");
+            rt.block_on(async {
+                {
+                    let guard = runtime.read().await;
+                    let mut ctx = guard.context.write().expect("metashrew context lock poisoned");
+                    ctx.block = genesis_bytes;
+                    ctx.height = 0;
+                }
+                runtime.read().await.run().await
+            })
+        })
+        .join()
+        .expect("genesis thread panicked")
+    });
+    match r {
+        Ok(()) => tracing::info!(label = %inst.label, "genesis block processed"),
+        Err(e) => tracing::warn!(label = %inst.label, error = %e, "genesis block processing failed (non-fatal)"),
+    }
 }
 
 impl IndexerManager {
     /// Create a new IndexerManager by loading indexers from configs.
     ///
     /// Each indexer gets its own RocksDB at `{datadir}/indexers/{label}/db/`.
-    pub fn new(
+    /// Transform nodes named by an indexer's `input` in the
+    /// `upstream/view/MAGIC` shorthand are created automatically.
+    pub fn new(configs: Vec<IndexerConfig>, datadir: &PathBuf, mode: IndexerMode) -> Result<Self, String> {
+        Self::with_transforms(configs, vec![], datadir, mode)
+    }
+
+    /// Like [`IndexerManager::new`], with explicit transform nodes.
+    pub fn with_transforms(
         configs: Vec<IndexerConfig>,
+        transforms: Vec<TransformConfig>,
         datadir: &PathBuf,
         mode: IndexerMode,
     ) -> Result<Self, String> {
-        let mut indexers = HashMap::new();
+        let shared = Arc::new(DagShared::new());
 
-        for config in configs {
-            tracing::info!(
-                label = %config.label,
-                wasm = %config.wasm_path.display(),
-                "loading indexer module"
-            );
-
-            // Read WASM binary.
-            let wasm_bytes = std::fs::read(&config.wasm_path).map_err(|e| {
-                format!(
-                    "failed to read WASM file '{}': {}",
-                    config.wasm_path.display(),
-                    e
-                )
-            })?;
-
-            // Compute SHA-256 hash.
-            let wasm_hash: [u8; 32] = Sha256::digest(&wasm_bytes).into();
-            let hash_hex: String = wasm_hash.iter().map(|b| format!("{:02x}", b)).collect();
-
-            // Open storage.
-            let db_dir = datadir
-                .join("indexers")
-                .join(&config.label)
-                .join("db");
-            std::fs::create_dir_all(&db_dir).map_err(|e| {
-                format!("failed to create indexer db dir: {}", e)
-            })?;
-
-            // Open RocksDB with optimized settings (matching rockshrew).
-            let db_opts = RocksDBRuntimeAdapter::get_optimized_options();
-            let db = Arc::new(
-                rocksdb::DB::open(&db_opts, &db_dir)
-                    .map_err(|e| format!("failed to open RocksDB at {:?}: {}", db_dir, e))?,
-            );
-            let adapter = RocksDBRuntimeAdapter::new(db.clone());
-
-            // Build wasmtime Engine matching metashrew's configuration.
-            // Engine config must match metashrew/rockshrew exactly.
-            let mut wasm_config = wasmtime::Config::default();
-            wasm_config.cranelift_nan_canonicalization(true);
-            wasm_config.relaxed_simd_deterministic(true);
-            wasm_config.memory_reservation(0x100000000); // 4GB
-            wasm_config.memory_guard_size(0x10000); // 64KB
-            wasm_config.memory_init_cow(false); // deterministic init
-            wasm_config.async_support(true);
-            // metashrew's MetashrewRuntime::new now builds its own wasmtime
-            // engine internally (v10); we only validate the config here.
-            let _engine = wasmtime::Engine::new(&wasm_config)
-                .map_err(|e| format!("wasmtime engine: {}", e))?;
-
-            // Create MetashrewRuntime — the production-compatible WASM indexer engine.
-            // Spawn on a dedicated thread to avoid "cannot block inside async" panic.
-            let runtime = std::thread::scope(|s| {
-                s.spawn(|| {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("tokio for metashrew init");
-                    rt.block_on(MetashrewRuntime::new(&wasm_bytes, adapter))
-                })
-                .join()
-                .expect("metashrew init thread panicked")
-            })
-            .map_err(|e| format!("metashrew runtime init: {}", e))?;
-
-            // Read tip height from metashrew's TIP_HEIGHT_KEY format.
-            let mut tip_height = match db.get(metashrew_runtime::TIP_HEIGHT_KEY.as_bytes()) {
-                Ok(Some(v)) if v.len() >= 4 => {
-                    u32::from_le_bytes([v[0], v[1], v[2], v[3]])
-                }
-                _ => 0,
-            };
-
-            // If starting fresh, process the genesis block (height 0).
-            // MetashrewRuntime needs block 0 to initialize its internal state
-            // (protocol tags, genesis alkanes, etc.). Without this, subsequent
-            // blocks will OOM due to uninitialized HashMap seeds.
-            if tip_height == 0 {
-                let genesis_hex = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4adae5494dffff7f20020000000101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a0100000043410496b538e853519c726a2c91e61ec11600ae1390813a627c66fb8be7947be63c52da7589379515d4e0a604f8141781e62294721166bf621e73a82cbf2342c858eeac00000000";
-                let genesis_bytes: Vec<u8> = (0..genesis_hex.len())
-                    .step_by(2)
-                    .map(|i| u8::from_str_radix(&genesis_hex[i..i + 2], 16).unwrap())
-                    .collect();
-
-                tracing::info!(label = %config.label, "processing genesis block (height 0)");
-                let genesis_result = std::thread::scope(|s| {
-                    s.spawn(|| {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("tokio for genesis");
-                        rt.block_on(async {
-                            {
-                                let mut ctx = runtime
-                                    .context
-                                    .write()
-                                    .expect("metashrew context lock poisoned");
-                                ctx.block = genesis_bytes;
-                                ctx.height = 0;
-                            }
-                            runtime.run().await
-                        })
-                    })
-                    .join()
-                    .expect("genesis thread panicked")
-                });
-                match genesis_result {
-                    Ok(()) => {
-                        tip_height = 0;
-                        tracing::info!(label = %config.label, "genesis block processed");
-                    }
-                    Err(e) => {
-                        tracing::warn!(label = %config.label, error = %e, "genesis block processing failed (non-fatal)");
-                    }
+        // Transforms: explicit, then shorthand ones implied by `input`.
+        let mut tcfgs: BTreeMap<String, TransformConfig> = BTreeMap::new();
+        for t in transforms {
+            tcfgs.insert(t.name.clone(), t);
+        }
+        for c in &configs {
+            if let Some(i) = &c.input {
+                if !tcfgs.contains_key(i) {
+                    let t = TransformConfig::from_shorthand(i).ok_or_else(|| {
+                        format!("indexer '{}': unknown transform '{}' (and not upstream/view/MAGIC)", c.label, i)
+                    })?;
+                    tcfgs.insert(i.clone(), t);
                 }
             }
-
-            tracing::info!(
-                label = %config.label,
-                hash = %hash_hex,
-                tip_height = tip_height,
-                smt = config.smt_enabled,
-                "indexer module loaded"
-            );
-
-            // In Async mode, spawn a dedicated worker thread per indexer.
-            // The channel has a bounded buffer to provide backpressure.
-            let block_sender = if mode == IndexerMode::Async {
-                let (tx, rx) = mpsc::sync_channel::<IndexerBlock>(64);
-                // We'll spawn the worker after creating the Arc below.
-                Some((tx, rx))
-            } else {
-                None
-            };
-
-            let instance = Arc::new(IndexerInstance {
-                label: config.label.clone(),
-                runtime: Arc::new(tokio::sync::RwLock::new(runtime)),
-                db,
-                wasm_hash,
-                tip_height: AtomicU32::new(tip_height),
-                smt_enabled: config.smt_enabled,
-                start_height: config.start_height,
-                layer: config.layer,
-                depends_on: config.depends_on.clone(),
-                paused: AtomicBool::new(false),
-                db_path: db_dir,
-                block_sender: block_sender.as_ref().map(|(tx, _)| tx.clone()),
-            });
-
-            // Spawn the worker thread for async mode.
-            if let Some((_tx, rx)) = block_sender {
-                let worker_inst = instance.clone();
-                let worker_label = config.label.clone();
-                std::thread::Builder::new()
-                    .name(format!("indexer-{}", worker_label))
-                    .spawn(move || {
-                        tracing::info!(indexer = %worker_label, "indexer worker thread started");
-                        while let Ok(block) = rx.recv() {
-                            if worker_inst.paused.load(Ordering::Relaxed) {
-                                continue;
-                            }
-                            if block.height < worker_inst.start_height {
-                                continue;
-                            }
-                            run_indexer_block(&worker_inst, block.height, &block.data);
-                        }
-                        tracing::info!(indexer = %worker_label, "indexer worker thread exiting");
-                    })
-                    .map_err(|e| format!("failed to spawn indexer worker: {}", e))?;
-            }
-
-            indexers.insert(config.label, instance);
+        }
+        for (name, t) in &tcfgs {
+            let node = TransformNode::from_config(t)?;
+            shared.transforms.write().insert(name.clone(), Arc::new(node));
         }
 
-        Ok(IndexerManager {
-            indexers,
-            mode,
-            datadir: datadir.clone(),
-        })
+        // Validate the graph before opening any store.
+        {
+            let mut g: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for c in &configs {
+                let mut ups = c.depends_on.clone();
+                if let Some(i) = &c.input {
+                    ups.push(i.clone());
+                }
+                g.insert(c.label.clone(), ups);
+            }
+            for (n, t) in shared.transforms.read().iter() {
+                for u in t.upstreams() {
+                    if !configs.iter().any(|c| c.label == u) {
+                        return Err(format!("transform '{}' reads '{}', which is not a loaded indexer", n, u));
+                    }
+                }
+                g.insert(n.clone(), t.upstreams());
+            }
+            dag::topo_order(&g)?;
+        }
+
+        let mut indexers = HashMap::new();
+        let mut receivers = Vec::new();
+        for config in configs {
+            let mut inst = open_instance(&config, datadir)?;
+            let edges = !inst.depends_on.is_empty() || inst.input.is_some();
+            if !edges && !inst.has_state() && inst.tip_height.load(Ordering::Relaxed) == 0 {
+                process_genesis(&inst);
+            }
+            if mode == IndexerMode::Async {
+                let (tx, rx) = mpsc::sync_channel::<IndexerMsg>(64);
+                inst.block_sender = Some(tx);
+                receivers.push((config.label.clone(), rx));
+            }
+            tracing::info!(
+                label = %inst.label,
+                hash = %hex::encode(inst.wasm_hash),
+                tip_height = inst.tip_height.load(Ordering::Relaxed),
+                runner = inst.runner(),
+                smt = inst.smt_enabled,
+                "indexer module loaded"
+            );
+            let inst = Arc::new(inst);
+            shared.indexers.write().insert(config.label.clone(), inst.clone());
+            indexers.insert(config.label, inst);
+        }
+        shared.reorder()?;
+
+        // Worker threads (async mode): one per indexer, strictly in order.
+        for (label, rx) in receivers {
+            let inst = indexers.get(&label).unwrap().clone();
+            let sh = shared.clone();
+            std::thread::Builder::new()
+                .name(format!("indexer-{}", label))
+                .spawn(move || {
+                    tracing::info!(indexer = %label, "indexer worker thread started");
+                    while let Ok(msg) = rx.recv() {
+                        match msg {
+                            IndexerMsg::Block(block) => {
+                                if inst.paused.load(Ordering::Relaxed) || block.height < inst.start_height {
+                                    continue;
+                                }
+                                let deps = sh.wait_set(&inst);
+                                let mut waited = 0u64;
+                                while !sh.deps_ready(&deps, block.height) {
+                                    if inst.paused.load(Ordering::Relaxed) {
+                                        break;
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(2));
+                                    waited += 2;
+                                    if waited % 60_000 == 0 {
+                                        tracing::warn!(indexer = %label, height = block.height, deps = ?deps, "still waiting for upstream indexers");
+                                    }
+                                }
+                                if inst.paused.load(Ordering::Relaxed) {
+                                    continue;
+                                }
+                                run_indexer_block(&sh, &inst, block.height, &block.data);
+                            }
+                            IndexerMsg::Reorg(h) => rollback_instance(&sh, &inst, h),
+                        }
+                    }
+                    tracing::info!(indexer = %label, "indexer worker thread exiting");
+                })
+                .map_err(|e| format!("failed to spawn indexer worker: {}", e))?;
+        }
+
+        Ok(IndexerManager { indexers, mode, datadir: datadir.clone(), shared })
+    }
+
+    /// The shared DAG (for the simulation engine and user nodes).
+    pub fn shared(&self) -> Arc<DagShared> {
+        self.shared.clone()
     }
 
     /// Get a reference to a loaded indexer by label.
@@ -318,174 +579,57 @@ impl IndexerManager {
     /// Notify all indexers that a new block has been connected.
     ///
     /// In **Async mode** (recommended): queues the block to per-indexer
-    /// worker threads and returns immediately. The caller is not blocked
-    /// by WASM execution. Worker threads process blocks in order.
+    /// worker threads and returns immediately. Each worker waits until the
+    /// indexers it depends on (`secondary` edges and its input transform's
+    /// upstreams) have processed the height.
     ///
-    /// In **Synchronous mode**: blocks until all indexers finish (legacy).
-    ///
-    /// Indexers are processed in two phases:
-    /// 1. Secondary indexers (no dependencies) run in parallel.
-    /// 2. Tertiary indexers run after their dependencies have completed.
+    /// In **Synchronous mode**: runs every indexer in topological order and
+    /// returns when all are done.
     pub fn on_block_connected(&self, height: u32, block_data: &[u8]) {
         if self.indexers.is_empty() {
             return;
         }
-
-        // Build input: [height_le32 ++ block_data]
         let mut input = Vec::with_capacity(4 + block_data.len());
         input.extend_from_slice(&height.to_le_bytes());
         input.extend_from_slice(block_data);
         let input = Arc::new(input);
 
-        // Async mode: queue to per-indexer worker threads.
-        if self.mode == IndexerMode::Async {
-            for inst in self.indexers.values() {
-                if height < inst.start_height || inst.paused.load(Ordering::Relaxed) {
-                    continue;
-                }
-                if let Some(ref sender) = inst.block_sender {
-                    let block = IndexerBlock {
-                        height,
-                        data: Arc::clone(&input),
-                    };
-                    if let Err(e) = sender.try_send(block) {
-                        // Channel full — apply backpressure by blocking.
-                        match e {
-                            mpsc::TrySendError::Full(block) => {
-                                let _ = sender.send(block);
-                            }
-                            mpsc::TrySendError::Disconnected(_) => {
-                                tracing::error!(
-                                    indexer = %inst.label,
-                                    "indexer worker thread disconnected"
-                                );
-                            }
-                        }
-                    }
-                }
+        let order = self.shared.order.read().clone();
+        for label in &order {
+            let Some(inst) = self.indexers.get(label) else { continue }; // transforms
+            if height < inst.start_height || inst.paused.load(Ordering::Relaxed) {
+                continue;
             }
-            // Tertiary indexers with dependencies: also queue, but the worker
-            // thread will check dependency heights before processing.
-            return;
-        }
-
-        // Synchronous mode (legacy): block until all indexers finish.
-        let (phase1, phase2): (Vec<_>, Vec<_>) = self
-            .indexers
-            .values()
-            .partition(|inst| inst.depends_on.is_empty());
-
-        let run_phase = |instances: &[&Arc<IndexerInstance>]| {
-            rayon::scope(|s| {
-                for inst in instances {
-                    if height < inst.start_height
-                        || inst.paused.load(Ordering::Relaxed)
-                    {
-                        continue;
-                    }
-                    let inst = Arc::clone(inst);
-                    let input = Arc::clone(&input);
-                    s.spawn(move |_| {
-                        run_indexer_block(&inst, height, &input);
-                    });
-                }
-            });
-        };
-
-        run_phase(&phase1);
-
-        if !phase2.is_empty() {
-            let ready: Vec<&Arc<IndexerInstance>> = phase2
-                .into_iter()
-                .filter(|inst| {
-                    if height < inst.start_height {
-                        return false;
-                    }
-                    self.dependencies_satisfied(inst, height)
-                })
-                .collect();
-
-            run_phase(&ready);
-        }
-    }
-
-    /// Check if all dependencies for a tertiary indexer have reached the
-    /// given height.
-    fn dependencies_satisfied(&self, inst: &IndexerInstance, height: u32) -> bool {
-        for dep_label in &inst.depends_on {
-            match self.indexers.get(dep_label) {
-                Some(dep) => {
-                    if dep.tip_height.load(Ordering::Relaxed) < height {
-                        return false;
+            match &inst.block_sender {
+                Some(sender) => {
+                    let msg = IndexerMsg::Block(IndexerBlock { height, data: Arc::clone(&input) });
+                    if sender.send(msg).is_err() {
+                        tracing::error!(indexer = %inst.label, "indexer worker thread disconnected");
                     }
                 }
                 None => {
-                    tracing::warn!(
-                        indexer = %inst.label,
-                        dependency = %dep_label,
-                        "dependency not found, skipping"
-                    );
-                    return false;
+                    // Synchronous (or hot-loaded): inline, in topological order.
+                    if self.shared.deps_ready(&self.shared.wait_set(inst), height) {
+                        run_indexer_block(&self.shared, inst, height, &input);
+                    } else {
+                        tracing::warn!(indexer = %inst.label, height, "upstream indexers not at height, skipping");
+                    }
                 }
             }
         }
-        true
     }
 
-    /// Notify all indexers of a chain reorganization.
-    ///
-    /// Uses **deferred rollback**: sets a reorg marker and deletes only
-    /// metadata. The service stays live — reads filter orphaned entries.
-    /// Background pruning cleans up later.
+    /// Notify all indexers of a chain reorganization: every indexer above
+    /// `rollback_height` is rolled back to it (in order with its queued
+    /// blocks in async mode).
     pub fn on_reorg(&self, rollback_height: u32) {
-        for (label, inst) in &self.indexers {
-            let current = inst.tip_height.load(Ordering::Relaxed);
-            if current > rollback_height {
-                tracing::info!(
-                    indexer = %label,
-                    from = current,
-                    to = rollback_height,
-                    "deferred rollback (service stays live)"
-                );
-                // TODO: Implement rollback using metashrew's manifest-based rollback
-                match Err::<usize, String>("rollback not yet implemented for metashrew backend".into()) {
-                    Ok(metadata_deleted) => {
-                        inst.tip_height.store(rollback_height, Ordering::Relaxed);
-                        tracing::info!(
-                            indexer = %label,
-                            metadata_deleted = metadata_deleted,
-                            "deferred rollback complete, background prune pending"
-                        );
-                        // Spawn background prune task.
-                        let _db = inst.db.clone();
-                        let label_owned = label.clone();
-                        std::thread::spawn(move || {
-                            match Ok::<usize, String>(0) {
-                                Ok(pruned) => {
-                                    tracing::info!(
-                                        indexer = %label_owned,
-                                        pruned = pruned,
-                                        "background prune complete"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        indexer = %label_owned,
-                                        error = %e,
-                                        "background prune failed"
-                                    );
-                                }
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            indexer = %label,
-                            error = %e,
-                            "deferred rollback failed"
-                        );
-                    }
+        self.shared.clear_transform_cache();
+        for inst in self.indexers.values() {
+            match &inst.block_sender {
+                Some(sender) => {
+                    let _ = sender.send(IndexerMsg::Reorg(rollback_height));
                 }
+                None => rollback_instance(&self.shared, inst, rollback_height),
             }
         }
     }
@@ -526,61 +670,31 @@ impl IndexerManager {
         if !inst.paused.load(Ordering::Relaxed) {
             return Err("indexer must be paused before rollback".to_string());
         }
-        let deleted = 0; // TODO: metashrew rollback
-        inst.tip_height.store(height, Ordering::Relaxed);
-        Ok(deleted)
+        let from = inst.tip_height.load(Ordering::Relaxed);
+        store::rollback(&inst.db, height, from)?;
+        inst.tip_height.store(height.min(from), Ordering::Relaxed);
+        Ok(from.saturating_sub(height))
     }
 
-    /// Hot-load a new WASM indexer module at runtime.
+    /// Hot-load a new WASM indexer module at runtime (processed inline).
     pub fn load(&mut self, label: &str, wasm_path: &Path, cfg: IndexerConfig) -> Result<String, String> {
-        let wasm_bytes = std::fs::read(wasm_path)
-            .map_err(|e| format!("failed to read WASM: {}", e))?;
-
-        let wasm_hash: [u8; 32] = Sha256::digest(&wasm_bytes).into();
-        let hash_hex: String = wasm_hash.iter().map(|b| format!("{:02x}", b)).collect();
-
-        let db_dir = self.datadir.join("indexers").join(label).join("db");
-        std::fs::create_dir_all(&db_dir)
-            .map_err(|e| format!("failed to create db dir: {}", e))?;
-
-        let db_opts = RocksDBRuntimeAdapter::get_optimized_options();
-        let db = Arc::new(
-            rocksdb::DB::open(&db_opts, &db_dir)
-                .map_err(|e| format!("failed to open RocksDB: {}", e))?,
-        );
-        let adapter = RocksDBRuntimeAdapter::new(db.clone());
-        let mut wasm_config = wasmtime::Config::default();
-        wasm_config.async_support(true);
-        wasm_config.cranelift_nan_canonicalization(true);
-        // metashrew builds its own engine internally (v10); validate only.
-        let _engine = wasmtime::Engine::new(&wasm_config)
-            .map_err(|e| format!("wasmtime engine: {}", e))?;
-        let runtime = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(
-                MetashrewRuntime::new(&wasm_bytes, adapter)
-            )
-        }).map_err(|e| format!("metashrew runtime: {}", e))?;
-        let tip_height = match db.get(metashrew_runtime::TIP_HEIGHT_KEY.as_bytes()) {
-            Ok(Some(v)) if v.len() >= 4 => u32::from_le_bytes([v[0], v[1], v[2], v[3]]),
-            _ => 0,
-        };
-
-        let instance = Arc::new(IndexerInstance {
-            label: label.to_string(),
-            runtime: Arc::new(tokio::sync::RwLock::new(runtime)),
-            db,
-            wasm_hash,
-            tip_height: AtomicU32::new(tip_height),
-            smt_enabled: cfg.smt_enabled,
-            start_height: cfg.start_height,
-            layer: cfg.layer,
-            depends_on: cfg.depends_on.clone(),
-            paused: AtomicBool::new(false),
-            db_path: db_dir,
-            block_sender: None, // hot-loaded indexers use sync mode
-        });
-
-        self.indexers.insert(label.to_string(), instance);
+        let mut cfg = cfg;
+        cfg.label = label.to_string();
+        cfg.wasm_path = wasm_path.to_path_buf();
+        if let Some(i) = &cfg.input {
+            if self.shared.transform(i).is_none() {
+                let t = TransformConfig::from_shorthand(i).ok_or_else(|| format!("unknown transform '{}'", i))?;
+                self.shared.transforms.write().insert(i.clone(), Arc::new(TransformNode::from_config(&t)?));
+            }
+        }
+        let inst = Arc::new(open_instance(&cfg, &self.datadir)?);
+        let hash_hex = hex::encode(inst.wasm_hash);
+        self.shared.indexers.write().insert(label.to_string(), inst.clone());
+        if let Err(e) = self.shared.reorder() {
+            self.shared.indexers.write().remove(label);
+            return Err(e);
+        }
+        self.indexers.insert(label.to_string(), inst);
         tracing::info!(label = label, hash = %hash_hex, "indexer hot-loaded");
         Ok(hash_hex)
     }
@@ -590,6 +704,8 @@ impl IndexerManager {
         if self.indexers.remove(label).is_none() {
             return Err(format!("indexer '{}' not found", label));
         }
+        self.shared.indexers.write().remove(label);
+        let _ = self.shared.reorder();
         tracing::info!(label = label, "indexer unloaded");
         Ok(())
     }
@@ -602,12 +718,15 @@ impl IndexerManager {
                 label: inst.label.clone(),
                 height: inst.tip_height.load(Ordering::Relaxed),
                 paused: inst.paused.load(Ordering::Relaxed),
-                wasm_hash: inst.wasm_hash.iter().map(|b| format!("{:02x}", b)).collect(),
+                wasm_hash: hex::encode(inst.wasm_hash),
                 layer: inst.layer,
                 db_path: inst.db_path.clone(),
                 smt_enabled: inst.smt_enabled,
                 start_height: inst.start_height,
                 depends_on: inst.depends_on.clone(),
+                input: inst.input.clone(),
+                runner: inst.runner(),
+                last_error: inst.last_error.lock().clone(),
             })
             .collect()
     }
@@ -616,49 +735,37 @@ impl IndexerManager {
     // View methods
     // -----------------------------------------------------------------------
 
-    /// Call a view function on an indexer (async, with fuel-based yielding).
+    /// Call a view function on an indexer at its tip (async).
     ///
-    /// Uses the dedicated `view_runtime` — no lock contention with block
-    /// processing. Multiple concurrent view calls are safe because each
-    /// creates a fresh wasmtime Store.
-    pub async fn call_view_async(
-        &self,
-        label: &str,
-        fn_name: &str,
-        input: Vec<u8>,
-    ) -> Result<Vec<u8>, String> {
+    /// Each call creates a fresh wasmtime Store; no lock contention with
+    /// block processing beyond the runtime's read lock.
+    pub async fn call_view_async(&self, label: &str, fn_name: &str, input: Vec<u8>) -> Result<Vec<u8>, String> {
         let inst = self
             .get_indexer(label)
             .ok_or_else(|| format!("indexer '{}' not found", label))?;
         let height = inst.tip_height.load(Ordering::Relaxed);
-        let runtime = inst.runtime.read().await;
-        runtime
-            .view(fn_name.to_string(), &input, height)
-            .await
-            .map_err(|e| format!("view '{}' failed: {}", fn_name, e))
+        persistent_view(&self.shared, inst, fn_name, input, height).await
     }
 
     /// Call a view function on an indexer (sync wrapper around async).
-    pub fn call_view(
-        &self,
-        label: &str,
-        fn_name: &str,
-        input: Vec<u8>,
-    ) -> Result<Vec<u8>, String> {
+    pub fn call_view(&self, label: &str, fn_name: &str, input: Vec<u8>) -> Result<Vec<u8>, String> {
+        let shared = self.shared.clone();
         let inst = self
             .get_indexer(label)
-            .ok_or_else(|| format!("indexer '{}' not found", label))?;
-        let height = inst.tip_height.load(Ordering::Relaxed);
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("tokio runtime: {}", e))?;
-        rt.block_on(async {
-            let runtime = inst.runtime.read().await;
-            runtime
-                .view(fn_name.to_string(), &input, height)
-                .await
-                .map_err(|e| format!("view '{}' failed: {}", fn_name, e))
+            .ok_or_else(|| format!("indexer '{}' not found", label))?
+            .clone();
+        let fn_name = fn_name.to_string();
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("tokio runtime: {}", e))?;
+                let height = inst.tip_height.load(Ordering::Relaxed);
+                rt.block_on(persistent_view(&shared, &inst, &fn_name, input, height))
+            })
+            .join()
+            .map_err(|_| "view thread panicked".to_string())?
         })
     }
 
@@ -670,100 +777,51 @@ impl IndexerManager {
 
     /// Replay blocks for indexers that are behind the chain tip.
     ///
-    /// In **Async mode**: feeds blocks to the per-indexer worker channels
-    /// and returns immediately. Workers process blocks in the background.
-    /// The node is not blocked during catch-up.
-    ///
-    /// In **Synchronous mode**: blocks until all catch-up is complete.
+    /// Each block is read once and handed to every indexer that needs it, in
+    /// topological order. In **Async mode** blocks are queued to the
+    /// workers; in **Synchronous mode** they are processed inline.
     pub fn catch_up<F>(&self, chain_height: u32, read_block: F)
     where
         F: Fn(u32) -> Option<Vec<u8>>,
     {
-        // Phase 1: catch up secondary indexers (no dependencies).
-        for (label, inst) in &self.indexers {
-            if !inst.depends_on.is_empty() {
-                continue;
-            }
-            self.catch_up_single(inst, label, chain_height, &read_block);
-        }
-
-        // Phase 2: catch up tertiary indexers.
-        for (label, inst) in &self.indexers {
-            if inst.depends_on.is_empty() {
-                continue;
-            }
-            // In async mode, tertiaries will process when deps are ready
-            // (the worker thread checks dependency heights).
-            if self.mode == IndexerMode::Synchronous
-                && !self.dependencies_satisfied(inst, chain_height)
-            {
-                tracing::warn!(
-                    indexer = %label,
-                    "skipping tertiary catch-up: dependencies not satisfied"
-                );
-                continue;
-            }
-            self.catch_up_single(inst, label, chain_height, &read_block);
-        }
-    }
-
-    fn catch_up_single<F>(
-        &self,
-        inst: &IndexerInstance,
-        label: &str,
-        chain_height: u32,
-        read_block: &F,
-    ) where
-        F: Fn(u32) -> Option<Vec<u8>>,
-    {
-        let indexer_height = inst.tip_height.load(Ordering::Relaxed);
-        // Distinguish "never processed" (height=0, no data) from
-        // "processed up to height 0" (height=0, has data).
-        // If tip_height is 0 and storage has no tip key, start from start_height.
-        let has_processed = inst.tip_height.load(Ordering::Relaxed) > 0
-            || inst.db.get(metashrew_runtime::TIP_HEIGHT_KEY.as_bytes()).ok().flatten().is_some();
-        let effective_start = if has_processed {
-            indexer_height + 1
-        } else {
-            inst.start_height
-        };
-        if effective_start > chain_height {
+        let next: HashMap<String, u32> = self
+            .indexers
+            .iter()
+            .map(|(l, inst)| {
+                let h = if inst.has_state() || inst.tip_height.load(Ordering::Relaxed) > 0 {
+                    inst.tip_height.load(Ordering::Relaxed) + 1
+                } else {
+                    inst.start_height
+                };
+                (l.clone(), h.max(inst.start_height))
+            })
+            .collect();
+        let Some(from) = next.values().copied().min() else { return };
+        if from > chain_height {
             return;
         }
-
-        let blocks_behind = chain_height - effective_start + 1;
-        tracing::info!(
-            indexer = %label,
-            from = effective_start,
-            to = chain_height,
-            blocks_behind = blocks_behind,
-            mode = if inst.block_sender.is_some() { "async" } else { "sync" },
-            "replaying blocks for indexer catch-up"
-        );
-        for h in effective_start..=chain_height {
-            if let Some(block_data) = read_block(h) {
-                let mut input = Vec::with_capacity(4 + block_data.len());
-                input.extend_from_slice(&h.to_le_bytes());
-                input.extend_from_slice(&block_data);
-
-                // Async mode: queue to worker thread.
-                if let Some(ref sender) = inst.block_sender {
-                    let block = IndexerBlock {
-                        height: h,
-                        data: Arc::new(input),
-                    };
-                    let _ = sender.send(block); // blocks if channel full (backpressure)
-                } else {
-                    // Synchronous mode: process inline.
-                    run_indexer_block(inst, h, &input);
-                }
-            } else {
-                tracing::warn!(
-                    indexer = %label,
-                    height = h,
-                    "block not available for catch-up, stopping"
-                );
+        tracing::info!(from, to = chain_height, "replaying blocks for indexer catch-up");
+        let order = self.shared.order.read().clone();
+        for h in from..=chain_height {
+            let Some(block_data) = read_block(h) else {
+                tracing::warn!(height = h, "block not available for catch-up, stopping");
                 break;
+            };
+            let mut input = Vec::with_capacity(4 + block_data.len());
+            input.extend_from_slice(&h.to_le_bytes());
+            input.extend_from_slice(&block_data);
+            let input = Arc::new(input);
+            for label in &order {
+                let Some(inst) = self.indexers.get(label) else { continue };
+                if h < next[label] || inst.paused.load(Ordering::Relaxed) {
+                    continue;
+                }
+                match &inst.block_sender {
+                    Some(sender) => {
+                        let _ = sender.send(IndexerMsg::Block(IndexerBlock { height: h, data: input.clone() }));
+                    }
+                    None => run_indexer_block(&self.shared, inst, h, &input),
+                }
             }
         }
     }
@@ -793,60 +851,89 @@ fn build_test_wasm() -> Vec<u8> {
     "#).expect("failed to parse test WAT")
 }
 
-/// Run a single indexer on a block using MetashrewRuntime.
-///
-/// The MetashrewRuntime handles all storage writes internally through
-/// the SMT append-only format, matching the production metashrew stack.
-fn run_indexer_block(inst: &IndexerInstance, height: u32, input: &[u8]) {
-    // input is [height_le32 ++ block_data]. MetashrewRuntime expects
-    // height and block_data separately (it prepends height in __load_input).
-    let block_data = if input.len() > 4 { &input[4..] } else { input };
-    let block_data_owned = block_data.to_vec();
-    let runtime_ref = inst.runtime.clone();
+/// Roll one indexer back to `height` (no-op if it is not above it).
+fn rollback_instance(shared: &Arc<DagShared>, inst: &IndexerInstance, height: u32) {
+    let from = inst.tip_height.load(Ordering::Relaxed);
+    if from <= height {
+        return;
+    }
+    shared.clear_transform_cache();
+    match store::rollback(&inst.db, height, from) {
+        Ok(()) => {
+            inst.tip_height.store(height, Ordering::Release);
+            tracing::info!(indexer = %inst.label, from, to = height, "indexer rolled back");
+        }
+        Err(e) => {
+            tracing::error!(indexer = %inst.label, from, to = height, error = %e, "indexer rollback failed");
+            *inst.last_error.lock() = Some(e);
+        }
+    }
+}
 
-    // Use a dedicated thread with its own tokio runtime.
-    // Worker threads may or may not be inside a tokio context, so we
-    // always create a fresh one to be safe.
-    let result = std::thread::scope(|s| {
-        s.spawn(move || {
+/// Run a single indexer on a block (`input` = `height_le32 ++ raw block`).
+///
+/// The input block is the raw block, or the output of the indexer's input
+/// transform. Metashrew-runner indexers run through `MetashrewRuntime`;
+/// fork-runner indexers run in fork mode over their store at `height - 1`
+/// with `__secondary_get` reading their upstreams at `height`, and commit
+/// through metashrew's store code.
+fn run_indexer_block(shared: &Arc<DagShared>, inst: &Arc<IndexerInstance>, height: u32, input: &[u8]) {
+    let raw = if input.len() > 4 { &input[4..] } else { &input[..0] };
+    let result: Result<(), String> = std::thread::scope(|s| {
+        s.spawn(|| {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("tokio for indexer block");
-            rt.block_on(async move {
-                {
-                    let mut ctx = runtime_ref.write().await;
-                    let mut inner = ctx
-                        .context
-                        .write()
-                        .expect("metashrew context lock poisoned");
-                    inner.height = height;
-                    inner.block = block_data_owned;
+            rt.block_on(async {
+                let block: Arc<Vec<u8>> = match &inst.input {
+                    None => Arc::new(raw.to_vec()),
+                    Some(t) => shared.transform_output(shared, t, height, raw).await?,
+                };
+                match &inst.runtime {
+                    Some(runtime_ref) => {
+                        {
+                            let ctx = runtime_ref.write().await;
+                            let mut inner = ctx.context.write().expect("metashrew context lock poisoned");
+                            inner.height = height;
+                            inner.block = (*block).clone();
+                        }
+                        let guard = runtime_ref.read().await;
+                        guard.run().await.map_err(|e| format!("{}", e))
+                    }
+                    None => {
+                        let fork = inst.fork_runtime()?;
+                        let mut full = Vec::with_capacity(4 + block.len());
+                        full.extend_from_slice(&height.to_le_bytes());
+                        full.extend_from_slice(&block);
+                        let reader = store::LayeredReader::at_height(inst.db.clone(), height.saturating_sub(1));
+                        let access = DagAccess {
+                            node: inst.label.clone(),
+                            allowed: inst.depends_on.clone(),
+                            backend: Arc::new(PersistentBackend { shared: shared.clone(), height }),
+                        };
+                        let out = fork
+                            .run_block_ctx(full, store::fork_storage(reader, height), &inst.label, access.host(), ExecLimits::default())
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        store::commit_block(&inst.db, height, &out.value)
+                    }
                 }
-                let guard = runtime_ref.read().await;
-                guard.run().await
             })
         })
         .join()
-        .expect("indexer thread panicked")
+        .unwrap_or_else(|_| Err("indexer thread panicked".into()))
     });
 
     match result {
         Ok(()) => {
-            inst.tip_height.store(height, Ordering::Relaxed);
-            tracing::debug!(
-                indexer = %inst.label,
-                height = height,
-                "indexer processed block"
-            );
+            inst.tip_height.store(height, Ordering::Release);
+            *inst.last_error.lock() = None;
+            tracing::debug!(indexer = %inst.label, height = height, "indexer processed block");
         }
         Err(e) => {
-            tracing::error!(
-                indexer = %inst.label,
-                height = height,
-                error = %e,
-                "indexer failed to process block"
-            );
+            tracing::error!(indexer = %inst.label, height = height, error = %e, "indexer failed to process block");
+            *inst.last_error.lock() = Some(format!("height {}: {}", height, e));
         }
     }
 }
@@ -867,6 +954,8 @@ mod tests {
             start_height: 0,
             layer: config::IndexerLayer::Secondary,
             depends_on: vec![],
+            input: None,
+            fork_runner: false,
         }
     }
 

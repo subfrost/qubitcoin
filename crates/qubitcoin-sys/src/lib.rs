@@ -21,7 +21,7 @@ use qubitcoin_common::coins::CoinsView;
 use qubitcoin_common::keys::Key;
 use qubitcoin_consensus::block::Block;
 use qubitcoin_consensus::transaction::{OutPoint, TransactionRef};
-use qubitcoin_indexer::config::{IndexerConfig, IndexerLayer};
+use qubitcoin_indexer::config::IndexerConfig;
 use qubitcoin_indexer::{IndexerManager, IndexerMode};
 use qubitcoin_node::test_framework::TestChain;
 use qubitcoin_primitives::{Amount, BlockHash};
@@ -448,14 +448,7 @@ impl NativeNode {
                     tempfile::tempdir().expect("failed to create temp dir for indexer storage")
                 });
 
-                let config = IndexerConfig {
-                    label: label.to_string(),
-                    wasm_path: wasm_path.to_path_buf(),
-                    smt_enabled: false,
-                    start_height: 0,
-                    layer: IndexerLayer::Secondary,
-                    depends_on: Vec::new(),
-                };
+                let config = IndexerConfig::new(label, wasm_path.to_path_buf());
 
                 let mgr = IndexerManager::new(
                     vec![config],

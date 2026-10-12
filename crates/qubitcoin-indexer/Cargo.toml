@@ -8,6 +8,13 @@ description = "In-process WASM secondary indexer runtime for Qubitcoin"
 
 [dependencies]
 qubitcoin-indexer-core = { workspace = true }
+qubitcoin-indexer-fork = { path = "../qubitcoin-indexer-fork", default-features = false }
+qubitcoin-consensus = { workspace = true }
+qubitcoin-serialize = { workspace = true }
+qubitcoin-primitives = { workspace = true }
+qubitcoin-script = { workspace = true }
+qubitcoin-crypto = { workspace = true }
+hex = { workspace = true }
 rocksdb = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
@@ -31,6 +38,7 @@ async-trait = "0.1"
 tempfile = { workspace = true }
 tokio = { workspace = true }
 wat = "1.0"
+bitcoin = "0.32"
 
 [build-dependencies]
 prost-build = "0.12"

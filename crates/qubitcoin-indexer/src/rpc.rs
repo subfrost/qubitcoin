@@ -344,6 +344,14 @@ where
                                 .collect()
                         })
                         .unwrap_or_default(),
+                    input: opts
+                        .and_then(|o| o.get("transform"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    fork_runner: opts
+                        .and_then(|o| o.get("runner"))
+                        .and_then(|v| v.as_str())
+                        == Some("fork"),
                 };
                 let mut mgr = mgr.write();
                 match mgr.load(label, std::path::Path::new(wasm_path), cfg) {
@@ -703,6 +711,8 @@ mod tests {
             start_height: 0,
             layer: config::IndexerLayer::Secondary,
             depends_on: vec![],
+            input: None,
+            fork_runner: false,
         }];
 
         let datadir = PathBuf::from(dir.path());
