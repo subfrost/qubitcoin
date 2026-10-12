@@ -102,7 +102,7 @@ fn test_single_accept_basic_rejections() {
     assert_eq!(e.reason, "version");
 
     // Too small (64-byte txs are non-standard; CVE-2017-12842).
-    let tiny = mk(2, &[(op.clone(), false)], vec![(v - 1000, Script::from_bytes(vec![0x51]))]);
+    let tiny = mk(2, &[(op.clone(), false)], vec![(v - 1000, Script::from_bytes(vec![0x6a]))]);
     assert_eq!(acc.accept_single(&tiny, false).unwrap_err().reason, "tx-size-small");
 
     // Non-final.
@@ -281,4 +281,159 @@ fn test_package_well_formedness() {
     // Parents depending on each other: not child-with-parents.
     let c = mk(2, &[(out(&b, 0), false), (out(&a, 0), false)], vec![(1000, wsh_op_true())]);
     assert!(!is_child_with_parents_tree(&[a, b, c]));
+}
+
+fn setup_with_pool(n: usize, pool: TxMemPool) -> (ChainstateManager, TxMemPool, Vec<(OutPoint, i64)>) {
+    let (cs, _p, coins) = setup(n);
+    (cs, pool, coins)
+}
+
+/// Spend output `n` of `parent` (worth `value`) into `outs` P2WSH outputs.
+fn chain_child(parent: &TransactionRef, n: u32, value: i64, fee: i64, outs: usize) -> TransactionRef {
+    let each = (value - fee) / outs as i64;
+    mk(2, &[(out(parent, n), false)], (0..outs).map(|_| (each, wsh_op_true())).collect())
+}
+
+#[test]
+fn test_ancestor_count_limit() {
+    let (cs, pool, coins) = setup(1);
+    let acc = MemPoolAccept::new(&cs, &pool);
+    let (op, mut v) = coins[0].clone();
+    let mut prev = mk(2, &[(op, false)], vec![(v - 1_000, wsh_op_true())]);
+    v -= 1_000;
+    acc.accept_single(&prev, false).unwrap();
+    for _ in 0..24 {
+        let next = chain_child(&prev, 0, v, 1_000, 1);
+        v -= 1_000;
+        acc.accept_single(&next, false).unwrap();
+        prev = next;
+    }
+    assert_eq!(pool.size(), 25);
+    let e = acc.accept_single(&chain_child(&prev, 0, v, 1_000, 1), false).unwrap_err();
+    assert_eq!(e.reason, "too-long-mempool-chain");
+    assert!(e.details.starts_with("too many unconfirmed ancestors"), "{}", e.details);
+}
+
+#[test]
+fn test_descendant_limit_and_cpfp_carve_out() {
+    let (cs, pool, coins) = setup(1);
+    let acc = MemPoolAccept::new(&cs, &pool);
+    let (op, v) = coins[0].clone();
+    // Parent with three outputs; a 24-long chain hangs off output 0, so
+    // the parent has 25 in-mempool descendants including itself.
+    let third = (v - 1_000) / 3;
+    let parent = mk(2, &[(op, false)], vec![(third, wsh_op_true()), (third, wsh_op_true()), (third, wsh_op_true())]);
+    acc.accept_single(&parent, false).unwrap();
+    let mut prev = parent.clone();
+    let mut val = third;
+    let mut idx = 0;
+    for _ in 0..24 {
+        let next = chain_child(&prev, idx, val, 1_000, 1);
+        val -= 1_000;
+        idx = 0;
+        acc.accept_single(&next, false).unwrap();
+        prev = next;
+    }
+    // One more child of the parent exceeds its descendant limit, but the
+    // carve-out admits a small tx whose only ancestor is the parent...
+    let carve = chain_child(&parent, 1, third, 1_000, 1);
+    acc.accept_single(&carve, false).unwrap();
+    // ...exactly once.
+    let e = acc.accept_single(&chain_child(&parent, 2, third, 1_000, 1), false).unwrap_err();
+    assert_eq!(e.reason, "too-long-mempool-chain");
+    assert!(e.details.starts_with("too many descendants for tx"), "{}", e.details);
+}
+
+#[test]
+fn test_package_feerate_cpfp_with_relay_floor() {
+    use qubitcoin_node::mempool::{FeeRate, MempoolPolicy};
+    let pool = TxMemPool::new_with_options(FeeRate::new(1_000), 300_000_000, MempoolPolicy::default());
+    let (cs, pool, coins) = setup_with_pool(1, pool);
+    let acc = MemPoolAccept::new(&cs, &pool);
+    let (op, v) = coins[0].clone();
+    let parent = mk(2, &[(op, false)], vec![(v, wsh_op_true())]); // 0 fee
+    let child = mk(2, &[(out(&parent, 0), false)], vec![(v - 2_000, wsh_op_true())]);
+    let e = acc.accept_single(&parent, true).unwrap_err();
+    assert_eq!(e.reason, "min relay fee not met");
+    assert!(e.reconsiderable);
+    // Test accept judges members on their own feerate (Core).
+    let (err, _) = acc.accept_package(&[parent.clone(), child.clone()], true);
+    assert!(err.is_some());
+    // Submission uses the package feerate.
+    let (err, res) = acc.accept_package(&[parent.clone(), child.clone()], false);
+    assert!(err.is_none(), "{:?}", res);
+    let p = res[0].as_ref().unwrap();
+    assert_eq!(p.effective_includes, vec![parent.wtxid().to_hex(), child.wtxid().to_hex()]);
+    assert_eq!(p.effective_feerate, res[1].as_ref().unwrap().effective_feerate);
+    assert_eq!(pool.size(), 2);
+}
+
+#[test]
+fn test_package_rbf_one_parent_one_child() {
+    let (cs, pool, coins) = setup(2);
+    let acc = MemPoolAccept::new(&cs, &pool);
+    let (op, v) = coins[0].clone();
+    let original = mk(2, &[(op.clone(), false)], vec![(v - 5_000, wsh_op_true())]);
+    acc.accept_single(&original, false).unwrap();
+
+    // Replacement parent pays less than the original on its own...
+    let new_parent = mk(2, &[(op.clone(), false)], vec![(v - 100, wsh_op_true())]);
+    assert!(acc.accept_single(&new_parent, true).unwrap_err().reconsiderable);
+    // ...a child that does not pay enough for both fails package RBF.
+    let cheap_child = mk(2, &[(out(&new_parent, 0), false)], vec![(v - 100 - 1_000, wsh_op_true())]);
+    let (err, res) = acc.accept_package(&[new_parent.clone(), cheap_child], false);
+    assert!(err.is_some());
+    assert_eq!(res[1].as_ref().unwrap_err().reason, "package RBF failed");
+    assert!(pool.exists(original.txid()));
+
+    // A child paying for the package replaces the original.
+    let child = mk(2, &[(out(&new_parent, 0), false)], vec![(v - 100 - 20_000, wsh_op_true())]);
+    let (err, res) = acc.accept_package(&[new_parent.clone(), child.clone()], false);
+    assert!(err.is_none(), "{:?}", res);
+    assert_eq!(res[0].as_ref().unwrap().replaced, vec![*original.txid()]);
+    assert!(!pool.exists(original.txid()));
+    assert!(pool.exists(new_parent.txid()) && pool.exists(child.txid()));
+}
+
+#[test]
+fn test_output_standardness_and_datacarrier() {
+    use qubitcoin_node::mempool::{FeeRate, MempoolPolicy};
+    let (cs, pool, coins) = setup(1);
+    let acc = MemPoolAccept::new(&cs, &pool);
+    let (op, v) = coins[0].clone();
+    let bare = mk(2, &[(op.clone(), false)], vec![(v - 1_000, Script::from_bytes(vec![0x51, 0x51, 0x93]))]);
+    assert_eq!(acc.accept_single(&bare, true).unwrap_err().reason, "scriptpubkey");
+    let mut data = vec![0x6a, 0x4c, 200];
+    data.extend([7u8; 200]);
+    let with_data = mk(2, &[(op.clone(), false)], vec![(v - 1_000, wsh_op_true()), (0, Script::from_bytes(data))]);
+    acc.accept_single(&with_data, true).unwrap();
+    let strict = TxMemPool::new_with_options(
+        FeeRate::new(0),
+        300_000_000,
+        MempoolPolicy { max_datacarrier_bytes: Some(83), permit_bare_multisig: true },
+    );
+    let acc2 = MemPoolAccept::new(&cs, &strict);
+    assert_eq!(acc2.accept_single(&with_data, true).unwrap_err().reason, "datacarrier");
+}
+
+#[test]
+fn test_bip68_relative_lock() {
+    let (mut cs, pool, coins) = setup(1);
+    // Confirm a fresh coin at the next height, then spend it with a
+    // 5-block relative lock.
+    let (op, v) = coins[0].clone();
+    let parent = mk(2, &[(op, false)], vec![(v - 1_000, wsh_op_true())]);
+    MemPoolAccept::new(&cs, &pool).accept_single(&parent, false).unwrap();
+    mine(&mut cs, &pool);
+    let mut locked = (*mk(2, &[(out(&parent, 0), false)], vec![(v - 2_000, wsh_op_true())])).clone();
+    locked.vin[0].sequence = 5;
+    let locked = Arc::new(Transaction::new(2, locked.vin, locked.vout, 0));
+    assert_eq!(
+        MemPoolAccept::new(&cs, &pool).accept_single(&locked, true).unwrap_err().reason,
+        "non-BIP68-final"
+    );
+    for _ in 0..4 {
+        mine(&mut cs, &pool);
+    }
+    MemPoolAccept::new(&cs, &pool).accept_single(&locked, true).unwrap();
 }

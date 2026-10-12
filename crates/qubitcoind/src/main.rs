@@ -533,7 +533,31 @@ async fn main() {
     tracing::info!(height = chainstate.lock().height(), "chain initialized");
 
     // 7. Initialize mempool
-    let mempool = Arc::new(TxMemPool::new());
+    // Relay policy (Core semantics; amounts in BTC/kvB). The relay floor
+    // stays 0 by default on this node.
+    let parse_rate = |key: &str| -> Option<qubitcoin_node::mempool::FeeRate> {
+        args.get_arg(key)
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|f| qubitcoin_node::mempool::FeeRate::new((f * 100_000_000.0).round() as i64))
+    };
+    let min_relay_fee = parse_rate("minrelaytxfee").unwrap_or(mempool::DEFAULT_MIN_RELAY_TX_FEE);
+    let max_mempool = args
+        .get_int_arg("maxmempool")
+        .map(|mb| (mb.max(5) as usize) * 1_000_000)
+        .unwrap_or(mempool::DEFAULT_MAX_MEMPOOL_SIZE);
+    let policy = mempool::MempoolPolicy {
+        max_datacarrier_bytes: if args.is_set("datacarrier") && !args.get_bool_arg("datacarrier") {
+            None
+        } else {
+            Some(
+                args.get_int_arg("datacarriersize")
+                    .map(|n| n.max(0) as usize)
+                    .unwrap_or(mempool::DEFAULT_MAX_DATACARRIER_BYTES),
+            )
+        },
+        permit_bare_multisig: !args.is_set("permitbaremultisig") || args.get_bool_arg("permitbaremultisig"),
+    };
+    let mempool = Arc::new(TxMemPool::new_with_options(min_relay_fee, max_mempool, policy));
     tracing::info!(size = mempool.size(), "mempool initialized");
 
     // 7b. Initialize wallet — load from disk if available, else create new.
@@ -1914,6 +1938,11 @@ fn print_usage() {
     println!("  -blockmaxweight=<n> Max block weight to mine (default: 3996000)");
     println!("  -blockmintxfee=<amt> Min fee rate (BTC/kvB) for mined txs (default: 0)");
     println!("  -blocknotify=<cmd> Run cmd when the best block changes (%s = hash)");
+    println!("  -minrelaytxfee=<amt> Min relay fee rate in BTC/kvB (default: 0)");
+    println!("  -maxmempool=<n>    Max mempool size in MB (default: 300)");
+    println!("  -datacarrier=<0|1> Relay/mine OP_RETURN outputs (default: 1)");
+    println!("  -datacarriersize=<n> Max total OP_RETURN scriptPubKey bytes per tx (default: 100000)");
+    println!("  -permitbaremultisig=<0|1> Relay bare multisig outputs (default: 1)");
     println!("  -zmqpubhashblock=<address>  Publish block hashes (e.g. tcp://127.0.0.1:28332)");
     println!("  -zmqpubrawblock=<address>   Publish raw blocks");
     println!("  -zmqpubhashtx=<address>     Publish transaction hashes");

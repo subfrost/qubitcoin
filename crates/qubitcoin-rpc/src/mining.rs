@@ -859,6 +859,16 @@ fn prioritisetransaction(ctx: &MiningContext, req: &RpcRequest) -> RpcResponse {
         Some(d) => d,
         None => return RpcResponse::error(id, RPC_TYPE_ERROR, "fee_delta must be an integer".into()),
     };
+    // Core v29: ephemeral dust must stay zero-fee, so no deltas for it.
+    if let Some(tx) = ctx.mempool.get(&txid) {
+        if qubitcoin_node::ephemeral_policy::has_dust(&tx, qubitcoin_node::mempool::DUST_RELAY_TX_FEE) {
+            return RpcResponse::error(
+                id,
+                RPC_INVALID_PARAMETER,
+                "Priority is not supported for transactions with dust outputs.".into(),
+            );
+        }
+    }
     ctx.mempool.prioritise_transaction(&txid, delta);
     RpcResponse::success(id, json!(true))
 }
@@ -1321,6 +1331,32 @@ mod tests {
         // Cancelling the delta removes the entry.
         ok(call(&r, "prioritisetransaction", json!([txid.clone(), 0, -1300])));
         assert_eq!(ok(call(&r, "getprioritisedtransactions", json!([]))), json!({}));
+    }
+
+    #[test]
+    fn test_prioritisetransaction_refuses_dusty_tx() {
+        use qubitcoin_consensus::transaction::{OutPoint, Transaction, TxIn, TxOut};
+        use qubitcoin_primitives::Amount;
+        let ctx = regtest_ctx();
+        let r = registry(&ctx);
+        let tx = Arc::new(Transaction::new(
+            3,
+            vec![TxIn::new(OutPoint::new(Txid::from_bytes([4; 32]), 0), Script::new(), 0)],
+            vec![TxOut::new(Amount::ZERO, Script::from_bytes(vec![0x51, 0x02, 0x4e, 0x73]))],
+            0,
+        ));
+        ctx.mempool.add_unchecked(qubitcoin_node::mempool::MempoolEntry::new(
+            tx.clone(),
+            Amount::ZERO,
+            60,
+            0,
+            0,
+            false,
+            0,
+        ));
+        let e = call(&r, "prioritisetransaction", json!([tx.txid().to_hex(), 0, 1000])).error.unwrap();
+        assert_eq!(e.code, RPC_INVALID_PARAMETER);
+        assert_eq!(e.message, "Priority is not supported for transactions with dust outputs.");
     }
 
     #[test]

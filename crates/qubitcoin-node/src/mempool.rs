@@ -472,6 +472,33 @@ pub struct TxMemPool {
     deltas: RwLock<HashMap<Txid, i64>>,
     /// Optional change listener (ZMQ, notifications).
     listener: RwLock<Option<MempoolEventListener>>,
+    /// Standardness options (`-datacarrier*`, `-permitbaremultisig`).
+    policy: MempoolPolicy,
+}
+
+/// Default `-datacarriersize`: Core v30's `MAX_OP_RETURN_RELAY` (the
+/// standard transaction weight limit, i.e. no separate cap), with any
+/// number of `OP_RETURN` outputs.
+pub const DEFAULT_MAX_DATACARRIER_BYTES: usize = 100_000;
+
+/// Standardness options for mempool acceptance (Core's `MemPoolOptions`
+/// subset).
+#[derive(Debug, Clone)]
+pub struct MempoolPolicy {
+    /// Total `OP_RETURN` scriptPubKey bytes allowed per transaction; `None`
+    /// disables data carrier outputs (`-datacarrier=0`).
+    pub max_datacarrier_bytes: Option<usize>,
+    /// Accept bare (non-P2SH) multisig outputs (`-permitbaremultisig`).
+    pub permit_bare_multisig: bool,
+}
+
+impl Default for MempoolPolicy {
+    fn default() -> Self {
+        MempoolPolicy {
+            max_datacarrier_bytes: Some(DEFAULT_MAX_DATACARRIER_BYTES),
+            permit_bare_multisig: true,
+        }
+    }
 }
 
 impl TxMemPool {
@@ -495,7 +522,29 @@ impl TxMemPool {
             transactions_updated: AtomicU64::new(0),
             deltas: RwLock::new(HashMap::new()),
             listener: RwLock::new(None),
+            policy: MempoolPolicy::default(),
         }
+    }
+
+    /// A mempool with explicit relay floor, size limit and standardness
+    /// options (`-minrelaytxfee`, `-maxmempool`, `-datacarrier*`,
+    /// `-permitbaremultisig`).
+    pub fn new_with_options(min_relay_fee: FeeRate, max_size: usize, policy: MempoolPolicy) -> Self {
+        let mut p = Self::new_with_limits(min_relay_fee, max_size);
+        p.policy = policy;
+        p
+    }
+
+    /// Standardness options.
+    pub fn policy(&self) -> &MempoolPolicy {
+        &self.policy
+    }
+
+    /// All in-mempool descendants of `txid` (not including itself).
+    pub fn descendants_of(&self, txid: &Txid) -> Vec<Txid> {
+        let entries = self.entries.read();
+        let spenders = self.spenders.read();
+        self.collect_descendants_locked(&entries, &spenders, txid)
     }
 
     /// Install (or clear) the listener that receives [`MempoolEvent`]s.

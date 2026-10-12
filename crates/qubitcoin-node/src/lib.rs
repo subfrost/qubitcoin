@@ -48,6 +48,10 @@ pub mod ephemeral_policy;
 /// Equivalent to the mempool half of `validation.cpp` in Bitcoin Core.
 pub mod mempool_accept;
 
+/// Transaction standardness (`Solver`, `IsStandard`). Equivalent to
+/// `src/script/solver.cpp` + the output half of `src/policy/policy.cpp`.
+pub mod policy;
+
 /// TRUC (v3) transaction policy. Equivalent to `src/policy/truc_policy.cpp`.
 pub mod truc_policy;
 

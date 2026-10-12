@@ -320,17 +320,9 @@ fn submitpackage(ctx: &MempoolRpcContext, req: &RpcRequest) -> RpcResponse {
         (pre_err, Vec::new())
     } else if let Some(i) = too_rich {
         let mut res = pre;
-        res[i] = Err(TxRejection {
-            reason: "max feerate exceeded".into(),
-            details: String::new(),
-            missing_inputs: false,
-        });
+        res[i] = Err(TxRejection::new("max feerate exceeded", ""));
         (
-            Some(TxRejection {
-                reason: "transaction failed".into(),
-                details: String::new(),
-                missing_inputs: false,
-            }),
+            Some(TxRejection::new("transaction failed", "")),
             res,
         )
     } else {
