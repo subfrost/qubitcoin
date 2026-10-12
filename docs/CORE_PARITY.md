@@ -117,10 +117,10 @@ regtest — but it is the machinery any future soft fork needs, and it is what
 
 | Gap | Core reference | Why it matters |
 | --- | --- | --- |
-| **TRUC / v3 transactions (BIP431)** | `src/policy/truc_policy.cpp` | Relay policy Core has enforced since v28. A TRUC-shaped package is relayed by the network but not by this node, and vice versa. |
-| **Package relay and package validation** | `src/policy/packages.cpp`, `validation.cpp` | `submitpackage`, 1P1C relay, and package RBF. Increasingly how real fee-bumping works. |
+| ~~**TRUC / v3 transactions (BIP431)**~~ | `src/policy/truc_policy.cpp` | Ported (`qubitcoin-node::truc_policy`, incl. sibling eviction); see `docs/MINING.md`. |
+| **Package relay** (validation done) | `src/policy/packages.cpp`, `validation.cpp` | Package validation, `submitpackage`, package-feerate CPFP and 1P1C package RBF are ported (`docs/MINING.md`); P2P 1P1C package *relay* (orphan resolution, `txdownloadman`) is not. |
 | **Cluster mempool (`cluster_linearize`, `txgraph`)** | `src/cluster_linearize.h`, `src/txgraph.cpp` | The v30 mempool rework. Large, self-contained, and changes eviction and mining order. Expect this to keep moving upstream. |
-| **Ephemeral dust** | `src/policy/ephemeral_policy.cpp` | Only a single marker present. Needed for TRUC-based fee-bumping patterns. |
+| ~~**Ephemeral dust**~~ | `src/policy/ephemeral_policy.cpp` | Ported (`qubitcoin-node::ephemeral_policy`, P2A included); see `docs/MINING.md`. |
 | **Miniscript** | `src/script/miniscript.h` | Descriptor support exists, but without miniscript the descriptor language is a strict subset of Core's. |
 
 ### Tier 3 — features and interoperability
