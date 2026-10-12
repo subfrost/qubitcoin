@@ -814,6 +814,20 @@ async fn main() {
         rpc_password: args.get_arg("rpcpassword").map(|s| s.to_string()),
     };
 
+    // Block assembler policy (-blockmaxweight, -blockmintxfee in BTC/kvB),
+    // as Core's `ApplyArgsManOptions` for `BlockAssembler::Options`.
+    let miner_options = {
+        let mut o = qubitcoin_node::miner::BlockAssemblerOptions::default();
+        if let Some(w) = args.get_int_arg("blockmaxweight") {
+            o.block_max_weight = w.max(0) as u64;
+        }
+        if let Some(fee) = args.get_arg("blockmintxfee").and_then(|v| v.parse::<f64>().ok()) {
+            o.block_min_fee_rate =
+                qubitcoin_node::mempool::FeeRate::new((fee * 100_000_000.0).round() as i64);
+        }
+        o
+    };
+
     let mut registry = RpcRegistry::new();
     register_node_rpcs(&mut registry, node_state.clone());
 
@@ -865,9 +879,7 @@ async fn main() {
     // Register real generatetoaddress for regtest mining.
     if network == Network::Regtest {
         use qubitcoin_rpc::server::{RpcRequest, RpcResponse, RPC_INVALID_PARAMS, RPC_MISC_ERROR};
-        use qubitcoin_consensus::merkle::block_merkle_root;
-        use qubitcoin_consensus::check::get_block_subsidy;
-        use qubitcoin_consensus::transaction::{Transaction, TxIn, TxOut, OutPoint, Witness, TransactionRef, SEQUENCE_FINAL};
+        use qubitcoin_node::miner::BlockAssembler;
         use qubitcoin_primitives::ArithUint256;
         use qubitcoin_primitives::arith_uint256::uint256_to_arith;
 
@@ -877,9 +889,9 @@ async fn main() {
         let ns_gen = node_state.clone();
         let im_gen = indexer_manager.clone();
         let mp_gen = mempool.clone();
-        let params_gen = params.clone();
         let magic_gen = magic_bytes;
         let bi_db_gen = block_index_db.clone();
+        let miner_opts_gen = miner_options.clone();
 
         registry.register("generatetoaddress", move |req: &RpcRequest| {
             let params_arr = match req.params.as_ref().and_then(|p| p.as_array()) {
@@ -925,167 +937,41 @@ async fn main() {
             for _ in 0..nblocks {
                 let mut cs = cs_gen.lock();
                 let height = cs.height() + 1;
-                let subsidy = get_block_subsidy(height, &params_gen.consensus);
 
-                // Collect mempool transactions in topological order (parents before children).
-                // This ensures intra-block spend chains (commit→reveal) are valid.
-                let mempool_txids = mp_gen.get_txids();
-                let mut all_mempool: Vec<TransactionRef> = Vec::new();
-                for txid in &mempool_txids {
-                    if let Some(tx) = mp_gen.get(txid) {
-                        all_mempool.push(tx);
-                    }
-                }
-                // Topological sort: a tx goes after any tx whose output it spends.
-                let mempool_txid_set: std::collections::HashSet<Txid> = all_mempool.iter().map(|tx| *tx.txid()).collect();
-                let mut user_txs: Vec<TransactionRef> = Vec::new();
-                let mut placed: std::collections::HashSet<Txid> = std::collections::HashSet::new();
-                let mut remaining = all_mempool.clone();
-                let max_iters = remaining.len() * 2 + 1;
-                for _ in 0..max_iters {
-                    if remaining.is_empty() { break; }
-                    let mut next_remaining = Vec::new();
-                    for tx in &remaining {
-                        let deps_met = tx.vin.iter().all(|input| {
-                            !mempool_txid_set.contains(&input.prevout.hash) || placed.contains(&input.prevout.hash)
-                        });
-                        if deps_met {
-                            placed.insert(*tx.txid());
-                            user_txs.push(tx.clone());
-                        } else {
-                            next_remaining.push(tx.clone());
-                        }
-                    }
-                    if next_remaining.len() == remaining.len() {
-                        // Circular dependency or unresolvable — add remaining as-is
-                        user_txs.extend(next_remaining);
-                        break;
-                    }
-                    remaining = next_remaining;
-                }
-                let mut has_witness = false;
-                for tx in &user_txs {
-                    for input in &tx.vin {
-                        if !input.witness.is_empty() {
-                            has_witness = true;
-                        }
-                    }
-                }
-
-                // Create coinbase with optional witness commitment (BIP141).
-                let mut sig_script = qubitcoin_script::Script::new();
-                sig_script.push_int(height as i64);
-                if sig_script.len() < 2 { sig_script.push_int(0); }
-
-                let mut coinbase_outputs = vec![TxOut::new(subsidy, coinbase_script.clone())];
-                let mut coinbase_witness = Witness::new();
-
-                if has_witness {
-                    // Compute witness commitment for BIP141.
-                    // witness_root = merkle_root of all wtxids (coinbase wtxid = 0x00..00)
-                    use qubitcoin_crypto::hash::hash256;
-                    let mut witness_hashes: Vec<Uint256> = Vec::new();
-                    witness_hashes.push(Uint256::default()); // coinbase wtxid = 0
-                    for tx in &user_txs {
-                        witness_hashes.push(tx.wtxid().into_uint256());
-                    }
-                    // Simple merkle root of witness hashes
-                    let mut level = witness_hashes;
-                    while level.len() > 1 {
-                        let mut next = Vec::new();
-                        for i in (0..level.len()).step_by(2) {
-                            let left = &level[i];
-                            let right = if i + 1 < level.len() { &level[i + 1] } else { &level[i] };
-                            let mut combined = [0u8; 64];
-                            combined[..32].copy_from_slice(left.as_bytes());
-                            combined[32..].copy_from_slice(right.as_bytes());
-                            let hash = hash256(&combined);
-                            next.push(Uint256::from_bytes(hash));
-                        }
-                        level = next;
-                    }
-                    let witness_root = if level.is_empty() { Uint256::default() } else { level[0] };
-
-                    // witness_commitment = SHA256d(witness_root || witness_nonce)
-                    // witness_nonce = 0x00..00 (32 bytes)
-                    let witness_nonce = [0u8; 32];
-                    let mut commitment_preimage = [0u8; 64];
-                    commitment_preimage[..32].copy_from_slice(witness_root.as_bytes());
-                    commitment_preimage[32..].copy_from_slice(&witness_nonce);
-                    let witness_commitment = hash256(&commitment_preimage);
-
-                    // Add OP_RETURN output with witness commitment
-                    // Format: OP_RETURN OP_PUSHBYTES_36 0xaa21a9ed <32-byte commitment>
-                    let mut commitment_script = Vec::with_capacity(38);
-                    commitment_script.push(0x6a); // OP_RETURN
-                    commitment_script.push(0x24); // OP_PUSHBYTES_36
-                    commitment_script.extend_from_slice(&[0xaa, 0x21, 0xa9, 0xed]); // witness magic
-                    commitment_script.extend_from_slice(&witness_commitment);
-                    coinbase_outputs.push(TxOut::new(
-                        qubitcoin_primitives::Amount::from_sat(0),
-                        qubitcoin_script::Script::from(commitment_script),
-                    ));
-
-                    // Coinbase witness: single 32-byte zero nonce
-                    coinbase_witness.stack.push(witness_nonce.to_vec());
-                }
-
-                let coinbase_tx = Transaction::new(
-                    2,
-                    vec![TxIn { prevout: OutPoint::null(), script_sig: sig_script, sequence: SEQUENCE_FINAL, witness: coinbase_witness }],
-                    coinbase_outputs,
-                    0,
-                );
-                let coinbase_ref: TransactionRef = Arc::new(coinbase_tx);
-                let mut all_txs = vec![coinbase_ref];
-                all_txs.extend(user_txs);
-
-                // Compute merkle root.
-                let mut mutated = false;
-                let merkle_root = block_merkle_root(&all_txs, &mut mutated);
-
-                // Build header.
-                let prev_hash = match cs.tip() {
-                    Some(t) => cs.block_index().get(t).block_hash,
-                    None => {
-                        // Genesis block hash for regtest
-                        BlockHash::from_hex("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206").unwrap()
+                // Assemble the block: ancestor-feerate package selection,
+                // weight/sigop limits, BIP34 coinbase and witness commitment.
+                // Maps to: `GenerateBlock()` -> `BlockAssembler::CreateNewBlock()`
+                // in Core's rpc/mining.cpp.
+                let tmpl = match BlockAssembler::new(&cs, Some(&mp_gen), miner_opts_gen.clone())
+                    .create_new_block(&coinbase_script)
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!(height = height, error = %e, "block assembly failed");
+                        return RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, e.to_string());
                     }
                 };
+                let mut block = tmpl.block;
+                let prev_hash = block.header.prev_blockhash;
+
+                // Strictly increasing timestamps so back-to-back regtest
+                // blocks never collide (and always exceed the parent's MTP).
                 last_time += 1;
                 let time = last_time;
-                let bits = {
-                    let arith = uint256_to_arith(&params_gen.consensus.pow_limit);
-                    arith.get_compact(false)
-                };
-
-                // Block version: BIP9. Signals for any deployment currently in
-                // STARTED or LOCKED_IN, and otherwise is just VERSIONBITS_TOP_BITS.
-                //
-                // Maps to: `BlockAssembler::CreateNewBlock`'s
-                // `pblock->nVersion = m_chainman.m_versionbitscache.ComputeBlockVersion(...)`.
-                let version = {
-                    let mut vb_cache = qubitcoin_common::versionbits::VersionBitsCache::new();
-                    vb_cache.compute_block_version(
-                        cs.block_index().as_slice(),
-                        cs.tip(),
-                        &params_gen.consensus,
-                    )
-                };
-
-                let mut header = BlockHeader { version, prev_blockhash: prev_hash, merkle_root, time, bits, nonce: 0 };
+                block.header.time = time;
+                if let Some(tip) = cs.tip() {
+                    block.header.bits = cs.next_work_required(tip, time);
+                }
 
                 // Solve PoW (trivial on regtest).
                 let mut target = ArithUint256::zero();
-                target.set_compact(header.bits);
+                target.set_compact(block.header.bits);
                 loop {
-                    let hash = header.block_hash();
+                    let hash = block.header.block_hash();
                     let hash_arith = uint256_to_arith(&hash.into_uint256());
                     if hash_arith <= target { break; }
-                    header.nonce = header.nonce.wrapping_add(1);
+                    block.header.nonce = block.header.nonce.wrapping_add(1);
                 }
-
-                let block = Block { header: header.clone(), vtx: all_txs };
                 let block_hash = block.header.block_hash();
 
                 // Serialize and process through chainstate.
@@ -1129,10 +1015,8 @@ async fn main() {
                         // Update RPC state.
                         *ns_gen.chain_height.write() = height;
                         *ns_gen.best_block_hash.write() = block_hash.to_hex();
-                        // Remove included txs from mempool.
-                        if !mempool_txids.is_empty() {
-                            mp_gen.remove_for_block(&mempool_txids);
-                        }
+                        // Remove included (and conflicting) txs from mempool.
+                        mp_gen.remove_for_block_txs(&block.vtx);
                     }
                     Ok((false, _)) => {
                         return RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, "block not accepted".into());

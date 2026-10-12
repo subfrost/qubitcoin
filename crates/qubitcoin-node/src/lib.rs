@@ -41,6 +41,10 @@ pub mod chainstate;
 /// Equivalent to `CTxMemPool` in Bitcoin Core.
 pub mod mempool;
 
+/// Block template assembly (`BlockAssembler`).
+/// Equivalent to `src/node/miner.cpp` in Bitcoin Core.
+pub mod miner;
+
 /// Memory-mapped block file I/O for zero-copy reads.
 /// An improvement over Bitcoin Core's standard file I/O approach.
 #[cfg(feature = "filesystem")]
