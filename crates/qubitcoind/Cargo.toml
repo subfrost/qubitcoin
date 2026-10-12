@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 description = "Qubitcoin daemon: full node implementation"
 
+[features]
+default = ["zmq"]
+# ZMQ publishers (-zmqpub*), on the pure-Rust `zeromq` crate.
+zmq = ["dep:zeromq", "dep:bytes"]
+
 [[bin]]
 name = "qubitcoind"
 path = "src/main.rs"
@@ -29,3 +34,5 @@ tokio = { workspace = true }
 parking_lot = { workspace = true }
 serde_json = { workspace = true }
 bech32 = "0.11"
+zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"], optional = true }
+bytes = { version = "1", optional = true }

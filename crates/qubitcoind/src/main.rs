@@ -3,6 +3,8 @@
 
 mod chain_events;
 mod notify;
+#[cfg(feature = "zmq")]
+mod zmq;
 
 use qubitcoin_common::chainparams::{ChainParams, Network};
 use qubitcoin_common::coins::{CoinsView, CoinsViewDB, FlushableCoinsView};
@@ -809,8 +811,33 @@ async fn main() {
     }
 
     // 8b. Tip-change fan-out shared by P2P, submitblock and generate.
+    #[cfg(feature = "zmq")]
+    let zmq_notifier = {
+        let cfgs = zmq::configs_from_args(|k| args.get_args(k).into_iter().map(|s| s.to_string()).collect());
+        if cfgs.is_empty() {
+            None
+        } else {
+            match zmq::ZmqNotifier::start(&cfgs).await {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    // Core: InitError("Unable to initialize ZMQ ...").
+                    tracing::error!(error = %e, "Unable to initialize ZMQ notifications");
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+    #[cfg(not(feature = "zmq"))]
+    for topic in ["hashblock", "hashtx", "rawblock", "rawtx", "sequence"] {
+        if !args.get_args(&format!("zmqpub{}", topic)).is_empty() {
+            tracing::error!("-zmqpub{} given but qubitcoind was built without the zmq feature", topic);
+            std::process::exit(1);
+        }
+    }
     let notifications = Arc::new(notify::Notifications {
         block_notify: args.get_arg("blocknotify").map(|s| s.to_string()),
+        #[cfg(feature = "zmq")]
+        zmq: zmq_notifier,
     });
     {
         let n = notifications.clone();
@@ -2170,4 +2197,9 @@ fn print_usage() {
     println!("  -blockmaxweight=<n> Max block weight to mine (default: 3996000)");
     println!("  -blockmintxfee=<amt> Min fee rate (BTC/kvB) for mined txs (default: 0)");
     println!("  -blocknotify=<cmd> Run cmd when the best block changes (%s = hash)");
+    println!("  -zmqpubhashblock=<address>  Publish block hashes (e.g. tcp://127.0.0.1:28332)");
+    println!("  -zmqpubrawblock=<address>   Publish raw blocks");
+    println!("  -zmqpubhashtx=<address>     Publish transaction hashes");
+    println!("  -zmqpubrawtx=<address>      Publish raw transactions");
+    println!("  -zmqpubsequence=<address>   Publish block connect + mempool accept/remove events");
 }

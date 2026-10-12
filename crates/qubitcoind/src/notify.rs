@@ -1,7 +1,8 @@
 //! External notifications: `-blocknotify` and ZMQ publishers.
 //!
 //! Port of the `-blocknotify` handler in Bitcoin Core's `init.cpp`
-//! (`NotifyBlockTip` -> `runCommand`).
+//! (`NotifyBlockTip` -> `runCommand`), plus the ZMQ publishers of
+//! `src/zmq/` (see `crate::zmq`, built with the `zmq` feature).
 
 use qubitcoin_consensus::block::Block;
 use qubitcoin_node::mempool::MempoolEvent;
@@ -26,6 +27,9 @@ fn run_block_notify(template: &str, hash: &BlockHash) {
 pub struct Notifications {
     /// `-blocknotify=<cmd>`.
     pub block_notify: Option<String>,
+    /// ZMQ publishers (`-zmqpub*`).
+    #[cfg(feature = "zmq")]
+    pub zmq: Option<std::sync::Arc<crate::zmq::ZmqNotifier>>,
 }
 
 impl Notifications {
@@ -38,11 +42,19 @@ impl Notifications {
                 run_block_notify(cmd, &hash);
             }
         }
+        #[cfg(feature = "zmq")]
+        if let Some(z) = &self.zmq {
+            z.block_connected(block, hash, initial_download);
+        }
         let _ = block;
     }
 
     /// Mempool listener entry point.
     pub fn mempool_event(&self, event: &MempoolEvent) {
+        #[cfg(feature = "zmq")]
+        if let Some(z) = &self.zmq {
+            z.mempool_event(event);
+        }
         let _ = event;
     }
 }
