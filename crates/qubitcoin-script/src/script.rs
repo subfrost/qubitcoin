@@ -51,6 +51,9 @@ pub const VALIDATION_WEIGHT_PER_SIGOP_PASSED: i64 = 50;
 /// BIP 342 validation weight offset added to the witness size budget (50).
 pub const VALIDATION_WEIGHT_OFFSET: i64 = 50;
 
+/// The Pay-to-Anchor scriptPubKey `OP_1 PUSH2 0x4e73` (Core v28 `IsPayToAnchor`).
+pub const PAY_TO_ANCHOR_SCRIPT: [u8; 4] = [0x51, 0x02, 0x4e, 0x73];
+
 /// Bitcoin Script -- a sequence of opcodes and data pushes stored as a byte vector.
 ///
 /// Port of Bitcoin Core's `CScript` (derived from `CScriptBase`).
@@ -289,6 +292,20 @@ impl Script {
         };
 
         Some((version, &self.data[2..]))
+    }
+
+    /// Returns `true` if this is a Pay-to-Anchor (P2A) output: `OP_1 <0x4e73>`.
+    ///
+    /// Port of Bitcoin Core's `CScript::IsPayToAnchor()` (script/script.cpp,
+    /// v28): a keyless anchor, standard to create and to spend with an empty
+    /// witness.
+    pub fn is_pay_to_anchor(&self) -> bool {
+        self.data == PAY_TO_ANCHOR_SCRIPT
+    }
+
+    /// `IsPayToAnchor(version, program)` for an already-decoded witness program.
+    pub fn is_pay_to_anchor_program(version: u8, program: &[u8]) -> bool {
+        version == 1 && program == &PAY_TO_ANCHOR_SCRIPT[2..]
     }
 
     /// Returns `true` if this is a Pay-to-Witness-Public-Key-Hash (P2WPKH) script.
@@ -568,6 +585,16 @@ pub fn build_op_return(data: &[u8]) -> Script {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pay_to_anchor_detection() {
+        let p2a = Script::from_bytes(PAY_TO_ANCHOR_SCRIPT.to_vec());
+        assert!(p2a.is_pay_to_anchor());
+        assert_eq!(p2a.is_witness_program(), Some((1, &[0x4e, 0x73][..])));
+        assert!(Script::is_pay_to_anchor_program(1, &[0x4e, 0x73]));
+        assert!(!Script::is_pay_to_anchor_program(0, &[0x4e, 0x73]));
+        assert!(!Script::from_bytes(vec![0x51, 0x02, 0x4e, 0x74]).is_pay_to_anchor());
+    }
 
     #[test]
     fn test_p2pkh_detection() {

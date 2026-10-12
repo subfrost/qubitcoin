@@ -19,6 +19,10 @@
 
 /// HTTP/1.1 server that accepts JSON-RPC requests over TCP with optional Basic Auth.
 pub mod http_server;
+/// Transaction submission RPCs (`sendrawtransaction`, `testmempoolaccept`, `submitpackage`).
+pub mod mempool_rpc;
+/// Mining RPCs (`getblocktemplate`, `submitblock`, ...): port of Core's rpc/mining.cpp.
+pub mod mining;
 /// Stub implementations of all RPC methods (blockchain, mining, network, mempool, utility).
 pub mod methods;
 /// RPC method handlers wired to shared, mutable `NodeState` for live node data.

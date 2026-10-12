@@ -1,6 +1,11 @@
 //! Qubitcoind: The Qubitcoin daemon.
 //! A production-ready Bitcoin-compatible full node.
 
+mod chain_events;
+mod notify;
+#[cfg(feature = "zmq")]
+mod zmq;
+
 use qubitcoin_common::chainparams::{ChainParams, Network};
 use qubitcoin_common::coins::{CoinsView, CoinsViewDB, FlushableCoinsView};
 use qubitcoin_consensus::block::{Block, BlockHeader};
@@ -99,22 +104,11 @@ struct LiveNodeInterface {
     chainstate: Arc<parking_lot::Mutex<ChainstateManager>>,
     mempool: Arc<TxMemPool>,
     block_files: Arc<NodeBlockFileManager>,
-    coins_db: Arc<CoinsViewDB<RocksDatabase>>,
-    block_index_db: Arc<BlockIndexDB<RocksDatabase>>,
-    tx_index_db: Arc<TxIndexDB<RocksDatabase>>,
     node_state: Arc<NodeState>,
-    /// Network magic bytes for block serialization.
-    magic_bytes: [u8; 4],
-    /// Counter for periodic UTXO flushes during IBD.
-    blocks_since_flush: parking_lot::Mutex<u64>,
-    /// Maximum UTXO cache size in bytes (from -dbcache).
-    dbcache_limit: u64,
     /// Tracks IBD progress for logging blocks/sec and ETA.
     ibd_tracker: parking_lot::Mutex<IbdTracker>,
-    /// Pending TX index entries accumulated between flushes.
-    pending_tx_index: parking_lot::Mutex<Vec<(Txid, i32, u32, u32)>>,
-    /// Optional in-process WASM secondary indexer manager.
-    indexer_manager: Option<Arc<IndexerManager>>,
+    /// Shared block storage + ProcessNewBlock + persistence + events.
+    processor: Arc<chain_events::BlockProcessor>,
 }
 
 /// Tracks IBD (Initial Block Download) progress for logging.
@@ -125,126 +119,31 @@ struct IbdTracker {
 
 impl NodeInterface for LiveNodeInterface {
     fn process_block(&self, data: &[u8]) -> Result<bool, String> {
-        // Deserialize the block.
         let block: Block = deserialize(data).map_err(|e| format!("block deserialize: {}", e))?;
-        let block_hash = block.header.block_hash();
+        // Stored wherever it attaches; ActivateBestChain reorganises onto
+        // it if its chain has the most work (side-branch blocks and undo
+        // data are read back from disk).
+        let outcome = self.processor.process(&block, false).map_err(|e| format!("{:?}", e))?;
 
-        // Write block data to flat files using the typed BlockFileManager.
-        let pos = self
-            .block_files
-            .write_block(&block, self.magic_bytes)
-            .map_err(|e| format!("block file write: {}", e))?;
-
-        // Process through chainstate.
-        let (accepted, block_undo) = {
-            let mut cs = self.chainstate.lock();
-
-            // Update the block index entry with file position before processing.
-            if let Some(arena_idx) = cs.lookup_block_index(&block_hash) {
-                let idx = cs.block_index_mut().get_mut(arena_idx);
-                idx.file = pos.file;
-                idx.data_pos = pos.pos;
-                cs.mark_dirty(arena_idx);
-            }
-
-            cs.process_new_block(&block).map_err(|e| format!("{:?}", e))?
-        };
-
-        // Write undo data to disk and update block index with undo position.
-        if let Some(undo) = block_undo {
-            let undo_pos = self
-                .block_files
-                .write_undo(pos.file, &undo)
-                .map_err(|e| format!("undo file write: {}", e))?;
-            let mut cs = self.chainstate.lock();
-            cs.set_undo_pos(&block_hash, undo_pos.pos);
+        let height = *self.node_state.chain_height.read();
+        if outcome.in_active_chain && height % 1000 == 0 {
+            let mut tracker = self.ibd_tracker.lock();
+            let elapsed = tracker.last_log_time.elapsed();
+            let blocks_delta = height - tracker.last_log_height;
+            let blocks_per_sec = if elapsed.as_secs_f64() > 0.0 {
+                blocks_delta as f64 / elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
+            tracing::info!(
+                height = height,
+                blocks_per_sec = format!("{:.1}", blocks_per_sec),
+                "IBD progress"
+            );
+            tracker.last_log_time = std::time::Instant::now();
+            tracker.last_log_height = height;
         }
-
-        if accepted {
-            // Accumulate TX index entries for batched flush (avoids per-block RocksDB writes).
-            {
-                let mut pending = self.pending_tx_index.lock();
-                for (i, tx) in block.vtx.iter().enumerate() {
-                    pending.push((tx.txid().clone(), pos.file, pos.pos, i as u32));
-                }
-            }
-
-            let mut flush_count = self.blocks_since_flush.lock();
-            *flush_count += 1;
-
-            // Update RPC state.
-            let mut cs = self.chainstate.lock();
-            let height = cs.height();
-            let tip_hash = cs
-                .tip()
-                .map(|t| cs.block_index().get(t).block_hash.to_hex())
-                .unwrap_or_default();
-            *self.node_state.chain_height.write() = height;
-            *self.node_state.best_block_hash.write() = tip_hash;
-
-            // Log progress during IBD with blocks/sec and sync percentage.
-            if height % 1000 == 0 {
-                let cache_mb = cs.coins_tip().dynamic_memory_usage() / (1024 * 1024);
-                let mut tracker = self.ibd_tracker.lock();
-                let elapsed = tracker.last_log_time.elapsed();
-                let blocks_delta = height - tracker.last_log_height;
-                let blocks_per_sec = if elapsed.as_secs_f64() > 0.0 {
-                    blocks_delta as f64 / elapsed.as_secs_f64()
-                } else {
-                    0.0
-                };
-
-                // Estimate sync progress based on known mainnet height (~870,000 as of 2025).
-                let estimated_tip = 870_000i32;
-                let progress_pct = (height as f64 / estimated_tip as f64 * 100.0).min(100.0);
-
-                tracing::info!(
-                    height = height,
-                    blocks_per_sec = format!("{:.1}", blocks_per_sec),
-                    progress = format!("{:.2}%", progress_pct),
-                    cache_mb = cache_mb,
-                    "IBD progress"
-                );
-
-                tracker.last_log_time = std::time::Instant::now();
-                tracker.last_log_height = height;
-            }
-
-            // Notify secondary indexers of the new block.
-            if let Some(ref im) = self.indexer_manager {
-                im.on_block_connected(height as u32, data);
-            }
-
-            // Memory-bounded flush: trigger when block count threshold OR cache
-            // size exceeds the -dbcache limit (default 1024 MiB).
-            let cache_bytes = cs.coins_tip().dynamic_memory_usage();
-            let need_flush = *flush_count >= 2_000 || cache_bytes > self.dbcache_limit;
-
-            if need_flush {
-                let cache_mb = cache_bytes / (1024 * 1024);
-                tracing::info!(height = height, cache_mb = cache_mb, "flushing UTXO cache and block index");
-                cs.flush_coins(self.coins_db.as_ref());
-
-                // Persist block index.
-                let dirty = cs.dirty_block_indices();
-                let refs: Vec<&qubitcoin_common::chain::BlockIndex> = dirty.into_iter().collect();
-                self.block_index_db.write_block_indices(&refs);
-                cs.clear_dirty();
-
-                // Flush accumulated TX index entries.
-                {
-                    let mut pending = self.pending_tx_index.lock();
-                    if !pending.is_empty() {
-                        self.tx_index_db.write_tx_positions(&pending);
-                        pending.clear();
-                    }
-                }
-
-                *flush_count = 0;
-            }
-        }
-
-        Ok(accepted)
+        Ok(outcome.in_active_chain)
     }
 
     fn accept_block_header(&self, header_data: &[u8]) -> Result<bool, String> {
@@ -285,76 +184,22 @@ impl NodeInterface for LiveNodeInterface {
         let tx: qubitcoin_consensus::Transaction =
             deserialize(data).map_err(|e| format!("tx deserialize: {}", e))?;
         let txid = tx.txid().clone();
-
-        // Basic validation: compute vsize.
-        let vsize = tx.get_virtual_size() as u32;
         let tx_ref = std::sync::Arc::new(tx);
 
-        // Resolve the output spent by each input -- first from the confirmed
-        // UTXO set, then from the mempool (for unconfirmed parents). This is
-        // needed both to compute the real fee and to verify the input scripts.
-        let (height, total_in, spent_outputs, missing) = {
-            let cs_guard = self.chainstate.lock();
-            let height = cs_guard.height();
-            let mut total_in: i64 = 0;
-            let mut spent_outputs: Vec<qubitcoin_consensus::transaction::TxOut> =
-                Vec::with_capacity(tx_ref.vin.len());
-            let mut missing = 0usize;
-            for input in &tx_ref.vin {
-                if input.prevout.is_null() {
-                    continue; // coinbase
-                }
-                if let Some(coin) = cs_guard.coins_tip().get_coin(&input.prevout) {
-                    total_in += coin.tx_out.value.to_sat();
-                    spent_outputs.push(coin.tx_out.clone());
-                } else if let Some(parent_tx) = self.mempool.get(&input.prevout.hash) {
-                    if let Some(output) = parent_tx.vout.get(input.prevout.n as usize) {
-                        total_in += output.value.to_sat();
-                        spent_outputs.push(output.clone());
-                    } else {
-                        missing += 1;
-                    }
-                } else {
-                    missing += 1;
-                }
-            }
-            (height, total_in, spent_outputs, missing)
-        };
-
-        if missing > 0 {
-            let reason = format!(
-                "bad-txns-inputs-missingorspent: {} input(s) not found in UTXO set or mempool",
-                missing
-            );
-            tracing::debug!(txid = %txid.to_hex(), reason = %reason, "transaction rejected");
-            return Err(reason);
-        }
-
-        // Verify the input scripts (signatures) before mempool acceptance.
-        // A peer can send a `tx` message at any time, so without this check an
-        // unsigned transaction spending any known UTXO enters the mempool and
-        // is then picked up by block assembly.
-        if let Err(reason) = mempool::verify_mempool_tx_scripts(&tx_ref, &spent_outputs) {
-            tracing::debug!(
-                txid = %txid.to_hex(),
-                reason = %reason,
-                "transaction rejected: script verification failed"
-            );
-            return Err(reason);
-        }
-
-        // Accept to mempool with the fee implied by the resolved inputs.
-        let total_out: i64 = tx_ref.vout.iter().map(|o| o.value.to_sat()).sum();
-        let fee = qubitcoin_primitives::Amount::from_sat(std::cmp::max(0, total_in - total_out));
-
-        let result = mempool::accept_to_mempool(&self.mempool, &tx_ref, fee, vsize, height);
-
-        match result {
-            mempool::MempoolAcceptResult::Accepted { .. } => {
+        // Full mempool acceptance (inputs from UTXO set + mempool, maturity,
+        // finality, standardness, TRUC/ephemeral-dust policy, RBF, scripts).
+        // A peer can send a `tx` message at any time, so scripts must be
+        // verified before anything reaches block assembly.
+        let cs = self.chainstate.lock();
+        match qubitcoin_node::mempool_accept::MemPoolAccept::new(&cs, &self.mempool)
+            .accept_single(&tx_ref, false)
+        {
+            Ok(_) => {
                 tracing::debug!(txid = %txid.to_hex(), "transaction accepted to mempool");
                 Ok(true)
             }
-            mempool::MempoolAcceptResult::Rejected { reason } => {
+            Err(e) => {
+                let reason = e.to_state_string();
                 tracing::debug!(txid = %txid.to_hex(), reason = %reason, "transaction rejected");
                 Err(reason)
             }
@@ -668,12 +513,18 @@ async fn main() {
     // Wire the disk-backed block reader so chainstate can read blocks/undo
     // from flat files during chain reorganization.
     {
-        let bf = block_files.clone();
-        chainstate.set_block_reader(std::sync::Arc::new(move |file, data_pos, undo_pos| {
-            let block = bf.read_block(&DiskBlockPos { file, pos: data_pos }).ok()?;
-            let undo = bf.read_undo(&DiskBlockPos { file, pos: undo_pos }).ok()?;
-            Some((block, undo))
-        }));
+        let (bf1, bf2, bf3) = (block_files.clone(), block_files.clone(), block_files.clone());
+        chainstate.set_disk_access(
+            std::sync::Arc::new(move |file, data_pos| {
+                bf1.read_block(&DiskBlockPos { file, pos: data_pos }).ok()
+            }),
+            std::sync::Arc::new(move |file, undo_pos| {
+                bf2.read_undo(&DiskBlockPos { file, pos: undo_pos }).ok()
+            }),
+            std::sync::Arc::new(move |file, undo: &qubitcoin_node::undo::BlockUndo| {
+                bf3.write_undo(file, undo).ok().map(|p| p.pos)
+            }),
+        );
     }
 
     // Wrap chainstate in Arc<Mutex> for thread-safe sharing.
@@ -682,7 +533,31 @@ async fn main() {
     tracing::info!(height = chainstate.lock().height(), "chain initialized");
 
     // 7. Initialize mempool
-    let mempool = Arc::new(TxMemPool::new());
+    // Relay policy (Core semantics; amounts in BTC/kvB). The relay floor
+    // stays 0 by default on this node.
+    let parse_rate = |key: &str| -> Option<qubitcoin_node::mempool::FeeRate> {
+        args.get_arg(key)
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|f| qubitcoin_node::mempool::FeeRate::new((f * 100_000_000.0).round() as i64))
+    };
+    let min_relay_fee = parse_rate("minrelaytxfee").unwrap_or(mempool::DEFAULT_MIN_RELAY_TX_FEE);
+    let max_mempool = args
+        .get_int_arg("maxmempool")
+        .map(|mb| (mb.max(5) as usize) * 1_000_000)
+        .unwrap_or(mempool::DEFAULT_MAX_MEMPOOL_SIZE);
+    let policy = mempool::MempoolPolicy {
+        max_datacarrier_bytes: if args.is_set("datacarrier") && !args.get_bool_arg("datacarrier") {
+            None
+        } else {
+            Some(
+                args.get_int_arg("datacarriersize")
+                    .map(|n| n.max(0) as usize)
+                    .unwrap_or(mempool::DEFAULT_MAX_DATACARRIER_BYTES),
+            )
+        },
+        permit_bare_multisig: !args.is_set("permitbaremultisig") || args.get_bool_arg("permitbaremultisig"),
+    };
+    let mempool = Arc::new(TxMemPool::new_with_options(min_relay_fee, max_mempool, policy));
     tracing::info!(size = mempool.size(), "mempool initialized");
 
     // 7b. Initialize wallet — load from disk if available, else create new.
@@ -798,6 +673,68 @@ async fn main() {
         }
     }
 
+    // 8b. Tip-change fan-out shared by P2P, submitblock and generate.
+    #[cfg(feature = "zmq")]
+    let zmq_notifier = {
+        let cfgs = zmq::configs_from_args(|k| args.get_args(k).into_iter().map(|s| s.to_string()).collect());
+        if cfgs.is_empty() {
+            None
+        } else {
+            match zmq::ZmqNotifier::start(&cfgs).await {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    // Core: InitError("Unable to initialize ZMQ ...").
+                    tracing::error!(error = %e, "Unable to initialize ZMQ notifications");
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+    #[cfg(not(feature = "zmq"))]
+    for topic in ["hashblock", "hashtx", "rawblock", "rawtx", "sequence"] {
+        if !args.get_args(&format!("zmqpub{}", topic)).is_empty() {
+            tracing::error!("-zmqpub{} given but qubitcoind was built without the zmq feature", topic);
+            std::process::exit(1);
+        }
+    }
+    let notifications = Arc::new(notify::Notifications {
+        block_notify: args.get_arg("blocknotify").map(|s| s.to_string()),
+        #[cfg(feature = "zmq")]
+        zmq: zmq_notifier,
+    });
+    {
+        let n = notifications.clone();
+        mempool.set_event_listener(Some(Arc::new(move |e: &mempool::MempoolEvent| n.mempool_event(e))));
+    }
+    let tip_watch = {
+        let cs = chainstate.lock();
+        let tip_hash = cs
+            .tip()
+            .map(|t| cs.block_index().get(t).block_hash)
+            .unwrap_or(BlockHash::ZERO);
+        Arc::new(qubitcoin_rpc::mining::TipWatch::new(tip_hash))
+    };
+    let chain_events = Arc::new(chain_events::ChainEvents {
+        mempool: mempool.clone(),
+        tip_watch: tip_watch.clone(),
+        node_state: node_state.clone(),
+        notifications: notifications.clone(),
+    });
+
+    let block_processor = Arc::new(chain_events::BlockProcessor {
+        chainstate: chainstate.clone(),
+        block_files: block_files.clone(),
+        coins_db: coins_db.clone(),
+        block_index_db: block_index_db.clone(),
+        tx_index_db: tx_index_db.clone(),
+        indexer_manager: indexer_manager.clone(),
+        magic_bytes,
+        events: chain_events.clone(),
+        dbcache_limit: (dbcache_mb as u64) * 1024 * 1024,
+        blocks_since_flush: parking_lot::Mutex::new(0),
+        pending_tx_index: parking_lot::Mutex::new(Vec::new()),
+    });
+
     // 9. Set up RPC server
     let rpc_port: u16 = args.get_int_arg("rpcport").unwrap_or(match network {
         Network::Mainnet => 8332,
@@ -812,6 +749,20 @@ async fn main() {
         bind_addr: format!("{}:{}", rpc_bind, rpc_port).parse().unwrap(),
         rpc_user: args.get_arg("rpcuser").map(|s| s.to_string()),
         rpc_password: args.get_arg("rpcpassword").map(|s| s.to_string()),
+    };
+
+    // Block assembler policy (-blockmaxweight, -blockmintxfee in BTC/kvB),
+    // as Core's `ApplyArgsManOptions` for `BlockAssembler::Options`.
+    let miner_options = {
+        let mut o = qubitcoin_node::miner::BlockAssemblerOptions::default();
+        if let Some(w) = args.get_int_arg("blockmaxweight") {
+            o.block_max_weight = w.max(0) as u64;
+        }
+        if let Some(fee) = args.get_arg("blockmintxfee").and_then(|v| v.parse::<f64>().ok()) {
+            o.block_min_fee_rate =
+                qubitcoin_node::mempool::FeeRate::new((fee * 100_000_000.0).round() as i64);
+        }
+        o
     };
 
     let mut registry = RpcRegistry::new();
@@ -862,299 +813,35 @@ async fn main() {
         // metashrew_view/metashrew_height aliases are registered via register_indexer_rpcs above
     }
 
-    // Register real generatetoaddress for regtest mining.
-    if network == Network::Regtest {
-        use qubitcoin_rpc::server::{RpcRequest, RpcResponse, RPC_INVALID_PARAMS, RPC_MISC_ERROR};
-        use qubitcoin_consensus::merkle::block_merkle_root;
-        use qubitcoin_consensus::check::get_block_subsidy;
-        use qubitcoin_consensus::transaction::{Transaction, TxIn, TxOut, OutPoint, Witness, TransactionRef, SEQUENCE_FINAL};
-        use qubitcoin_primitives::ArithUint256;
-        use qubitcoin_primitives::arith_uint256::uint256_to_arith;
-
-        let cs_gen = chainstate.clone();
-        let bf_gen = block_files.clone();
-        let cdb_gen = coins_db.clone();
-        let ns_gen = node_state.clone();
-        let im_gen = indexer_manager.clone();
-        let mp_gen = mempool.clone();
-        let params_gen = params.clone();
-        let magic_gen = magic_bytes;
-        let bi_db_gen = block_index_db.clone();
-
-        registry.register("generatetoaddress", move |req: &RpcRequest| {
-            let params_arr = match req.params.as_ref().and_then(|p| p.as_array()) {
-                Some(a) => a.clone(),
-                None => return RpcResponse::error(req.id.clone(), RPC_INVALID_PARAMS, "expected array params".into()),
-            };
-            let nblocks = params_arr.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
-            let address_str = match params_arr.get(1).and_then(|v| v.as_str()) {
-                Some(a) => a.to_string(),
-                None => return RpcResponse::error(req.id.clone(), RPC_INVALID_PARAMS, "missing address".into()),
-            };
-
-            // Build coinbase output script from address (P2WPKH/P2TR bech32).
-            let coinbase_script = {
-                if let Ok((_, version, program)) = bech32::segwit::decode(&address_str) {
-                    let ver_op: u8 = match version.to_u8() { 0 => 0x00, n => 0x50 + n };
-                    let mut raw = Vec::with_capacity(2 + program.len());
-                    raw.push(ver_op);
-                    raw.push(program.len() as u8);
-                    raw.extend_from_slice(&program);
-                    qubitcoin_script::Script::from(raw)
-                } else {
-                    // Fallback: OP_TRUE (anyone-can-spend) for regtest.
-                    qubitcoin_script::Script::from(vec![0x51u8])
-                }
-            };
-
-            let mut hashes = Vec::new();
-            let wall_clock = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as u32;
-            let mut last_time = {
-                let cs = cs_gen.lock();
-                let tip_time = if let Some(tip) = cs.tip() {
-                    cs.block_index().get(tip).time
-                } else {
-                    0
-                };
-                // Use whichever is later: wall clock or tip time
-                std::cmp::max(wall_clock, tip_time)
-            };
-            for _ in 0..nblocks {
-                let mut cs = cs_gen.lock();
-                let height = cs.height() + 1;
-                let subsidy = get_block_subsidy(height, &params_gen.consensus);
-
-                // Collect mempool transactions in topological order (parents before children).
-                // This ensures intra-block spend chains (commit→reveal) are valid.
-                let mempool_txids = mp_gen.get_txids();
-                let mut all_mempool: Vec<TransactionRef> = Vec::new();
-                for txid in &mempool_txids {
-                    if let Some(tx) = mp_gen.get(txid) {
-                        all_mempool.push(tx);
-                    }
-                }
-                // Topological sort: a tx goes after any tx whose output it spends.
-                let mempool_txid_set: std::collections::HashSet<Txid> = all_mempool.iter().map(|tx| *tx.txid()).collect();
-                let mut user_txs: Vec<TransactionRef> = Vec::new();
-                let mut placed: std::collections::HashSet<Txid> = std::collections::HashSet::new();
-                let mut remaining = all_mempool.clone();
-                let max_iters = remaining.len() * 2 + 1;
-                for _ in 0..max_iters {
-                    if remaining.is_empty() { break; }
-                    let mut next_remaining = Vec::new();
-                    for tx in &remaining {
-                        let deps_met = tx.vin.iter().all(|input| {
-                            !mempool_txid_set.contains(&input.prevout.hash) || placed.contains(&input.prevout.hash)
-                        });
-                        if deps_met {
-                            placed.insert(*tx.txid());
-                            user_txs.push(tx.clone());
-                        } else {
-                            next_remaining.push(tx.clone());
-                        }
-                    }
-                    if next_remaining.len() == remaining.len() {
-                        // Circular dependency or unresolvable — add remaining as-is
-                        user_txs.extend(next_remaining);
-                        break;
-                    }
-                    remaining = next_remaining;
-                }
-                let mut has_witness = false;
-                for tx in &user_txs {
-                    for input in &tx.vin {
-                        if !input.witness.is_empty() {
-                            has_witness = true;
-                        }
-                    }
-                }
-
-                // Create coinbase with optional witness commitment (BIP141).
-                let mut sig_script = qubitcoin_script::Script::new();
-                sig_script.push_int(height as i64);
-                if sig_script.len() < 2 { sig_script.push_int(0); }
-
-                let mut coinbase_outputs = vec![TxOut::new(subsidy, coinbase_script.clone())];
-                let mut coinbase_witness = Witness::new();
-
-                if has_witness {
-                    // Compute witness commitment for BIP141.
-                    // witness_root = merkle_root of all wtxids (coinbase wtxid = 0x00..00)
-                    use qubitcoin_crypto::hash::hash256;
-                    let mut witness_hashes: Vec<Uint256> = Vec::new();
-                    witness_hashes.push(Uint256::default()); // coinbase wtxid = 0
-                    for tx in &user_txs {
-                        witness_hashes.push(tx.wtxid().into_uint256());
-                    }
-                    // Simple merkle root of witness hashes
-                    let mut level = witness_hashes;
-                    while level.len() > 1 {
-                        let mut next = Vec::new();
-                        for i in (0..level.len()).step_by(2) {
-                            let left = &level[i];
-                            let right = if i + 1 < level.len() { &level[i + 1] } else { &level[i] };
-                            let mut combined = [0u8; 64];
-                            combined[..32].copy_from_slice(left.as_bytes());
-                            combined[32..].copy_from_slice(right.as_bytes());
-                            let hash = hash256(&combined);
-                            next.push(Uint256::from_bytes(hash));
-                        }
-                        level = next;
-                    }
-                    let witness_root = if level.is_empty() { Uint256::default() } else { level[0] };
-
-                    // witness_commitment = SHA256d(witness_root || witness_nonce)
-                    // witness_nonce = 0x00..00 (32 bytes)
-                    let witness_nonce = [0u8; 32];
-                    let mut commitment_preimage = [0u8; 64];
-                    commitment_preimage[..32].copy_from_slice(witness_root.as_bytes());
-                    commitment_preimage[32..].copy_from_slice(&witness_nonce);
-                    let witness_commitment = hash256(&commitment_preimage);
-
-                    // Add OP_RETURN output with witness commitment
-                    // Format: OP_RETURN OP_PUSHBYTES_36 0xaa21a9ed <32-byte commitment>
-                    let mut commitment_script = Vec::with_capacity(38);
-                    commitment_script.push(0x6a); // OP_RETURN
-                    commitment_script.push(0x24); // OP_PUSHBYTES_36
-                    commitment_script.extend_from_slice(&[0xaa, 0x21, 0xa9, 0xed]); // witness magic
-                    commitment_script.extend_from_slice(&witness_commitment);
-                    coinbase_outputs.push(TxOut::new(
-                        qubitcoin_primitives::Amount::from_sat(0),
-                        qubitcoin_script::Script::from(commitment_script),
-                    ));
-
-                    // Coinbase witness: single 32-byte zero nonce
-                    coinbase_witness.stack.push(witness_nonce.to_vec());
-                }
-
-                let coinbase_tx = Transaction::new(
-                    2,
-                    vec![TxIn { prevout: OutPoint::null(), script_sig: sig_script, sequence: SEQUENCE_FINAL, witness: coinbase_witness }],
-                    coinbase_outputs,
-                    0,
-                );
-                let coinbase_ref: TransactionRef = Arc::new(coinbase_tx);
-                let mut all_txs = vec![coinbase_ref];
-                all_txs.extend(user_txs);
-
-                // Compute merkle root.
-                let mut mutated = false;
-                let merkle_root = block_merkle_root(&all_txs, &mut mutated);
-
-                // Build header.
-                let prev_hash = match cs.tip() {
-                    Some(t) => cs.block_index().get(t).block_hash,
-                    None => {
-                        // Genesis block hash for regtest
-                        BlockHash::from_hex("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206").unwrap()
-                    }
-                };
-                last_time += 1;
-                let time = last_time;
-                let bits = {
-                    let arith = uint256_to_arith(&params_gen.consensus.pow_limit);
-                    arith.get_compact(false)
-                };
-
-                // Block version: BIP9. Signals for any deployment currently in
-                // STARTED or LOCKED_IN, and otherwise is just VERSIONBITS_TOP_BITS.
-                //
-                // Maps to: `BlockAssembler::CreateNewBlock`'s
-                // `pblock->nVersion = m_chainman.m_versionbitscache.ComputeBlockVersion(...)`.
-                let version = {
-                    let mut vb_cache = qubitcoin_common::versionbits::VersionBitsCache::new();
-                    vb_cache.compute_block_version(
-                        cs.block_index().as_slice(),
-                        cs.tip(),
-                        &params_gen.consensus,
-                    )
-                };
-
-                let mut header = BlockHeader { version, prev_blockhash: prev_hash, merkle_root, time, bits, nonce: 0 };
-
-                // Solve PoW (trivial on regtest).
-                let mut target = ArithUint256::zero();
-                target.set_compact(header.bits);
-                loop {
-                    let hash = header.block_hash();
-                    let hash_arith = uint256_to_arith(&hash.into_uint256());
-                    if hash_arith <= target { break; }
-                    header.nonce = header.nonce.wrapping_add(1);
-                }
-
-                let block = Block { header: header.clone(), vtx: all_txs };
-                let block_hash = block.header.block_hash();
-
-                // Serialize and process through chainstate.
-                let block_bytes = match serialize(&block) {
-                    Ok(b) => b,
-                    Err(e) => return RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, format!("serialize: {}", e)),
-                };
-
-                // Write to block files.
-                let pos = match bf_gen.write_block(&block, magic_gen) {
-                    Ok(p) => p,
-                    Err(e) => return RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, format!("write: {}", e)),
-                };
-
-                // Process through chainstate (validates + connects).
-                // This must happen BEFORE updating data_pos because process_new_block
-                // creates the block index entry via accept_block_header.
-                tracing::info!(height = height, time = time, prev_hash = %prev_hash.to_hex(), "mining block");
-                match cs.process_new_block(&block) {
-                    Ok((true, undo)) => {
-                        // Update block index with file position AFTER the entry exists.
-                        if let Some(arena_idx) = cs.lookup_block_index(&block_hash) {
-                            let idx = cs.block_index_mut().get_mut(arena_idx);
-                            idx.file = pos.file;
-                            idx.data_pos = pos.pos;
-                            cs.mark_dirty(arena_idx);
-                        }
-                        // Write undo data.
-                        if let Some(undo_data) = undo {
-                            if let Ok(undo_pos) = bf_gen.write_undo(pos.file, &undo_data) {
-                                cs.set_undo_pos(&block_hash, undo_pos.pos);
-                            }
-                        }
-                        // Flush coins + block index to disk for crash safety.
-                        cs.flush_coins(cdb_gen.as_ref());
-                        let dirty = cs.dirty_block_indices();
-                        if !dirty.is_empty() {
-                            let refs: Vec<&qubitcoin_common::chain::BlockIndex> = dirty.into_iter().collect();
-                            bi_db_gen.write_block_indices(&refs);
-                        }
-                        // Update RPC state.
-                        *ns_gen.chain_height.write() = height;
-                        *ns_gen.best_block_hash.write() = block_hash.to_hex();
-                        // Remove included txs from mempool.
-                        if !mempool_txids.is_empty() {
-                            mp_gen.remove_for_block(&mempool_txids);
-                        }
-                    }
-                    Ok((false, _)) => {
-                        return RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, "block not accepted".into());
-                    }
-                    Err(e) => {
-                        tracing::error!(height = height, time = time, error = %format!("{:?}", e), "mining failed");
-                        return RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, format!("process: {:?}", e));
-                    }
-                }
-                drop(cs);
-
-                // Notify secondary indexers.
-                if let Some(ref im) = im_gen {
-                    im.on_block_connected(height as u32, &block_bytes);
-                }
-
-                hashes.push(block_hash.to_hex());
-            }
-
-            RpcResponse::success(req.id.clone(), serde_json::json!(hashes))
+    // Mining RPCs: getblocktemplate, submitblock, submitheader,
+    // getblockheader, prioritisetransaction, getprioritisedtransactions,
+    // getmininginfo/getnetworkhashps/getdifficulty (live), and on regtest
+    // generatetoaddress.
+    {
+        let sink = Arc::new(chain_events::DaemonBlockSink {
+            processor: block_processor.clone(),
         });
-        tracing::info!("real generatetoaddress registered for regtest");
+        let ns_peers = node_state.clone();
+        let ctx = Arc::new(qubitcoin_rpc::mining::MiningContext::new(
+            chainstate.clone(),
+            mempool.clone(),
+            sink,
+            tip_watch.clone(),
+            miner_options.clone(),
+            Arc::new(move || *ns_peers.connections.read()),
+            network != Network::Mainnet,
+            chain_name,
+            network == Network::Regtest,
+        ));
+        qubitcoin_rpc::mining::register_mining_rpcs(&mut registry, ctx);
+        qubitcoin_rpc::mempool_rpc::register_mempool_rpcs(
+            &mut registry,
+            Arc::new(qubitcoin_rpc::mempool_rpc::MempoolRpcContext {
+                chainstate: chainstate.clone(),
+                mempool: mempool.clone(),
+            }),
+        );
+        tracing::info!("mining and mempool RPCs registered");
     }
 
     tracing::info!(
@@ -1224,19 +911,12 @@ async fn main() {
         chainstate: chainstate.clone(),
         mempool: mempool.clone(),
         block_files: block_files.clone(),
-        coins_db: coins_db.clone(),
-        block_index_db: block_index_db.clone(),
-        tx_index_db: tx_index_db.clone(),
         node_state: node_state.clone(),
-        magic_bytes,
-        blocks_since_flush: parking_lot::Mutex::new(0),
-        dbcache_limit: (dbcache_mb as u64) * 1024 * 1024,
-        pending_tx_index: parking_lot::Mutex::new(Vec::new()),
         ibd_tracker: parking_lot::Mutex::new(IbdTracker {
             last_log_time: std::time::Instant::now(),
             last_log_height: initial_height,
         }),
-        indexer_manager: indexer_manager.clone(),
+        processor: block_processor.clone(),
     });
 
     if let Some(event_rx) = event_rx {
@@ -1345,19 +1025,8 @@ async fn main() {
 
     // 13. Graceful shutdown: flush all state to disk
     tracing::info!("flushing state to disk...");
-    {
-        let cs = chainstate.lock();
-
-        // Flush UTXO cache.
-        cs.flush_coins(coins_db.as_ref());
-
-        // Persist all block index entries.
-        let dirty = cs.dirty_block_indices();
-        let refs: Vec<&qubitcoin_common::chain::BlockIndex> = dirty.into_iter().collect();
-        block_index_db.write_block_indices(&refs);
-
-        tracing::info!(height = cs.height(), "state flushed to disk");
-    }
+    block_processor.flush();
+    tracing::info!(height = chainstate.lock().height(), "state flushed to disk");
 
     // Save wallet to disk.
     {
@@ -1771,125 +1440,8 @@ fn register_live_rpcs(
         )
     });
 
-    // -- sendrawtransaction -------------------------------------------------
-    let mp = mempool.clone();
-    let cs2 = chainstate.clone();
-    registry.register("sendrawtransaction", move |req: &RpcRequest| {
-        let hex_str = match req
-            .params
-            .as_ref()
-            .and_then(|p| p.get(0))
-            .and_then(|v| v.as_str())
-        {
-            Some(h) => h,
-            None => {
-                return RpcResponse::error(
-                    req.id.clone(),
-                    RPC_INVALID_PARAMS,
-                    "Missing hex transaction parameter".into(),
-                )
-            }
-        };
-
-        // Decode hex string.
-        let raw_bytes: Result<Vec<u8>, _> = (0..hex_str.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex_str[i..i + 2], 16))
-            .collect();
-
-        let raw_bytes = match raw_bytes {
-            Ok(b) => b,
-            Err(_) => {
-                return RpcResponse::error(
-                    req.id.clone(),
-                    RPC_INVALID_PARAMS,
-                    "Invalid hex encoding".into(),
-                )
-            }
-        };
-
-        let tx: qubitcoin_consensus::Transaction = match deserialize(&raw_bytes) {
-            Ok(t) => t,
-            Err(e) => {
-                return RpcResponse::error(
-                    req.id.clone(),
-                    RPC_MISC_ERROR,
-                    format!("TX decode failed: {}", e),
-                )
-            }
-        };
-
-        let txid = tx.txid().clone();
-        let vsize = tx.get_virtual_size() as u32;
-        let tx_ref = std::sync::Arc::new(tx.clone());
-
-        // Compute the fee: sum(input values) - sum(output values)
-        // Check both confirmed UTXO set AND mempool for unconfirmed outputs
-        // (needed for commit/reveal flows where reveal spends the commit output).
-        let cs_guard = cs2.lock();
-        let height = cs_guard.height();
-        let mut total_in: i64 = 0;
-        let mut missing_inputs = Vec::new();
-        // The output spent by each input, in input order. Needed both for the
-        // fee calculation and for script verification below.
-        let mut spent_outputs: Vec<qubitcoin_consensus::transaction::TxOut> =
-            Vec::with_capacity(tx.vin.len());
-        for input in &tx.vin {
-            if input.prevout.is_null() { continue; } // coinbase
-            if let Some(coin) = cs_guard.coins_tip().get_coin(&input.prevout) {
-                total_in += coin.tx_out.value.to_sat();
-                spent_outputs.push(coin.tx_out.clone());
-            } else if let Some(parent_tx) = mp.get(&input.prevout.hash) {
-                // Check mempool for unconfirmed parent output
-                if let Some(output) = parent_tx.vout.get(input.prevout.n as usize) {
-                    total_in += output.value.to_sat();
-                    spent_outputs.push(output.clone());
-                } else {
-                    missing_inputs.push(input.prevout.clone());
-                }
-            } else {
-                missing_inputs.push(input.prevout.clone());
-            }
-        }
-        drop(cs_guard);
-
-        if !missing_inputs.is_empty() {
-            return RpcResponse::error(
-                req.id.clone(),
-                RPC_MISC_ERROR,
-                format!(
-                    "bad-txns-inputs-missingorspent: {} input(s) not found in UTXO set or mempool",
-                    missing_inputs.len()
-                ),
-            );
-        }
-
-        // Verify the input scripts (signatures) before the transaction is
-        // allowed into the mempool. Without this an unsigned transaction
-        // spending any known UTXO is accepted and relayed, and is then picked
-        // up by block assembly.
-        if let Err(reason) = mempool::verify_mempool_tx_scripts(&tx_ref, &spent_outputs) {
-            return RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, reason);
-        }
-
-        let total_out: i64 = tx.vout.iter().map(|o| o.value.to_sat()).sum();
-        let fee = qubitcoin_primitives::Amount::from_sat(std::cmp::max(0, total_in - total_out));
-
-        match mempool::accept_to_mempool(
-            &mp,
-            &tx_ref,
-            fee,
-            vsize,
-            height,
-        ) {
-            mempool::MempoolAcceptResult::Accepted { .. } => {
-                RpcResponse::success(req.id.clone(), serde_json::json!(txid.to_hex()))
-            }
-            mempool::MempoolAcceptResult::Rejected { reason } => {
-                RpcResponse::error(req.id.clone(), RPC_MISC_ERROR, reason)
-            }
-        }
-    });
+    // sendrawtransaction / testmempoolaccept / submitpackage live in
+    // qubitcoin_rpc::mempool_rpc (registered in main).
 
     // -- getrawtransaction --------------------------------------------------
     let mp2 = mempool.clone();
@@ -2383,4 +1935,17 @@ fn print_usage() {
     println!("  -maxconnections=<n> Max connections (default: 125)");
     println!("  -loglevel=<level>  Log level: error, warn, info, debug, trace");
     println!("  -dbcache=<n>       UTXO cache size in MB (default: 1024)");
+    println!("  -blockmaxweight=<n> Max block weight to mine (default: 3996000)");
+    println!("  -blockmintxfee=<amt> Min fee rate (BTC/kvB) for mined txs (default: 0)");
+    println!("  -blocknotify=<cmd> Run cmd when the best block changes (%s = hash)");
+    println!("  -minrelaytxfee=<amt> Min relay fee rate in BTC/kvB (default: 0)");
+    println!("  -maxmempool=<n>    Max mempool size in MB (default: 300)");
+    println!("  -datacarrier=<0|1> Relay/mine OP_RETURN outputs (default: 1)");
+    println!("  -datacarriersize=<n> Max total OP_RETURN scriptPubKey bytes per tx (default: 100000)");
+    println!("  -permitbaremultisig=<0|1> Relay bare multisig outputs (default: 1)");
+    println!("  -zmqpubhashblock=<address>  Publish block hashes (e.g. tcp://127.0.0.1:28332)");
+    println!("  -zmqpubrawblock=<address>   Publish raw blocks");
+    println!("  -zmqpubhashtx=<address>     Publish transaction hashes");
+    println!("  -zmqpubrawtx=<address>      Publish raw transactions");
+    println!("  -zmqpubsequence=<address>   Publish block connect + mempool accept/remove events");
 }

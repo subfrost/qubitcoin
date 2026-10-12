@@ -37,7 +37,7 @@ pub use opcode::Opcode;
 pub use script::{
     build_op_return, build_p2pkh, build_p2sh, build_p2tr, build_p2wpkh, build_p2wsh, Script,
     ScriptOpsIter, LOCKTIME_THRESHOLD, MAX_OPS_PER_SCRIPT, MAX_PUBKEYS_PER_MULTISIG,
-    MAX_SCRIPT_ELEMENT_SIZE, MAX_SCRIPT_SIZE, MAX_STACK_SIZE,
+    MAX_SCRIPT_ELEMENT_SIZE, MAX_SCRIPT_SIZE, MAX_STACK_SIZE, PAY_TO_ANCHOR_SCRIPT,
 };
 pub use script_error::ScriptError;
 pub use script_num::ScriptNum;

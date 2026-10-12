@@ -12,6 +12,10 @@ qubitcoin-common = { workspace = true, features = ["native"] }
 qubitcoin-util = { workspace = true, features = ["native"] }
 qubitcoin-primitives = { workspace = true }
 qubitcoin-consensus = { workspace = true }
+qubitcoin-script = { workspace = true }
+qubitcoin-serialize = { workspace = true }
+qubitcoin-crypto = { workspace = true }
+bech32 = "0.11"
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
