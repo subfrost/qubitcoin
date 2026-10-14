@@ -35,6 +35,8 @@ export { QubitcoinNode } from './node.js';
 export { IndexerRuntime } from './indexer.js';
 export { DevnetTestHarness } from './devnet-server.js';
 export type { DevnetTestHarnessOptions, TertiaryIndexerConfig } from './devnet-server.js';
+export { DevnetViewCache, protobufHasTopLevelField } from './view-cache.js';
+export type { ViewCacheStats } from './view-cache.js';
 export { LuaRuntime, preloadLuaScripts, saveScript, getScript } from './lua-runtime.js';
 export type { RpcHandler } from './lua-runtime.js';
 export type { Block, SpendableOutput, NodeConfig } from './types.js';

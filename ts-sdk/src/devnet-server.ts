@@ -6,6 +6,8 @@
  * - Lua script execution via wasmoon (lua_evalscript, lua_evalsaved, etc.)
  * - Auto-indexing through loaded WASM indexer modules
  * - Fetch interceptor for seamless WebProvider integration
+ * - View cache (view-cache.ts) for repeated alkanes outpoint/address reads;
+ *   every request goes through `dispatch()`, and importState clears it
  *
  * @example
  * ```ts
@@ -31,6 +33,7 @@
 
 import type { DevnetServer } from './wasm/qubitcoin_web_sys.js';
 import { LuaRuntime, preloadLuaScripts, saveScript, getScript } from './lua-runtime.js';
+import { DevnetViewCache, type ViewCacheStats } from './view-cache.js';
 
 /** Default secret key (32 bytes of 0x01 — deterministic for testing). */
 const DEFAULT_SECRET_KEY = new Uint8Array(32).fill(0x01);
@@ -111,6 +114,13 @@ export interface DevnetTestHarnessOptions {
    * If omitted, tries common paths automatically.
    */
   luaScriptsDir?: string;
+  /**
+   * Memoize repeated alkanes view reads (`protorunesbyoutpoint`,
+   * `alkanes_protorunesbyaddress`). Default true. Responses are unchanged;
+   * see view-cache.ts for the soundness argument. Set false to measure or
+   * to rule the cache out while debugging.
+   */
+  viewCache?: boolean;
 }
 
 export class DevnetTestHarness {
@@ -119,13 +129,16 @@ export class DevnetTestHarness {
   private interceptUrls: string[];
   private luaRuntime: LuaRuntime | null = null;
   private luaInitPromise: Promise<void> | null = null;
+  private viewCache: DevnetViewCache | null;
 
   private constructor(
     server: DevnetServer,
     interceptUrls: string[],
+    viewCache: boolean,
   ) {
     this.server = server;
     this.interceptUrls = interceptUrls;
+    this.viewCache = viewCache ? new DevnetViewCache(() => server.height) : null;
   }
 
   /**
@@ -188,6 +201,7 @@ export class DevnetTestHarness {
     const harness = new DevnetTestHarness(
       server,
       opts.interceptUrls ?? DEFAULT_INTERCEPT_URLS,
+      opts.viewCache ?? true,
     );
 
     // Initialize Lua runtime (non-blocking — will be ready by first use)
@@ -245,17 +259,17 @@ export class DevnetTestHarness {
     try {
       parsed = JSON.parse(requestJson);
     } catch {
-      return this.server.handleRpc(requestJson);
+      return this.dispatch(requestJson);
     }
 
     if (parsed.method && LUA_METHODS.has(parsed.method)) {
       // Lua methods need async execution — we can't do that synchronously.
       // Instead, return a marker that handleFetchRequest will resolve.
       // For direct handleRpc() callers, fall through to Rust shims.
-      return this.server.handleRpc(requestJson);
+      return this.dispatch(requestJson);
     }
 
-    return this.server.handleRpc(requestJson);
+    return this.dispatch(requestJson);
   }
 
   /**
@@ -350,6 +364,12 @@ export class DevnetTestHarness {
    */
   importState(data: Uint8Array): void {
     this.server.importState(data);
+    this.viewCache?.clear();
+  }
+
+  /** View-cache hit/miss counters, or null when the cache is disabled. */
+  get viewCacheStats(): ViewCacheStats | null {
+    return this.viewCache?.stats ?? null;
   }
 
   /** Clean up: restore fetch and free WASM resources. */
@@ -361,6 +381,12 @@ export class DevnetTestHarness {
 
   // -- Private ---------------------------------------------------------------
 
+  /** Every JSON-RPC request reaches the Rust backend through here. */
+  private dispatch(requestJson: string): string {
+    if (!this.viewCache) return this.server.handleRpc(requestJson);
+    return this.viewCache.handle(requestJson, (json) => this.server.handleRpc(json));
+  }
+
   /**
    * Initialize the Lua runtime and pre-load known scripts.
    */
@@ -368,7 +394,7 @@ export class DevnetTestHarness {
     try {
       // Create Lua runtime with RPC handler that routes back to this harness
       const rpcHandler = (requestJson: string): string => {
-        return this.server.handleRpc(requestJson);
+        return this.dispatch(requestJson);
       };
 
       this.luaRuntime = await LuaRuntime.create(rpcHandler);
@@ -558,7 +584,7 @@ export class DevnetTestHarness {
           }
         }
 
-        const responseJson = this.server.handleRpc(bodyText);
+        const responseJson = this.dispatch(bodyText);
         return new Response(responseJson, {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
@@ -588,7 +614,7 @@ export class DevnetTestHarness {
           params: restMethod.params,
           id: 1,
         });
-        const responseJson = this.server.handleRpc(rpcRequest);
+        const responseJson = this.dispatch(rpcRequest);
 
         // If this was a metashrew_view call, the result is hex-encoded JSON.
         // Decode it and wrap in the REST envelope the SDK expects.
@@ -619,7 +645,7 @@ export class DevnetTestHarness {
       }
 
       // Fallback: pass raw body to Rust dispatcher
-      const responseJson = this.server.handleRpc(bodyText);
+      const responseJson = this.dispatch(bodyText);
       return new Response(responseJson, {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
